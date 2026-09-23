@@ -89,7 +89,9 @@ token cost.
   reclaimed atomically. A malformed state file is moved aside to
   `sprite.state.json.corrupt.<stamp>.json` rather than overwritten; a v1→v2
   migration keeps `sprite.state.json.pre-migration.json`. XP, level, and stat
-  values are hard-capped so no state file can stall the session.
+  values are hard-capped so no state file can stall the session. Locks carry a
+  per-acquisition token; release and stale-reclaim both verify it, so no
+  process ever removes a lock it did not inspect.
 - Activating the mod twice on one host (e.g. a hand-copied file plus the
   installed package) is a no-op the second time — events are never counted
   twice.
@@ -115,10 +117,16 @@ token cost.
   subprocesses; no shell strings and no conversation-content reads. Git runs
   with a scrubbed environment (no `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CONFIG_*`
   inheritance), an empty hooks directory that is verified empty on every call,
-  and executable config knobs (filters, credential helpers, signing, external
-  diff) disabled. Temp files use per-process names created with `O_EXCL`, so a
-  planted symlink is never followed. With backup disabled, no Git or network
-  activity occurs.
+  and signing / external-diff / LFS filters disabled. Auth and transport
+  settings (credential helpers, `GIT_SSH_COMMAND`, ssh agent, askpass, proxies)
+  pass through untouched — it is the user's own remote. Temp files use
+  per-process names created with `O_EXCL`, so a planted symlink is never
+  followed. With backup disabled, no Git or network activity occurs.
+- Threat-model note: git `filter.*` / `diff.*` *commands* live in git config
+  (system/global/repo), which a shared MemFS payload cannot write; only
+  `.gitattributes` is payload-borne. The one filter commonly present in global
+  config (LFS) is disabled explicitly. Other executable filters a user has
+  configured globally are already trusted for every git operation they run.
 - All capabilities are guarded (`ui.panels`, `events.*`, `commands`, `tools`)
   so the mod degrades gracefully on hosts that lack them.
 - Remove: delete the mod file and `/reload`. Delete the state file to release
