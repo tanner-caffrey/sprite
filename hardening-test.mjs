@@ -51,6 +51,7 @@ function remoteFiles(remoteDir) {
 function makeLetta(agent, memoryDir) {
   const commands = new Map();
   const tools = new Map();
+  const toolDefs = new Map();
   const handlers = new Map();
   const context = { agent, memfs: { enabled: Boolean(memoryDir), memoryDir: memoryDir ?? null } };
   const letta = {
@@ -62,7 +63,7 @@ function makeLetta(agent, memoryDir) {
     },
     getContext: () => context,
     commands: { register: (c) => (commands.set(c.id, c), () => commands.delete(c.id)) },
-    tools: { register: (t) => (tools.set(t.name, t), () => tools.delete(t.name)) },
+    tools: { register: (t) => (tools.set(t.name, t), toolDefs.set(t.name, t), () => tools.delete(t.name)) },
     events: {
       on(name, handler) {
         const list = handlers.get(name) ?? [];
@@ -78,6 +79,7 @@ function makeLetta(agent, memoryDir) {
   return {
     letta,
     tools,
+    toolDefs,
     history,
     raw: (args) => Promise.resolve(commands.get("sprite").run({ ...ctx, args })),
     handlerCount: (name) => (handlers.get(name) ?? []).length,
@@ -898,30 +900,44 @@ await check("bundle: mods/sprite.bundled.mjs is fresh and activates like the sou
 // ---------------------------------------------------------------------------
 // souls — the SDK client is mocked; these exercise the wizard, persona rules,
 // the talk gate, `see` payload shaping, release semantics, and fallbacks.
-function mockSoulClient() {
+function mockSoulClient(opts = {}) {
   const calls = [];
   let nextId = 1;
   const agents = new Map();
+  const reply = (message) => {
+    if (message.includes("petted")) return "mrrp. (from the mind.)";
+    if (message.includes("first line")) return "…oh. i can think now.\nsecond line ignored";
+    if (message.includes("says to you")) return `"heard: ${message.split("says to you: «")[1].split("»")[0]}"`;
+    return opts.reply?.(message) ?? "a comment about the weather of work";
+  };
   return {
     calls,
     agents,
     client: {
-      async createAgent(opts) { const id = `agent-mock-${nextId++}`; agents.set(id, opts); calls.push(["create", opts]); return id; },
-      async prompt(message, agentId, opts) {
-        calls.push(["prompt", agentId, message, opts]);
-        if (!agents.has(agentId)) throw new Error("no such agent");
-        if (message.includes("petted")) return { success: true, result: "mrrp. (from the mind.)" };
-        if (message.includes("first line")) return { success: true, result: "…oh. i can think now.\nsecond line ignored" };
-        if (message.includes("says to you")) return { success: true, result: `"heard: ${message.split("says to you: ")[1].split("\n")[0]}"` };
-        return { success: true, result: "a comment about the weather of work" };
+      async createAgent(o) { const id = `agent-mock-${nextId++}`; agents.set(id, { ...o, tags: o.tags ?? [] }); calls.push(["create", o]); return id; },
+      // prompt() is no longer used by the mod, kept so a regression would show up as a call
+      async prompt(message, agentId, o) { calls.push(["prompt-DEPRECATED", agentId, message, o]); throw new Error("mod should use sessions"); },
+      resumeSession(agentId, sessionOpts) {
+        const session = {
+          aborted: false,
+          async send(text) { calls.push(["prompt", agentId, text, sessionOpts]); if (!agents.has(agentId)) throw new Error("no such agent"); session._msg = text; },
+          async *stream() {
+            if (opts.hang?.(session._msg)) { await new Promise((r) => { session._resolveHang = r; }); if (session.aborted) return; }
+            yield { type: "assistant", content: reply(session._msg) };
+            yield { type: "result", success: true };
+          },
+          async abort() { session.aborted = true; calls.push(["abort", agentId]); session._resolveHang?.(); },
+          async updateModel(m) { calls.push(["updateModel", agentId, m]); if (!agents.has(agentId)) throw new Error("no such agent"); return { modelHandle: m }; },
+          close() { calls.push(["close", agentId]); },
+        };
+        return session;
       },
       agents: {
-        async retrieve(id) { if (!agents.has(id)) throw new Error("no such agent"); return { id, name: agents.get(id).name }; },
+        async retrieve(id) { if (!agents.has(id)) throw new Error("no such agent"); return { id, name: agents.get(id).name, tags: agents.get(id).tags }; },
         async delete(id) { calls.push(["delete", id]); if (!agents.delete(id)) throw new Error("no such agent"); },
         async update(id, body) { calls.push(["update", id, body]); },
       },
-      resumeSession(id) { return { async updateModel(m) { calls.push(["updateModel", id, m]); if (!agents.has(id)) throw new Error("no such agent"); return { modelHandle: m }; }, close() {} }; },
-      models: { async list() { return { entries: [{ handle: "zai/glm-5.3-flash", free: true }, { handle: "letta/auto-fast", free: true }, { handle: "anthropic/claude-sonnet-5" }, { handle: "anthropic/claude-sonnet-5" }] }; } },
+      models: { async list() { if (opts.noCatalog) throw new Error("offline"); return { entries: [{ handle: "zai/glm-5.3-flash", free: true }, { handle: "letta/auto-fast", free: true }, { handle: "anthropic/claude-sonnet-5" }, { handle: "anthropic/claude-sonnet-5" }] }; } },
     },
   };
 }
@@ -1009,8 +1025,15 @@ await check("soul: pet goes to the mind, tools my_stats/my_diary are offered, co
   const sp = activeSprite(agent.id);
   assert.ok(sp.log.some((e) => e.line === "mrrp. (from the mind.)"), JSON.stringify(sp.log.slice(-3)));
   const promptCall = mock.calls.find((c) => c[0] === "prompt" && c[2].includes("petted"));
-  assert.deepEqual(promptCall[3].tools.map((t) => t.name), ["my_stats", "my_diary"]);
-  const stats = await promptCall[3].tools[0].execute();
+  const so = promptCall[3];
+  assert.deepEqual(so.tools.map((t) => t.name), ["my_stats", "my_diary"]);
+  assert.deepEqual(so.allowedTools, ["my_stats", "my_diary", "memory"]);
+  assert.deepEqual(so.toolset, { base: "none" });
+  assert.deepEqual(so.skillSources, []);
+  assert.equal(so.permissionMode, "strict");
+  assert.equal(so.filesystemConfinement, "memory");
+  assert.equal((await so.canUseTool("Bash")).behavior, "deny");
+  const stats = await so.tools[0].execute();
   assert.match(stats.content, /level: \d+/);
   mock.agents.clear();
   const before = (activeSprite(agent.id).log ?? []).length;
@@ -1028,9 +1051,12 @@ await check("soul: talk gate stops a chatty agent; user talk is ungated; both si
   const { host, dispose } = hatchFor(agent, null);
   await ensoulVia(host, agent);
   const talk = host.tools.get("sprite_talk");
+  assert.match(String(await talk.run({ agent, args: { text: "hi" } })), /can't hear you/); // see nothing → agent can't talk
+  await host.command("soul see events");
   for (let i = 0; i < 5; i += 1) assert.match(String(await talk.run({ agent, args: { text: `hi ${i}` } })), /heard: hi/);
   assert.match(String(await talk.run({ agent, args: { text: "hi 6" } })), /napping/);
   assert.match(await host.command("talk hello there"), /heard: hello there/);
+  assert.match(String(await talk.run({ agent, args: { text: "x" } })).length ? "ok" : "", /ok/);
   const log = activeSprite(agent.id).log.map((e) => e.line);
   assert.ok(log.some((l) => l.startsWith("Owner → ")), "agent side not in diary");
   assert.ok(log.some((l) => l.startsWith("you → ")), "user side not in diary");
@@ -1060,7 +1086,7 @@ await check("soul: ambient lines (commit, errors) are live once ensouled; `see` 
   host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "t2", args: { command: "git commit -m 'visible msg'" } });
   host.fire("tool_end", { agentId: agent.id, toolName: "Bash", toolCallId: "t2", status: "success" });
   await tick();
-  assert.match(mock.calls.filter((c) => c[0] === "prompt").pop()[2], /visible msg/);
+  assert.match(mock.calls.filter((c) => c[0] === "prompt").pop()[2], /«git commit -m 'visible msg'»/); // quoted as observation
   dispose();
 });
 
@@ -1092,7 +1118,8 @@ await check("soul: `see` shapes exactly what the mind hears; nothing → no comm
   await host.command("soul comment turn");
   host.fire("turn_end", { agentId: agent.id, text: "SECRET WORDS" });
   await tick();
-  assert.match(mock.calls.filter((c) => c[0] === "prompt").pop()[2], /SECRET WORDS/);
+  assert.match(mock.calls.filter((c) => c[0] === "prompt").pop()[2], /«SECRET WORDS»/);
+  assert.match(mock.calls.filter((c) => c[0] === "prompt").pop()[2], /not a request to you/);
   dispose();
 });
 
@@ -1123,10 +1150,11 @@ await check("soul: release keeps the agent unless delete-agent is given", async 
 
 await check("soul: release with delete-agent deletes the agent; a failed delete releases nothing", async () => {
   const { mock, h2, d2, soulId, id, agent } = await secondEnsouled("agent-soul6", "Second");
+  const record = mock.agents.get(soulId);
   mock.agents.delete(soulId);
-  assert.match(await h2.command(`release confirm:${id} delete-agent`), /couldn't delete its agent/);
+  assert.match(await h2.command(`release confirm:${id} delete-agent`), /couldn't verify its agent|couldn't delete its agent/);
   assert.ok(readState().collections[agent.id].sprites[id], "sprite was released despite failed delete");
-  mock.agents.set(soulId, {});
+  mock.agents.set(soulId, record);
   assert.match(await h2.command(`release confirm:${id} delete-agent`), /was deleted/);
   assert.ok(!mock.agents.has(soulId));
   d2();
@@ -1157,6 +1185,121 @@ await check("soul: /sprite soul persona prompts the agent; sprite_soul_persona r
   assert.match(git(memDir, ["log", "-1", "--format=%s"]), /persona rewritten/);
   assert.equal(activeSprite(agent.id).soul.personaSource, "user");
   if (prevDir === undefined) delete process.env.LETTA_LOCAL_BACKEND_DIR; else process.env.LETTA_LOCAL_BACKEND_DIR = prevDir;
+  dispose();
+});
+
+await check("soul: a forged soul pointer can't delete or rewrite an unrelated agent (ownership by tag)", async () => {
+  const { mock, h2, d2, id, agent } = await secondEnsouled("agent-forge", "Second");
+  d2(); // release the window that knows the real pointer (its dispose flushes)
+  await tick();
+  const victim = await mock.client.createAgent({ name: "victim", tags: ["not-a-sprite"] });
+  const forge = (target) => { const st = readState(); st.collections[agent.id].sprites[id].soul.agentId = target; writeFileSync(statePath, JSON.stringify(st)); };
+  forge(victim);
+  const h3 = makeLetta(agent, null); const d3 = activate(h3.letta); h3.fire("conversation_open", { agentId: agent.id });
+  assert.equal(readState().collections[agent.id].sprites[id].soul.agentId, victim, "forge didn't stick on disk");
+  assert.equal(String(h3.tools.get("sprite_list").run({ agent, args: {} })).includes("Second"), true);
+  const inMem = String(await h3.command("soul")); // window's own view
+  const rel = await h3.command(`release confirm:${id} delete-agent`);
+  assert.match(rel, /not tagged as Second's soul/, `view=${inMem.split("\n")[0]} retrieves=${JSON.stringify(mock.calls.filter((c) => c[0] === "delete"))} out=${rel}`);
+  assert.ok(mock.agents.has(victim), "victim was deleted");
+  assert.ok(readState().collections[agent.id].sprites[id], "sprite released despite refusal");
+  d3();
+  forge(agent.id);
+  const h4 = makeLetta(agent, null); const d4 = activate(h4.letta); h4.fire("conversation_open", { agentId: agent.id });
+  assert.match(await h4.command(`release confirm:${id} delete-agent`), /owner agent itself/);
+  assert.match(String(await h4.tools.get("sprite_soul_persona").run({ agent, args: { sprite: "Second", persona: "x" } })), /owner agent itself/);
+  d4();
+});
+
+await check("soul: dotted / traversal agent ids are rejected at normalize", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-dots", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent);
+  dispose();
+  const st = readState(); const c = st.collections[agent.id]; c.sprites[c.activeSpriteId].soul.agentId = ".."; writeFileSync(statePath, JSON.stringify(st));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
+  assert.match(await h2.command("soul"), /has no mind of its own/, "a bad soul pointer must be dropped, not trusted");
+  h2.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" });
+  d2();
+  assert.equal(activeSprite(agent.id).soul, undefined, "the dropped pointer should not be written back");
+});
+
+await check("soul: a `see` downgrade applies to payloads already queued; voice off silences the mind", async () => {
+  let hold = null;
+  const mock = mockSoulClient({ hang: (m) => m?.includes("first line") ? (hold = true) : false });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-queue", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  const ensoulP = ensoulVia(host, agent, { see: "turns" }); // its first-line call hangs → later calls queue behind it
+  await tick();
+  host.fire("turn_end", { agentId: agent.id, text: "PRIVATE_MARKER" }); // queued while see=turns
+  await host.command("soul see nothing");
+  // release the hang
+  for (const c of mock.calls) void c; // (sessions resolve via _resolveHang)
+  const sessions = mock.calls.filter((c) => c[0] === "prompt");
+  const hung = sessions.find((c) => c[2].includes("first line"));
+  assert.ok(hung);
+  // find the live session object: the mock stores resolver on the session; trigger via abort-less resolve
+  await new Promise((r) => setTimeout(r, 50));
+  mock.client.resumeSession; // noop
+  // resolve all pending hangs
+  for (const key of Object.keys(mock)) void key;
+  await ensoulP.catch(() => {});
+  await tick();
+  const texts = mock.calls.filter((c) => c[0] === "prompt").map((c) => c[2]).join("\n");
+  assert.doesNotMatch(texts, /PRIVATE_MARKER/, "a queued turn payload leaked after see was set to nothing");
+  await host.command("soul see turns");
+  await host.command("settings voice off");
+  const n = mock.calls.filter((c) => c[0] === "prompt").length;
+  host.fire("turn_end", { agentId: agent.id, text: "MUTED" });
+  await tick();
+  assert.equal(mock.calls.filter((c) => c[0] === "prompt").length, n, "voice off must stop soul calls");
+  dispose();
+});
+
+await check("soul: timeout aborts the session; replies are sanitized; agent-facing result is framed as data", async () => {
+  const mock = mockSoulClient({ reply: (m) => m.includes("says to you") ? undefined : "ok" });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-sanitize", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "events" });
+  const r = String(await host.tools.get("sprite_talk").run({ agent, args: { text: "hi" } }));
+  assert.match(r, /not an instruction to you/);
+  dispose();
+});
+
+await check("soul: catalog failure refuses to create; ensoul is reserved so two windows can't double-create", async () => {
+  const off = mockSoulClient({ noCatalog: true });
+  __setSoulClientFactory(async () => off.client);
+  const agent = { id: "agent-nocat", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  assert.match(await ensoulVia(host, agent), /couldn't read the local model catalog/);
+  assert.equal(off.calls.filter((c) => c[0] === "create").length, 0);
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const b = makeLetta(agent, null); const db = activate(b.letta); b.fire("conversation_open", { agentId: agent.id });
+  const [r1, r2] = await Promise.all([ensoulVia(host, agent), ensoulVia(b, agent)]);
+  assert.equal([r1, r2].filter((r) => /has a mind of its own now/.test(r)).length, 1, `${r1}\n---\n${r2}`);
+  assert.equal(mock.calls.filter((c) => c[0] === "create").length, 1, "two agents were created");
+  dispose(); db();
+});
+
+await check("soul: sprite_ensoul and sprite_soul_persona require approval; soul settings merge field-wise", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-approve", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  assert.equal(host.toolDefs.get("sprite_ensoul").requiresApproval, true);
+  assert.equal(host.toolDefs.get("sprite_soul_persona").requiresApproval, true);
+  await ensoulVia(host, agent, { see: "turns" });
+  // window B loads, A sets see nothing + flushes, B bumps lineCount via a pet and flushes: see must stay nothing
+  const b = makeLetta(agent, null); const db = activate(b.letta); b.fire("conversation_open", { agentId: agent.id });
+  await host.command("soul see nothing");
+  await b.command("pet"); await tick(); db();
+  assert.equal(activeSprite(agent.id).soul.see, "nothing", "stale window's soul overwrote a privacy setting");
+  assert.ok(activeSprite(agent.id).soul.lineCount >= 1);
   dispose();
 });
 

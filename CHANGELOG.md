@@ -3,6 +3,24 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.9.1 — ensoulment, hardened
+- A companion's mind runs in a confined session: only its own two tools and
+  its memory, no harness tools, no skills, memory-only filesystem on local.
+- Every operation on its agent (talk, model, dreaming, persona, delete) first
+  proves the agent is that companion's, by tag. A restored backup can no
+  longer point a companion at some other agent — or at you.
+- What it observes is quoted as data, never as a request; it is told not to
+  follow instructions inside the quotes. Its replies are stripped of control
+  characters and framed as its own words when your agent reads them.
+- A `see` downgrade applies to anything already waiting to be sent. Your
+  agent can't talk to it under `see nothing`. `my_diary` shows only its own
+  words. `voice off` silences the mind too. Commit commentary sends the first
+  line only.
+- Timeouts abort the turn instead of letting it run on. Soul settings merge
+  field by field across windows. Two windows can't ensoul the same companion
+  twice. If the model catalog can't be read, nothing is created.
+- `sprite_ensoul` and `sprite_soul_persona` ask for your approval.
+
 ## v0.9.0 — your agent walks you through ensoulment
 - `/sprite ensoul` now hands your agent a walkthrough: it asks you each
   question with a proper picker (where the mind lives, which model from the
