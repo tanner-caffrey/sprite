@@ -568,4 +568,27 @@ await check("#14 breeding: seed delimiter can't collide; chimera has poses + a v
   assert.ok(h.HYBRID_POSES.chimera?.idle && h.HYBRID_CORPUS.chimera?.pet?.length > 0);
 });
 
+// ---------------------------------------------------------------------------
+await check("bars: lap math is monotonic, wraps cleanly, and every lap style renders", async () => {
+  const seedAgent = { id: "agent-bars", name: "Bars" };
+  seedAlive(seedAgent.id);
+  const st = JSON.parse(readFileSync(statePath, "utf-8"));
+  st.sprites[seedAgent.id].stats = { craft: 0, wander: 99, grit: 100, lore: 1300, spark: 12345678 };
+  writeFileSync(statePath, JSON.stringify(st));
+  const host = makeLetta(seedAgent, null);
+  const dispose = activate(host.letta);
+  host.fire("conversation_open", { agentId: seedAgent.id });
+  const line = () => host.command("").split("\n")[2];
+  assert.match(line(), /CRAFT ▱{8}  WANDER ▰{7}▱  GRIT ▱{8} ×1  LORE ▰+▱* ×\d+  SPARK .* ×\d+/, line());
+  host.command("settings laps odometer");
+  assert.match(line(), /CRAFT ⟨0⟩▱{7}  WANDER ⟨0⟩▰{7}  GRIT ⟨1⟩▱{7}/, line());
+  host.command("settings laps belt");
+  assert.match(line(), /GRIT ▰{8}/, line()); // lap 1, nothing into it yet → a full bar of lap-0 glyph
+  host.command("settings laps pips");
+  assert.match(line(), /GRIT ▱{8} ·  /, line());
+  assert.equal(host.command("settings laps nope"), "laps must be count|odometer|belt|pips");
+  assert.equal(host.command("settings hue maybe"), "hue must be on|off");
+  dispose();
+});
+
 console.log(`\nSprite hardening test passed (${passed} checks).`);

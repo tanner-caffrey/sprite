@@ -825,6 +825,9 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   voice: "on",
   voiceRateMin: 10,
   visible: "on",
+  laps: "count", // how wrapped stat bars show their lap count: count|odometer|belt|pips
+  hue: "on", // colour the bars by lap age (panel + card)
+  bars: "off", // also show a compact stat strip on the panel row
 };
 
 const STATE_PATH =
@@ -1867,12 +1870,106 @@ const STAT_LABELS: Record<(typeof STAT_KEYS)[number], string> = {
   spark: "SPARK",
 };
 
-// log-scale: each block ≈3× the last, so bars stay alive for months.
-const STAT_THRESHOLDS = [10, 30, 100, 300, 1_000, 3_000, 10_000, 30_000];
+// Stat bars wrap. Each bar is one "lap"; when it fills it starts over and the
+// lap counter goes up, so growth is always visible and old sprites read as old.
+// Lap cost grows gently (+15%) for the first LAP_GROW_UNTIL laps, then stays
+// flat — the first ×10 is a real history, every ×1 after that costs the same.
+const BAR_CELLS = 8;
+const LAP_BASE_COST = 100;
+const LAP_GROWTH = 1.15;
+const LAP_GROW_UNTIL = 10;
 
-function statBar(value: number): string {
-  const filled = STAT_THRESHOLDS.filter((t) => value >= t).length;
-  return "▰".repeat(filled) + "▱".repeat(STAT_THRESHOLDS.length - filled);
+function lapCost(lap: number): number {
+  return Math.round(LAP_BASE_COST * Math.pow(LAP_GROWTH, Math.min(lap, LAP_GROW_UNTIL)));
+}
+
+interface LapProgress {
+  laps: number; // completed laps (0 on a fresh sprite)
+  filled: number; // cells lit in the current lap, 0..BAR_CELLS
+  intoLap: number; // events into the current lap
+  cost: number; // events this lap needs
+}
+
+function lapProgress(value: number): LapProgress {
+  let remaining = Math.max(0, Math.floor(value));
+  let laps = 0;
+  // Growing phase: at most LAP_GROW_UNTIL iterations.
+  while (laps < LAP_GROW_UNTIL && remaining >= lapCost(laps)) {
+    remaining -= lapCost(laps);
+    laps += 1;
+  }
+  // Flat phase: closed form.
+  if (laps >= LAP_GROW_UNTIL) {
+    const flat = lapCost(LAP_GROW_UNTIL);
+    const extra = Math.floor(remaining / flat);
+    laps += extra;
+    remaining -= extra * flat;
+  }
+  const cost = lapCost(laps);
+  const filled = Math.min(BAR_CELLS, Math.floor((remaining / cost) * BAR_CELLS));
+  return { laps, filled, intoLap: remaining, cost };
+}
+
+// How the lap count is drawn. All four read the same LapProgress.
+//   count    ▰▰▰▱▱▱▱▱ ×3           number after the bar (hidden on lap 0)
+//   odometer ⟨3⟩▰▰▰▱▱▱▱            counter sits where the bar begins, bar is one cell shorter
+//   belt     ▮▮▮▰▰▰▰▰               each lap fills with a heavier glyph over the last
+//   pips     ▰▰▰▱▱▱▱▱ ···           one dot per lap under/after the bar
+const LAP_STYLES = ["count", "odometer", "belt", "pips"] as const;
+type LapStyle = (typeof LAP_STYLES)[number];
+const BELT_GLYPHS = ["▰", "▮", "█", "▓", "▒"]; // lap 1..5 fills; beyond → last + ×N
+
+// Colour ladder: grey → white → gold → rose → violet → teal → shimmer.
+const HUE_LADDER = ["#8c8c96", "#ebebf0", "#ffd660", "#ff96b4", "#be96ff", "#78e6dc"];
+const HUE_EMPTY = "#4a4a56";
+const SHIMMER = ["#ffb4b4", "#ffd6a0", "#fff2a0", "#c8ffb4", "#b4f0ff", "#c8c8ff", "#f0b4ff", "#ffb4dc"];
+
+function hueForLap(lap: number, cell: number): string {
+  if (lap < HUE_LADDER.length) return HUE_LADDER[lap];
+  return SHIMMER[(cell + lap) % SHIMMER.length];
+}
+
+interface BarPaint {
+  fill: (text: string, lap: number, cell: number) => string;
+  empty: (text: string) => string;
+  mark: (text: string, lap: number) => string;
+}
+const PLAIN_PAINT: BarPaint = { fill: (t) => t, empty: (t) => t, mark: (t) => t };
+
+function huePaint(chalk: any): BarPaint {
+  return {
+    fill: (t, lap, cell) => chalk.hex(hueForLap(lap, cell))(t),
+    empty: (t) => chalk.hex(HUE_EMPTY)(t),
+    mark: (t, lap) => chalk.hex(hueForLap(lap, 0))(t),
+  };
+}
+
+function statBar(value: number, style: LapStyle = "count", paint: BarPaint = PLAIN_PAINT): string {
+  const p = lapProgress(value);
+  const cells = style === "odometer" ? BAR_CELLS - 1 : BAR_CELLS;
+  const filled = style === "odometer" ? Math.min(cells, Math.round((p.intoLap / p.cost) * cells)) : p.filled;
+  // belt: lap N fills with glyph N over a full bar of glyph N-1; past the glyph
+  // range it cycles (▰ over ▒) and the ×N marker carries the rest.
+  const beltIdx = (lap: number) => lap % BELT_GLYPHS.length;
+  const fillGlyph = style === "belt" ? BELT_GLYPHS[beltIdx(p.laps)] : "▰";
+  const underGlyph = style === "belt" && p.laps > 0 ? BELT_GLYPHS[beltIdx(p.laps - 1)] : "▱";
+  let bar = "";
+  for (let i = 0; i < cells; i += 1) {
+    if (i < filled) bar += paint.fill(fillGlyph, p.laps, i);
+    else if (style === "belt" && p.laps > 0) bar += paint.fill(underGlyph, p.laps - 1, i);
+    else bar += paint.empty("▱");
+  }
+  switch (style) {
+    case "odometer":
+      return paint.mark(`⟨${p.laps}⟩`, p.laps) + bar;
+    case "belt":
+      return p.laps >= BELT_GLYPHS.length ? `${bar} ${paint.mark(`×${p.laps}`, p.laps)}` : bar;
+    case "pips":
+      if (p.laps === 0) return bar;
+      return p.laps <= 8 ? `${bar} ${paint.mark("·".repeat(p.laps), p.laps)}` : `${bar} ${paint.mark(`········+${p.laps - 8}`, p.laps)}`;
+    default:
+      return p.laps > 0 ? `${bar} ${paint.mark(`×${p.laps}`, p.laps)}` : bar;
+  }
 }
 
 // half nature, half nurture: temperament is seeded at birth, vocation is earned.
@@ -2273,6 +2370,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return DEFAULT_SETTINGS[key];
   }
 
+  function lapStyleOf(sprite: SpriteState | null): LapStyle {
+    const v = setting(sprite, "laps");
+    return LAP_STYLES.includes(v as LapStyle) ? (v as LapStyle) : "count";
+  }
+
   function speciesOf(sprite: SpriteState): Species {
     return SPECIES.find((s) => s.id === sprite.species) ?? SPECIES[0];
   }
@@ -2462,7 +2564,13 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           const shinyMark = sprite.shiny ? chalk.yellowBright("✦") : "";
           const label = `${chalk.cyan(sprite.name)}${shinyMark} ${chalk.dim(`·Lv.${sprite.level}`)}`;
           const pad = " ".repeat(Math.max(0, Math.min(x, 16)));
-          const right = bubble && Date.now() < bubbleUntil ? chalk.dim(`“${bubble}”`) : "";
+          let right = bubble && Date.now() < bubbleUntil ? chalk.dim(`“${bubble}”`) : "";
+          if (!right && setting(sprite, "bars") === "on") {
+            const paint = setting(sprite, "hue") === "on" ? huePaint(chalk) : PLAIN_PAINT;
+            right = STAT_KEYS.map(
+              (k) => `${chalk.dim(STAT_LABELS[k][0])} ${statBar(sprite.stats[k], lapStyleOf(sprite), paint)}`,
+            ).join("  ");
+          }
           return row(`${pad}${face}  ${label}`, right, width);
         },
       })
@@ -2792,7 +2900,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         agentId ? natureLine(sprite) : "your companion"
       }${title ? ` (${title})` : ""}`,
       `species: ${sp.id} (${sp.rarity})   level: ${sprite.level}   xp: ${sprite.xp}/${xpToNext(sprite.level)}   mood: ${mood}`,
-      STAT_KEYS.map((k) => `${STAT_LABELS[k]} ${statBar(sprite.stats[k])}`).join("  "),
+      STAT_KEYS.map((k) => `${STAT_LABELS[k]} ${statBar(sprite.stats[k], lapStyleOf(sprite))}`).join("  "),
       sprite.hatchedAt
         ? `hatched: ${relativeTime(sprite.hatchedAt)}   born of: ${agentName ?? sprite.bornToAgentId ?? agentId ?? "unknown"}`
         : "",
@@ -2832,7 +2940,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         ...rows,
         "",
         "set: /sprite settings <key> <value>    global: /sprite settings global <key> <value>",
-        "keys: voice on|off · voiceRateMin <n> · visible on|off",
+        "keys: voice on|off · voiceRateMin <n> · visible on|off · laps count|odometer|belt|pips · hue on|off · bars on|off",
       ].join("\n");
     }
 
@@ -2845,8 +2953,10 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     }
 
     let parsed: unknown = value;
-    if (key === "voice" || key === "visible") {
+    if (key === "voice" || key === "visible" || key === "hue" || key === "bars") {
       if (value !== "on" && value !== "off") return `${key} must be on|off`;
+    } else if (key === "laps") {
+      if (!LAP_STYLES.includes(value as LapStyle)) return `laps must be ${LAP_STYLES.join("|")}`;
     } else if (key === "voiceRateMin") {
       const n = Number(value);
       if (!Number.isFinite(n) || n < 0) return "voiceRateMin must be a number of minutes";
@@ -2960,7 +3070,14 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       "  /sprite settings global <key> <value>",
       "                                 Change the default for every sprite.",
       "                                 Keys: voice on|off, voiceRateMin <minutes>,",
-      "                                 visible on|off.",
+      "                                 visible on|off, laps count|odometer|belt|pips,",
+      "                                 hue on|off, bars on|off.",
+      "",
+      "  Stat bars wrap: when a bar fills it starts over and the lap count goes up.",
+      "  `laps` picks how that count is drawn — count (×3 after the bar), odometer",
+      "  (⟨3⟩ before it), belt (each lap fills with a heavier glyph), or pips (one",
+      "  dot per lap). `hue` colours bars by age (grey → white → gold → rose → violet",
+      "  → teal → shimmer). `bars` also shows a compact stat strip on the panel row.",
       "",
       "  /sprite backup                 Show the portable backup status. Backup is off",
       "                                 by default and never runs until you turn it on.",

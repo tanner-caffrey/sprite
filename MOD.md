@@ -72,7 +72,9 @@ companion from Signal, Telegram, Discord, or CLI turns.
 | `/sprite backup restore [force]` | Restore a portable soul-backup |
 | `/sprite help` | Explain every subcommand |
 
-Settings keys: `voice on|off`, `voiceRateMin <minutes>`, `visible on|off`.
+Settings keys: `voice on|off`, `voiceRateMin <minutes>`, `visible on|off`, `laps count|odometer|belt|pips`, `hue on|off`, `bars on|off`.
+
+Stat bars wrap: when one fills it starts over and its lap count rises (lap cost grows +15% per lap for ten laps, then stays flat). `laps` picks how the count is drawn; `hue` colours bars by age (grey → white → gold → rose → violet → teal → shimmer); `bars` adds a compact stat strip to the panel row.
 
 Ensoulment (a live tiny-mind voice on a model you choose) is planned for a
 future update; today the voice is a static or agent-authored corpus at zero
