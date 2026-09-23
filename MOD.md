@@ -39,7 +39,7 @@ A tiny persistent pet for your Letta agent.
 
 ## The agent raises its own pet
 
-Every command has an agent-tool twin: `sprite_hatch`, `sprite_name`,
+Core care actions have agent-tool twins: `sprite_hatch`, `sprite_name`,
 `sprite_molt`, `sprite_pet`, `sprite_set_voice`, and `sprite_status`. You can
 simply ask your agent to hatch and name its own companion — or to **author
 its pet's voice**: the agent writes a replacement line-corpus once (per
@@ -50,6 +50,11 @@ The pet speaks into a panel the agent cannot see, so perception is built in:
 action results carry what the pet did and said (petting returns its response),
 and `sprite_status` reports species, level, stats, mood, and a small diary of
 what it said recently — how the owner hears its companion.
+
+The sprite is agent-owned rather than UI-owned. If the host has no panel UI
+(for example, a headless channel listener), sprite skips visual rendering but
+still registers its tools and event hooks so the agent can care for the same
+companion from Signal, Telegram, Discord, or CLI turns.
 
 ## Commands
 
@@ -62,6 +67,9 @@ what it said recently — how the owner hears its companion.
 | `/sprite pet` | Pet it |
 | `/sprite diary` | Read its recent utterances, oldest-first, with away-gap markers |
 | `/sprite settings [global] [key] [value]` | Configure (per-sprite overrides beat global) |
+| `/sprite backup [status\|on\|off\|now]` | Inspect or control portable checkpoints |
+| `/sprite backup push safe\|never` | Configure direct MemFS Git sync |
+| `/sprite backup restore [force]` | Restore a portable soul-backup |
 
 Settings keys: `voice on|off`, `voiceRateMin <minutes>`, `visible on|off`.
 
@@ -71,14 +79,30 @@ token cost.
 
 ## State & safety
 
-- State lives in `~/.letta/mods/sprite.state.json` (override with
-  `SPRITE_STATE_PATH`). Writes are atomic-ish (temp file + rename) and
-  best-effort: persistence failures never break a session.
-- Multi-agent friendly: one sprite per agent-id, all in the same state file.
-- No network access, no shell execution, no reading conversation content. The
-  mod only observes event metadata (tool names, statuses, lifecycle) and
-  renders a panel.
+- Live state lives in `~/.letta/mods/sprite.state.json` (override with
+  `SPRITE_STATE_PATH`). Schema v2 gives every collection and sprite a stable
+  ID/fate seed; legacy one-sprite-per-agent state migrates automatically.
+- Local persistence uses atomic temp+rename writes under a cross-process lock
+  and three-way merges additive counters/logs against the latest disk state.
+  Persistence remains best-effort and never breaks a session.
+- Portable backup is opt-in. It checkpoints checksum-protected JSON beneath
+  the fixed agent-MemFS namespace
+  `data/mods/letta-ai-sprite/collection-v1.json`, which is excluded from prompt
+  compilation. Local state remains authoritative and fast.
+- `safe` Git sync stages/commits only Sprite's file, marks commits with
+  `Letta-Mod-State: @faye/sprite`, and refuses to proceed around unrelated
+  dirty or unpushed memory work. `never` disables direct pushes. No remote
+  means local versioned checkpoints only.
+- Restore is automatic only when local state is absent. Replacing a live local
+  collection requires the explicit `restore force` command. A restored sprite
+  keeps its stable soul ID, birth agent, fate seed, stats, voice, and diary
+  while ownership rebinds to the current agent ID. Portable backup remains off
+  after restore until explicitly re-enabled on the new installation.
+- Portable backup uses scoped filesystem access plus argument-array Git
+  subprocesses; no shell strings and no conversation-content reads. With
+  backup disabled, no Git or network activity occurs.
 - All capabilities are guarded (`ui.panels`, `events.*`, `commands`, `tools`)
   so the mod degrades gracefully on hosts that lack them.
 - Remove: delete the mod file and `/reload`. Delete the state file to release
-  all sprites (they will be missed).
+  local sprites; a valid portable backup remains restorable unless deleted
+  separately (they will be missed).

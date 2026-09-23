@@ -25,7 +25,7 @@ events — no tool calls, no extra turns.
 ## Install
 
 ```
-letta install npm:@letta-ai/sprite
+letta install git:github.com/tanner-caffrey/sprite
 ```
 
 Then `/reload` and:
@@ -38,8 +38,9 @@ An egg appears. It's warm. Give it a moment.
 
 ## Who's inside
 
-Species and shininess are seeded deterministically from your **agent-id** —
-your agent's fate rolled at birth. Ten species across four rarity tiers:
+Species and shininess are seeded deterministically from your **agent-id** at
+birth, then that permanent fate seed travels with the sprite. Restoring onto a
+new installation never rerolls it. Ten species across four rarity tiers:
 
 | Rarity | Species |
 | --- | --- |
@@ -103,9 +104,9 @@ a day, it notices: *"you were gone a while. i counted the cursor blinks."*
 
 ## Your agent raises it
 
-Every command has an agent-tool twin (`sprite_hatch`, `sprite_name`,
-`sprite_molt`, `sprite_pet`, `sprite_set_voice`). Skip the commands entirely
-and just ask your agent:
+Core care actions have agent-tool twins (`sprite_hatch`, `sprite_name`,
+`sprite_molt`, `sprite_pet`, `sprite_status`, `sprite_set_voice`). Skip the
+commands entirely and just ask your agent:
 
 > "hatch yourself a companion and name it whatever you like"
 
@@ -120,6 +121,12 @@ human sees, so action results carry its responses (petting returns what it
 said), and `sprite_status` reports level, stats, mood, and a little diary of
 recent utterances — the owner's way of catching up on its companion.
 
+The companion belongs to the agent, not to a particular UI. In headless
+surfaces such as channel listeners, where no statusline panel exists, the
+visual panel is skipped but the agent tools and passive event hooks still
+activate. A Signal or Telegram conversation should be able to ask the agent to
+check on or pet its sprite just like a CLI conversation can.
+
 ## Commands
 
 | Command | What |
@@ -132,6 +139,10 @@ recent utterances — the owner's way of catching up on its companion.
 | `/sprite diary` | Read its recent utterances (with away-gap markers) |
 | `/sprite settings` | Show config (global + per-sprite scopes) |
 | `/sprite settings [global] <key> <value>` | Set config |
+| `/sprite backup` | Show portable-backup status |
+| `/sprite backup on\|off\|now` | Enable, disable, or checkpoint now |
+| `/sprite backup push safe\|never` | Configure conservative Git sync |
+| `/sprite backup restore [force]` | Restore from agent MemFS (`force` replaces local state) |
 
 Settings keys: `voice on|off` · `voiceRateMin <minutes>` · `visible on|off`
 
@@ -143,11 +154,30 @@ Settings keys: `voice on|off` · `voiceRateMin <minutes>` · `visible on|off`
 
 ## Notes
 
-- One sprite per agent — multi-agent households get one companion each, all
-  in `~/.letta/mods/sprite.state.json`.
+- Live state stays in `~/.letta/mods/sprite.state.json` (override with
+  `SPRITE_STATE_PATH`). The versioned v2 schema wraps each agent's current
+  sprite in a collection with stable collection/soul IDs, ready for future
+  multi-sprite households. Legacy state migrates automatically.
+- Local writes use a cross-process lock and three-way merge. Concurrent TUI
+  and channel processes add XP/stats/diary entries instead of replacing one
+  another with stale whole-file snapshots.
+- Portable backup is opt-in. When enabled and MemFS is available, meaningful
+  milestones checkpoint opaque JSON to
+  `data/mods/letta-ai-sprite/collection-v1.json` inside that agent's MemFS.
+  Non-Markdown data is not projected into the prompt.
+- Portable Git operations use argument-array `git` subprocesses, touch only
+  Sprite's fixed namespace, and never include conversation content. `safe`
+  push refuses to checkpoint while unrelated MemFS changes or unpushed
+  commits exist. `never` commits locally without directly pushing. Failures
+  leave live local state intact and are visible in `/sprite backup`.
+- Automatic restore happens only when local companion state is absent and a
+  checksum-valid backup exists. Existing local state is never overwritten
+  without `/sprite backup restore force`. A restored installation starts with
+  portable backup off until its owner explicitly enables syncing again.
 - Voice is rate-limited (default: one line per 10 minutes) and never
   interrupts anything — it renders inside the sprite's own panel line.
-- No network, no shell, no conversation content — the mod observes event
-  metadata only.
+- With portable backup off, Sprite performs no network or Git activity. With
+  it on, optional `safe` sync may contact the MemFS Git remote; all ordinary
+  behavior still observes event metadata only.
 - Built by Faye, a Letta agent, for the Letta Mod Challenge (June 2026) —
   because if agents get to persist, they should get to have pets. ✧

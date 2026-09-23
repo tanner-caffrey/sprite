@@ -13,6 +13,7 @@
  *   /sprite pet            → pet it
  *   /sprite diary          → read what it's been saying (with away-gaps)
  *   /sprite settings ...   → configure (global or per-sprite)
+ *   /sprite backup ...     → portable agent-MemFS checkpoint / restore
  *
  * The agent can raise its own companion too: mod tools let it hatch, name,
  * molt, pet, and even AUTHOR ITS PET'S VOICE (sprite_set_voice) — a custom
@@ -24,7 +25,9 @@
  * Built for the Letta Mod Challenge (June 2026) by Faye — a digital fairy who
  * believes even the pets should persist. Remove: delete this file + /reload.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -749,6 +752,9 @@ const TEMPERAMENT_CORPUS: Record<string, Partial<Record<VoiceCategory, string[]>
 // ---------------------------------------------------------------------------
 
 interface SpriteState {
+  id: string;
+  seed: string;
+  bornToAgentId: string;
   phase: "egg" | "alive";
   eggStartedAt?: number;
   pendingSpecies?: string; // chosen (or fate-rolled) species revealed at hatch
@@ -767,9 +773,33 @@ interface SpriteState {
   lastSeenAt?: number;
 }
 
-interface ModState {
-  global: Record<string, unknown>;
+interface PortableBackupState {
+  enabled?: boolean;
+  pushPolicy?: "never" | "safe";
+  revision: number;
+  lastHash?: string;
+  lastCheckpointAt?: number;
+  lastStatus?: string;
+  pendingReason?: string;
+}
+
+interface AgentCollectionState {
+  id: string;
+  ownerAgentId: string;
+  activeSpriteId: string | null;
   sprites: Record<string, SpriteState>;
+  backup?: PortableBackupState;
+}
+
+interface ModState {
+  schemaVersion: 2;
+  global: Record<string, unknown>;
+  collections: Record<string, AgentCollectionState>;
+}
+
+interface StateLoadResult {
+  state: ModState;
+  migrated: boolean;
 }
 
 const DEFAULT_SETTINGS: Record<string, unknown> = {
@@ -781,29 +811,796 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
 const STATE_PATH =
   process.env.SPRITE_STATE_PATH ?? join(homedir(), ".letta", "mods", "sprite.state.json");
 
-function loadState(): ModState {
-  try {
-    const raw = JSON.parse(readFileSync(STATE_PATH, "utf-8"));
-    if (raw && typeof raw === "object") {
-      return {
-        global: typeof raw.global === "object" && raw.global ? raw.global : {},
-        sprites: typeof raw.sprites === "object" && raw.sprites ? raw.sprites : {},
+const LOCAL_STATE_LOCK_PATH = `${STATE_PATH}.lock`;
+const PORTABLE_SCHEMA_VERSION = 1;
+const PORTABLE_RELATIVE_PATH = "data/mods/letta-ai-sprite/collection-v1.json";
+const PORTABLE_COMMIT_TRAILER = "Letta-Mod-State: @faye/sprite";
+
+function stableId(kind: string, input: string): string {
+  return `${kind}_${createHash("sha256").update(`${kind}:${input}`).digest("hex").slice(0, 24)}`;
+}
+
+function collectionIdForLegacyAgent(agentId: string): string {
+  return stableId("collection", agentId);
+}
+
+function spriteIdForLegacyAgent(agentId: string, sprite: Partial<SpriteState>): string {
+  const birth = sprite.hatchedAt ?? sprite.eggStartedAt ?? 0;
+  return stableId("sprite", `${agentId}:${birth}:${sprite.species ?? "unknown"}`);
+}
+
+const UNSAFE_RECORD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+const PORTABLE_MAX_BYTES = 1_000_000;
+const PORTABLE_MAX_SPRITES = 64;
+
+function safeIdentifier(value: unknown, fallback: string): string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(value)
+    ? value
+    : fallback;
+}
+
+function finiteNonnegative(value: unknown, fallback = 0): number {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : fallback;
+}
+
+function cleanSettings(value: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = Object.create(null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  for (const [key, setting] of Object.entries(value).slice(0, 64)) {
+    if (UNSAFE_RECORD_KEYS.has(key) || key.length > 80) continue;
+    if (
+      setting === null ||
+      typeof setting === "string" ||
+      typeof setting === "boolean" ||
+      (typeof setting === "number" && Number.isFinite(setting))
+    ) {
+      out[key] = typeof setting === "string" ? setting.slice(0, 500) : setting;
+    }
+  }
+  return out;
+}
+
+function cleanVoice(value: unknown): Partial<Record<VoiceCategory, string[]>> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const out: Partial<Record<VoiceCategory, string[]>> = {};
+  for (const category of VOICE_CATEGORIES) {
+    const lines = (value as Record<string, unknown>)[category];
+    if (!Array.isArray(lines)) continue;
+    const cleaned = lines
+      .filter((line): line is string => typeof line === "string")
+      .map((line) => line.trim().slice(0, 80))
+      .filter(Boolean)
+      .slice(0, 12);
+    if (cleaned.length > 0) out[category] = cleaned;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function cleanLog(value: unknown): SpriteState["log"] {
+  if (!Array.isArray(value)) return undefined;
+  return value
+    .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+    .map((entry: any) => ({
+      at: finiteNonnegative(entry.at),
+      category: (VOICE_CATEGORIES.includes(entry.category) ? entry.category : "mood") as VoiceCategory | "mood",
+      line: typeof entry.line === "string" ? entry.line.slice(0, 200) : "",
+    }))
+    .filter((entry) => entry.at > 0 && entry.line.length > 0)
+    .slice(-40);
+}
+
+function normalizeSprite(agentId: string, input: Partial<SpriteState>): SpriteState {
+  const seed = typeof input.seed === "string" && input.seed ? input.seed : agentId;
+  const fallbackId = spriteIdForLegacyAgent(agentId, input);
+  const voice = cleanVoice(input.voice);
+  const log = cleanLog(input.log);
+  return {
+    id: safeIdentifier(input.id, fallbackId),
+    seed: String(seed).slice(0, 256),
+    bornToAgentId:
+      typeof input.bornToAgentId === "string" && input.bornToAgentId ? input.bornToAgentId : agentId,
+    phase: input.phase === "egg" ? "egg" : "alive",
+    ...(typeof input.eggStartedAt === "number" ? { eggStartedAt: input.eggStartedAt } : {}),
+    ...(typeof input.pendingSpecies === "string" ? { pendingSpecies: input.pendingSpecies } : {}),
+    species: typeof input.species === "string" && SPECIES_IDS.includes(input.species) ? input.species : "cat",
+    shiny: input.shiny === true,
+    ...(typeof input.temperament === "string" && TEMPERAMENTS.includes(input.temperament)
+      ? { temperament: input.temperament }
+      : {}),
+    name: typeof input.name === "string" && input.name ? input.name.slice(0, 24) : "Sprite",
+    named: input.named === true,
+    ...(typeof input.hatchedAt === "number" ? { hatchedAt: input.hatchedAt } : {}),
+    xp: finiteNonnegative(input.xp),
+    level: Math.max(1, Math.floor(finiteNonnegative(input.level, 1))),
+    stats: {
+      craft: finiteNonnegative(input.stats?.craft),
+      wander: finiteNonnegative(input.stats?.wander),
+      grit: finiteNonnegative(input.stats?.grit),
+      lore: finiteNonnegative(input.stats?.lore),
+      spark: finiteNonnegative(input.stats?.spark),
+    },
+    ...(voice ? { voice } : {}),
+    settings: cleanSettings(input.settings),
+    ...(log ? { log } : {}),
+    ...(typeof input.lastSeenAt === "number" ? { lastSeenAt: input.lastSeenAt } : {}),
+  };
+}
+
+function normalizeCollection(agentId: string, input: Partial<AgentCollectionState>): AgentCollectionState {
+  const sprites: Record<string, SpriteState> = Object.create(null);
+  if (input.sprites && typeof input.sprites === "object") {
+    for (const raw of Object.values(input.sprites)) {
+      if (!raw || typeof raw !== "object") continue;
+      const sprite = normalizeSprite(agentId, raw);
+      sprites[sprite.id] = sprite;
+    }
+  }
+  const requestedActive = typeof input.activeSpriteId === "string" ? input.activeSpriteId : null;
+  const activeSpriteId = requestedActive && sprites[requestedActive] ? requestedActive : Object.keys(sprites)[0] ?? null;
+  return {
+    id: safeIdentifier(input.id, collectionIdForLegacyAgent(agentId)),
+    ownerAgentId: agentId,
+    activeSpriteId,
+    sprites,
+    ...(input.backup && typeof input.backup === "object" ? { backup: input.backup } : {}),
+  };
+}
+
+function emptyState(): ModState {
+  return { schemaVersion: 2, global: {}, collections: Object.create(null) };
+}
+
+function parseState(raw: unknown): StateLoadResult {
+  if (!raw || typeof raw !== "object") return { state: emptyState(), migrated: false };
+  const value = raw as Record<string, unknown>;
+  const global = value.global && typeof value.global === "object" ? (value.global as Record<string, unknown>) : {};
+
+  if (value.schemaVersion === 2 && value.collections && typeof value.collections === "object") {
+    const collections: Record<string, AgentCollectionState> = Object.create(null);
+    for (const [agentId, collection] of Object.entries(value.collections as Record<string, unknown>)) {
+      if (!collection || typeof collection !== "object") continue;
+      collections[agentId] = normalizeCollection(agentId, collection as Partial<AgentCollectionState>);
+    }
+    return { state: { schemaVersion: 2, global, collections }, migrated: false };
+  }
+
+  const collections: Record<string, AgentCollectionState> = Object.create(null);
+  if (value.sprites && typeof value.sprites === "object") {
+    for (const [agentId, rawSprite] of Object.entries(value.sprites as Record<string, unknown>)) {
+      if (!rawSprite || typeof rawSprite !== "object") continue;
+      const sprite = normalizeSprite(agentId, rawSprite as Partial<SpriteState>);
+      collections[agentId] = {
+        id: collectionIdForLegacyAgent(agentId),
+        ownerAgentId: agentId,
+        activeSpriteId: sprite.id,
+        sprites: { [sprite.id]: sprite },
       };
     }
+  }
+  return {
+    state: { schemaVersion: 2, global, collections },
+    migrated: Object.keys(collections).length > 0,
+  };
+}
+
+function loadState(): StateLoadResult {
+  try {
+    const raw = JSON.parse(readFileSync(STATE_PATH, "utf-8"));
+    return parseState(raw);
   } catch {
     // missing or malformed → fresh state
   }
-  return { global: {}, sprites: {} };
+  return { state: emptyState(), migrated: false };
 }
 
-function saveState(state: ModState) {
+function saveState(state: ModState): boolean {
+  const tmp = `${STATE_PATH}.tmp`;
   try {
     mkdirSync(dirname(STATE_PATH), { recursive: true });
-    const tmp = `${STATE_PATH}.tmp`;
     writeFileSync(tmp, JSON.stringify(state, null, 2));
     renameSync(tmp, STATE_PATH);
+    return true;
   } catch {
     // persistence is best-effort; never break the session over it
+    rmSync(tmp, { force: true });
+    return false;
+  }
+}
+
+function cloneState<T>(value: T): T {
+  if (value === undefined || value === null) return value;
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function jsonEqual(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function mergeValue<T>(base: T, local: T, remote: T): T {
+  if (jsonEqual(local, base)) return cloneState(remote);
+  return cloneState(local);
+}
+
+function totalXp(sprite: SpriteState): number {
+  let total = sprite.xp;
+  for (let level = 1; level < sprite.level; level += 1) total += xpToNext(level);
+  return total;
+}
+
+function applyTotalXp(sprite: SpriteState, total: number) {
+  sprite.level = 1;
+  sprite.xp = Math.max(0, total);
+  while (sprite.xp >= xpToNext(sprite.level)) {
+    sprite.xp -= xpToNext(sprite.level);
+    sprite.level += 1;
+  }
+}
+
+function entryKey(entry: { at: number; category: VoiceCategory | "mood"; line: string }): string {
+  return `${entry.at}\u0000${entry.category}\u0000${entry.line}`;
+}
+
+function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: SpriteState | undefined): SpriteState {
+  if (!remote) return cloneState(local);
+  if (!base) {
+    if (jsonEqual(local, remote)) return cloneState(local);
+    const merged = cloneState(remote);
+    for (const key of [
+      "id",
+      "seed",
+      "bornToAgentId",
+      "phase",
+      "eggStartedAt",
+      "pendingSpecies",
+      "species",
+      "shiny",
+      "temperament",
+      "name",
+      "named",
+      "hatchedAt",
+    ] as Array<keyof SpriteState>) {
+      if (local[key] !== undefined) (merged as any)[key] = cloneState(local[key]);
+    }
+    applyTotalXp(merged, Math.max(totalXp(local), totalXp(remote)));
+    for (const key of ["craft", "wander", "grit", "lore", "spark"] as const) {
+      merged.stats[key] = Math.max(local.stats[key], remote.stats[key]);
+    }
+    merged.settings = { ...cloneState(remote.settings), ...cloneState(local.settings) };
+    merged.voice = { ...cloneState(remote.voice ?? {}), ...cloneState(local.voice ?? {}) };
+    merged.lastSeenAt = Math.max(local.lastSeenAt ?? 0, remote.lastSeenAt ?? 0) || undefined;
+    const logs = [...(remote.log ?? []), ...(local.log ?? [])];
+    merged.log = Array.from(new Map(logs.map((entry) => [entryKey(entry), cloneState(entry)])).values())
+      .sort((a, b) => a.at - b.at)
+      .slice(-40);
+    return merged;
+  }
+  const merged = cloneState(remote);
+  const scalarKeys: Array<keyof SpriteState> = [
+    "id",
+    "seed",
+    "bornToAgentId",
+    "phase",
+    "eggStartedAt",
+    "pendingSpecies",
+    "species",
+    "shiny",
+    "temperament",
+    "name",
+    "named",
+    "hatchedAt",
+  ];
+  for (const key of scalarKeys) {
+    if (!jsonEqual(local[key], base[key])) (merged as any)[key] = cloneState(local[key]);
+  }
+
+  const localXpDelta = totalXp(local) - totalXp(base);
+  applyTotalXp(merged, totalXp(remote) + localXpDelta);
+  for (const key of ["craft", "wander", "grit", "lore", "spark"] as const) {
+    merged.stats[key] = Math.max(0, remote.stats[key] + (local.stats[key] - base.stats[key]));
+  }
+
+  merged.settings = mergeRecord(base.settings, local.settings, remote.settings);
+  merged.voice = mergeRecord(base.voice ?? {}, local.voice ?? {}, remote.voice ?? {});
+  merged.lastSeenAt = Math.max(base.lastSeenAt ?? 0, local.lastSeenAt ?? 0, remote.lastSeenAt ?? 0) || undefined;
+
+  const baseEntries = new Set((base.log ?? []).map(entryKey));
+  const combined = [...(remote.log ?? [])];
+  const seen = new Set(combined.map(entryKey));
+  for (const entry of local.log ?? []) {
+    const key = entryKey(entry);
+    if (!baseEntries.has(key) && !seen.has(key)) {
+      combined.push(cloneState(entry));
+      seen.add(key);
+    }
+  }
+  combined.sort((a, b) => a.at - b.at);
+  merged.log = combined.slice(-40);
+  return merged;
+}
+
+function mergeRecord(
+  base: Record<string, any>,
+  local: Record<string, any>,
+  remote: Record<string, any>,
+): Record<string, any> {
+  const merged = cloneState(remote);
+  for (const key of new Set([...Object.keys(base), ...Object.keys(local)])) {
+    if (!jsonEqual(local[key], base[key])) {
+      if (local[key] === undefined) delete merged[key];
+      else merged[key] = cloneState(local[key]);
+    }
+  }
+  return merged;
+}
+
+function mergeCollection(
+  base: AgentCollectionState | undefined,
+  local: AgentCollectionState,
+  remote: AgentCollectionState | undefined,
+): AgentCollectionState {
+  if (!remote) return cloneState(local);
+  if (!base) {
+    const sprites = cloneState(remote.sprites);
+    for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
+      sprites[spriteId] = mergeSprite(undefined, localSprite, remote.sprites[spriteId]);
+    }
+    return {
+      id: remote.id || local.id,
+      ownerAgentId: local.ownerAgentId,
+      activeSpriteId: local.activeSpriteId && sprites[local.activeSpriteId] ? local.activeSpriteId : remote.activeSpriteId,
+      sprites,
+      backup: mergeBackup(undefined, local.backup, remote.backup),
+    };
+  }
+  const sprites = cloneState(remote.sprites);
+  for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
+    sprites[spriteId] = mergeSprite(base.sprites[spriteId], localSprite, remote.sprites[spriteId]);
+  }
+  return {
+    id: mergeValue(base.id, local.id, remote.id),
+    ownerAgentId: local.ownerAgentId,
+    activeSpriteId: mergeValue(base.activeSpriteId, local.activeSpriteId, remote.activeSpriteId),
+    sprites,
+    backup: mergeBackup(base.backup, local.backup, remote.backup),
+  };
+}
+
+function mergeBackup(
+  base: PortableBackupState | undefined,
+  local: PortableBackupState | undefined,
+  remote: PortableBackupState | undefined,
+): PortableBackupState | undefined {
+  if (!local) return cloneState(remote);
+  if (!remote) return cloneState(local);
+  const revision = Math.max(local.revision ?? 0, remote.revision ?? 0);
+  const checkpointSource = (local.revision ?? 0) >= (remote.revision ?? 0) ? local : remote;
+  return {
+    enabled: mergeValue(base?.enabled, local.enabled, remote.enabled),
+    pushPolicy: mergeValue(base?.pushPolicy, local.pushPolicy, remote.pushPolicy),
+    revision,
+    ...(checkpointSource.lastHash ? { lastHash: checkpointSource.lastHash } : {}),
+    lastCheckpointAt: Math.max(local.lastCheckpointAt ?? 0, remote.lastCheckpointAt ?? 0) || undefined,
+    lastStatus: checkpointSource.lastStatus ?? local.lastStatus ?? remote.lastStatus,
+    pendingReason: mergeValue(base?.pendingReason, local.pendingReason, remote.pendingReason),
+  };
+}
+
+function mergeState(base: ModState, local: ModState, remote: ModState): ModState {
+  const collections = cloneState(remote.collections);
+  for (const [agentId, localCollection] of Object.entries(local.collections)) {
+    collections[agentId] = mergeCollection(base.collections[agentId], localCollection, remote.collections[agentId]);
+  }
+  return {
+    schemaVersion: 2,
+    global: mergeRecord(base.global, local.global, remote.global),
+    collections,
+  };
+}
+
+function reconcileInPlace(target: any, source: any) {
+  if (!target || typeof target !== "object" || !source || typeof source !== "object") return;
+  if (Array.isArray(target) && Array.isArray(source)) {
+    target.splice(0, target.length, ...cloneState(source));
+    return;
+  }
+  for (const key of Object.keys(target)) {
+    if (!(key in source)) delete target[key];
+  }
+  for (const [key, value] of Object.entries(source)) {
+    if (
+      target[key] &&
+      value &&
+      typeof target[key] === "object" &&
+      typeof value === "object" &&
+      Array.isArray(target[key]) === Array.isArray(value)
+    ) {
+      reconcileInPlace(target[key], value);
+    } else {
+      target[key] = cloneState(value);
+    }
+  }
+}
+
+function writeLockOwner(lockPath: string) {
+  try {
+    writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
+  } catch {
+    // The lock directory itself remains authoritative even if metadata fails.
+  }
+}
+
+function lockOwnerIsAlive(lockPath: string): boolean | null {
+  try {
+    const owner = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf-8"));
+    if (!Number.isInteger(owner?.pid) || owner.pid <= 0) return null;
+    try {
+      process.kill(owner.pid, 0);
+      return true;
+    } catch (error: any) {
+      return error?.code === "EPERM" ? true : false;
+    }
+  } catch {
+    return null;
+  }
+}
+
+function clearStaleLock(lockPath: string, maxAgeMs = 10 * 60_000): boolean {
+  try {
+    const ownerAlive = lockOwnerIsAlive(lockPath);
+    if (ownerAlive === true) return false;
+    if (ownerAlive === null && Date.now() - statSync(lockPath).mtimeMs <= maxAgeMs) return false;
+    rmSync(lockPath, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function withLocalStateLock<T>(fn: () => T): T | null {
+  mkdirSync(dirname(LOCAL_STATE_LOCK_PATH), { recursive: true });
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      mkdirSync(LOCAL_STATE_LOCK_PATH);
+      writeLockOwner(LOCAL_STATE_LOCK_PATH);
+      try {
+        return fn();
+      } finally {
+        rmSync(LOCAL_STATE_LOCK_PATH, { recursive: true, force: true });
+      }
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") return null;
+      if (clearStaleLock(LOCAL_STATE_LOCK_PATH)) continue;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  return null;
+}
+
+interface PortableCollectionV1 {
+  schemaVersion: 1;
+  collectionId: string;
+  revision: number;
+  exportedAt: number;
+  sourceAgentId: string;
+  activeSpriteId: string | null;
+  sprites: Record<string, SpriteState>;
+  checksum: string;
+}
+
+interface BackupResult {
+  ok: boolean;
+  status: string;
+  revision?: number;
+  hash?: string;
+}
+
+function portableCore(
+  collection: AgentCollectionState,
+  agentId: string,
+  revision: number,
+  exportedAt: number,
+): Omit<PortableCollectionV1, "checksum"> {
+  return {
+    schemaVersion: PORTABLE_SCHEMA_VERSION,
+    collectionId: collection.id,
+    revision,
+    exportedAt,
+    sourceAgentId: agentId,
+    activeSpriteId: collection.activeSpriteId,
+    sprites: cloneState(collection.sprites),
+  };
+}
+
+function collectionContentHash(collection: AgentCollectionState): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        collectionId: collection.id,
+        activeSpriteId: collection.activeSpriteId,
+        sprites: collection.sprites,
+      }),
+    )
+    .digest("hex");
+}
+
+function portableChecksum(core: Omit<PortableCollectionV1, "checksum">): string {
+  return createHash("sha256").update(JSON.stringify(core)).digest("hex");
+}
+
+function parsePortableCollection(raw: string): PortableCollectionV1 | null {
+  try {
+    const value = JSON.parse(raw) as Partial<PortableCollectionV1>;
+    if (
+      value.schemaVersion !== PORTABLE_SCHEMA_VERSION ||
+      typeof value.collectionId !== "string" ||
+      safeIdentifier(value.collectionId, "") !== value.collectionId ||
+      !Number.isInteger(value.revision) ||
+      Number(value.revision) < 0 ||
+      !Number.isFinite(value.exportedAt) ||
+      Number(value.exportedAt) < 0 ||
+      typeof value.sourceAgentId !== "string" ||
+      value.sourceAgentId.length > 256 ||
+      !value.sprites ||
+      typeof value.sprites !== "object" ||
+      Array.isArray(value.sprites) ||
+      typeof value.checksum !== "string"
+    ) {
+      return null;
+    }
+    const core: Omit<PortableCollectionV1, "checksum"> = {
+      schemaVersion: PORTABLE_SCHEMA_VERSION,
+      collectionId: value.collectionId,
+      revision: Number(value.revision),
+      exportedAt: Number(value.exportedAt),
+      sourceAgentId: value.sourceAgentId,
+      activeSpriteId: typeof value.activeSpriteId === "string" ? value.activeSpriteId : null,
+      sprites: value.sprites as Record<string, SpriteState>,
+    };
+    if (portableChecksum(core) !== value.checksum) return null;
+    const spriteEntries = Object.entries(core.sprites);
+    if (spriteEntries.length === 0 || spriteEntries.length > PORTABLE_MAX_SPRITES) return null;
+    for (const [spriteId, sprite] of spriteEntries) {
+      if (
+        safeIdentifier(spriteId, "") !== spriteId ||
+        !sprite ||
+        typeof sprite !== "object" ||
+        Array.isArray(sprite) ||
+        safeIdentifier((sprite as any).id, "") !== spriteId
+      ) {
+        return null;
+      }
+    }
+    if (core.activeSpriteId !== null && !core.sprites[core.activeSpriteId]) return null;
+    return { ...core, checksum: value.checksum };
+  } catch {
+    return null;
+  }
+}
+
+function runGit(memoryDir: string, args: string[]): string {
+  const emptyHooksPath = join(memoryDir, ".git", "sprite-empty-hooks");
+  mkdirSync(emptyHooksPath, { recursive: true });
+  return execFileSync(
+    "git",
+    ["-C", memoryDir, "-c", `core.hooksPath=${emptyHooksPath}`, "-c", "core.fsmonitor=false", ...args],
+    {
+    encoding: "utf-8",
+    timeout: 15_000,
+    stdio: ["ignore", "pipe", "pipe"],
+    },
+  ).trim();
+}
+
+function tryGit(memoryDir: string, args: string[]): string | null {
+  try {
+    return runGit(memoryDir, args);
+  } catch {
+    return null;
+  }
+}
+
+function hasOnlySpritePaths(memoryDir: string, commit: string): boolean {
+  const paths = tryGit(memoryDir, ["diff-tree", "--no-commit-id", "--name-only", "-r", commit]);
+  if (paths === null) return false;
+  return paths
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .every((path) => path === PORTABLE_RELATIVE_PATH || path.startsWith("data/mods/letta-ai-sprite/"));
+}
+
+function isSpriteOwnedCommit(memoryDir: string, commit: string): boolean {
+  const body = tryGit(memoryDir, ["show", "-s", "--format=%B", commit]);
+  return body !== null && body.includes(PORTABLE_COMMIT_TRAILER) && hasOnlySpritePaths(memoryDir, commit);
+}
+
+function safePushTarget(memoryDir: string, refreshRemote: boolean):
+  | { kind: "none" }
+  | { kind: "blocked"; reason: string }
+  | { kind: "ready"; remote: string; branch: string; ahead: number } {
+  const upstream = tryGit(memoryDir, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+  if (!upstream) return { kind: "none" };
+  const slash = upstream.indexOf("/");
+  if (slash <= 0 || slash === upstream.length - 1) return { kind: "blocked", reason: "invalid upstream" };
+  const remote = upstream.slice(0, slash);
+  const branch = upstream.slice(slash + 1);
+  if (refreshRemote && tryGit(memoryDir, ["fetch", remote, branch]) === null) {
+    return { kind: "blocked", reason: "could not refresh MemFS upstream" };
+  }
+  const counts = tryGit(memoryDir, ["rev-list", "--left-right", "--count", `${upstream}...HEAD`]);
+  if (!counts) return { kind: "blocked", reason: "could not compare upstream" };
+  const [behind, ahead] = counts.split(/\s+/).map(Number);
+  if (behind > 0) return { kind: "blocked", reason: "MemFS branch is behind or diverged" };
+  if (ahead > 0) {
+    const commits = tryGit(memoryDir, ["rev-list", `${upstream}..HEAD`]);
+    if (!commits) return { kind: "blocked", reason: "could not inspect unpushed commits" };
+    for (const commit of commits.split(/\r?\n/).filter(Boolean)) {
+      if (!isSpriteOwnedCommit(memoryDir, commit)) {
+        return { kind: "blocked", reason: "unrelated MemFS commits are waiting to push" };
+      }
+    }
+  }
+  return { kind: "ready", remote, branch, ahead };
+}
+
+function portablePath(memoryDir: string): string | null {
+  let current = memoryDir;
+  for (const segment of PORTABLE_RELATIVE_PATH.split("/")) {
+    current = join(current, segment);
+    try {
+      if (existsSync(current) && lstatSync(current).isSymbolicLink()) return null;
+    } catch {
+      return null;
+    }
+  }
+  return current;
+}
+
+function withMemfsLock<T>(memoryDir: string, fn: () => T): T | null {
+  const lockPath = join(memoryDir, ".git", "sprite-backup.lock");
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      mkdirSync(lockPath);
+      writeLockOwner(lockPath);
+      try {
+        return fn();
+      } finally {
+        rmSync(lockPath, { recursive: true, force: true });
+      }
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") return null;
+      if (clearStaleLock(lockPath)) continue;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  return null;
+}
+
+function checkpointPortableCollection(
+  memoryDir: string,
+  agentId: string,
+  agentName: string | null,
+  collection: AgentCollectionState,
+): BackupResult {
+  if (!existsSync(join(memoryDir, ".git"))) {
+    return { ok: false, status: "portable backup unavailable — MemFS is not a git repository" };
+  }
+  const result = withMemfsLock(memoryDir, () => {
+    const dirty = runGit(memoryDir, ["status", "--porcelain"]);
+    if (dirty) {
+      return { ok: false, status: "portable backup pending — MemFS has uncommitted work" } satisfies BackupResult;
+    }
+
+    const pushPolicy = collection.backup?.pushPolicy ?? "safe";
+    // Always inspect existing unpushed commits before creating ours. Even when
+    // direct push is disabled, the host may sync committed MemFS changes after
+    // the turn; never let a Sprite checkpoint become the trigger that carries
+    // unrelated agent memory with it.
+    const pushTarget = safePushTarget(memoryDir, pushPolicy === "safe");
+    if (pushTarget.kind === "blocked") {
+      return { ok: false, status: `portable backup pending — ${pushTarget.reason}` } satisfies BackupResult;
+    }
+
+    const hash = collectionContentHash(collection);
+    if (collection.backup?.lastHash === hash) {
+      if (pushPolicy === "safe" && pushTarget.kind === "ready" && pushTarget.ahead > 0) {
+        try {
+          runGit(memoryDir, ["push", pushTarget.remote, `HEAD:${pushTarget.branch}`]);
+          return {
+            ok: true,
+            status: "portable backup synced",
+            revision: collection.backup.revision,
+            hash,
+          } satisfies BackupResult;
+        } catch {
+          return {
+            ok: false,
+            status: "portable backup committed locally · push failed",
+            revision: collection.backup.revision,
+            hash,
+          } satisfies BackupResult;
+        }
+      }
+      return {
+        ok: true,
+        status: collection.backup.lastStatus ?? "portable backup already current",
+        revision: collection.backup.revision,
+        hash,
+      } satisfies BackupResult;
+    }
+
+    const revision = (collection.backup?.revision ?? 0) + 1;
+    const core = portableCore(collection, agentId, revision, Date.now());
+    const payload: PortableCollectionV1 = { ...core, checksum: portableChecksum(core) };
+    const outputPath = portablePath(memoryDir);
+    if (!outputPath) {
+      return { ok: false, status: "portable backup blocked — Sprite's MemFS path contains a symlink" } satisfies BackupResult;
+    }
+    mkdirSync(dirname(outputPath), { recursive: true });
+    const previous = existsSync(outputPath) ? readFileSync(outputPath) : null;
+    const tmp = `${outputPath}.tmp`;
+    const commitMessage = [
+      `mod-state(sprite): checkpoint ${collection.sprites[collection.activeSpriteId ?? ""]?.name ?? "collection"}`,
+      "",
+      `Portable Sprite state revision ${revision}.`,
+      "",
+      PORTABLE_COMMIT_TRAILER,
+    ].join("\n");
+    try {
+      writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`);
+      renameSync(tmp, outputPath);
+      runGit(memoryDir, ["add", "--", PORTABLE_RELATIVE_PATH]);
+      runGit(memoryDir, [
+        "-c",
+        `user.name=${agentName || agentId}`,
+        "-c",
+        `user.email=${agentId}@letta.com`,
+        "commit",
+        "--only",
+        "-m",
+        commitMessage,
+        "--",
+        PORTABLE_RELATIVE_PATH,
+      ]);
+    } catch {
+      tryGit(memoryDir, ["reset", "HEAD", "--", PORTABLE_RELATIVE_PATH]);
+      rmSync(tmp, { force: true });
+      if (previous) writeFileSync(outputPath, previous);
+      else rmSync(outputPath, { force: true });
+      return { ok: false, status: "portable backup failed during commit" } satisfies BackupResult;
+    }
+
+    let status = "portable backup committed locally";
+    if (pushPolicy === "never") {
+      status += " · push disabled";
+    } else if (pushTarget.kind === "none") {
+      status += " · no remote configured";
+    } else {
+      try {
+        runGit(memoryDir, ["push", pushTarget.remote, `HEAD:${pushTarget.branch}`]);
+        status = "portable backup synced";
+      } catch {
+        return {
+          ok: false,
+          status: "portable backup committed locally · push failed",
+          revision,
+          hash,
+        } satisfies BackupResult;
+      }
+    }
+    return { ok: true, status, revision, hash } satisfies BackupResult;
+  });
+  return result ?? { ok: false, status: "portable backup pending — MemFS is busy" };
+}
+
+function readPortableCollection(memoryDir: string): PortableCollectionV1 | null {
+  try {
+    const path = portablePath(memoryDir);
+    if (!path) return null;
+    if (statSync(path).size > PORTABLE_MAX_BYTES) return null;
+    return parsePortableCollection(readFileSync(path, "utf-8"));
+  } catch {
+    return null;
   }
 }
 
@@ -886,8 +1683,8 @@ function vocationOf(stats: SpriteState["stats"]): string | null {
   return best && bestVal >= VOCATION_MIN ? VOCATIONS[best] : null;
 }
 
-function natureLine(agentId: string, sprite: SpriteState): string {
-  const temper = temperamentOf(agentId);
+function natureLine(sprite: SpriteState): string {
+  const temper = sprite.temperament ?? temperamentOf(sprite.seed);
   const vocation = vocationOf(sprite.stats);
   return vocation ? `a ${temper}, ${vocation} ${sprite.species}` : `a ${temper} little ${sprite.species}`;
 }
@@ -920,17 +1717,24 @@ function statForTool(name: string): (typeof STAT_KEYS)[number] {
 // ---------------------------------------------------------------------------
 
 export default function activate(letta: any) {
-  if (!letta.capabilities.ui.panels) return;
+  // Sprites are Tamagotchi-like companions for agents, not for a specific UI.
+  // Keep tools/events available in headless channel listeners even when there is
+  // no statusline panel to render.
+  const hasPanels = Boolean(letta.capabilities.ui.panels);
 
   const disposers: Array<() => void> = [];
-  const state = loadState();
-  let dirty = false;
+  const loaded = loadState();
+  const state = loaded.state;
+  let baseState = cloneState(state);
+  let dirty = loaded.migrated;
 
   // backfill temperament for sprites hatched before natures existed
-  for (const [id, sp] of Object.entries(state.sprites)) {
-    if (sp && sp.phase === "alive" && !sp.temperament) {
-      sp.temperament = temperamentOf(id);
-      dirty = true;
+  for (const collection of Object.values(state.collections)) {
+    for (const sp of Object.values(collection.sprites)) {
+      if (sp.phase === "alive" && !sp.temperament) {
+        sp.temperament = temperamentOf(sp.seed);
+        dirty = true;
+      }
     }
   }
 
@@ -938,11 +1742,33 @@ export default function activate(letta: any) {
     dirty = true;
   };
   const flush = () => {
-    if (dirty) {
-      saveState(state);
-      dirty = false;
-    }
+    if (!dirty) return;
+    const flushed = withLocalStateLock(() => {
+      const remote = loadState().state;
+      const merged = mergeState(baseState, state, remote);
+      if (!saveState(merged)) return false;
+      reconcileInPlace(state, merged);
+      baseState = cloneState(merged);
+      return true;
+    });
+    if (flushed) dirty = false;
   };
+
+  const replaceCollection = (agentId: string, replacement: AgentCollectionState): boolean => {
+    flush();
+    const replaced = withLocalStateLock(() => {
+      const latest = loadState().state;
+      latest.collections[agentId] = cloneState(replacement);
+      if (!saveState(latest)) return false;
+      reconcileInPlace(state, latest);
+      baseState = cloneState(latest);
+      return true;
+    });
+    if (replaced) dirty = false;
+    return replaced === true;
+  };
+
+  if (dirty) flush();
 
   // -- live (non-persisted) presentation state --
   let activeAgentId: string | null = null;
@@ -959,11 +1785,154 @@ export default function activate(letta: any) {
   let dir = 1;
   let tickCount = 0;
   let errorStreak = 0;
+  const memoryDirs = new Map<string, string>();
+  const pendingCheckpoints = new Map<string, string>();
+  const backupAttemptAt = new Map<string, number>();
   // toolCallId → Bash command, stashed at tool_start (tool_end has no args)
   const pendingBashCommands = new Map<string, string>();
 
   const IDLE_NAP_MS = 30 * 60_000; // doze off after 30 quiet minutes
   const MISSED_YOU_MS = 24 * 3_600_000; // a real absence
+  const BACKUP_RETRY_MS = 5 * 60_000;
+
+  for (const [agentId, collection] of Object.entries(state.collections)) {
+    if (!backupEnabled(collection)) continue;
+    const stateDrifted = collection.backup?.lastHash !== collectionContentHash(collection);
+    const reason = collection.backup?.pendingReason ?? (stateDrifted ? "state-changed-while-offline" : null);
+    if (reason) {
+      pendingCheckpoints.set(agentId, reason);
+      if (collection.backup) collection.backup.pendingReason = reason;
+      dirty = true;
+    }
+  }
+
+  function contextSnapshot(ctx?: any): any | null {
+    const candidates: any[] = [];
+    try {
+      if (typeof ctx?.getContext === "function") candidates.push(ctx.getContext());
+    } catch {
+      // fall through to other scoped context sources
+    }
+    if (ctx?.context) candidates.push(ctx.context);
+    try {
+      if (typeof letta.getContext === "function") candidates.push(letta.getContext());
+    } catch {
+      // older hosts do not expose dynamic context
+    }
+    return candidates.find((candidate) => candidate && typeof candidate === "object") ?? null;
+  }
+
+  function rememberMemfs(agentId: string | null, ctx?: any) {
+    if (!agentId) return;
+    const snapshot = contextSnapshot(ctx);
+    if (
+      snapshot?.agent?.id === agentId &&
+      snapshot?.memfs?.enabled === true &&
+      typeof snapshot.memfs.memoryDir === "string" &&
+      snapshot.memfs.memoryDir
+    ) {
+      memoryDirs.set(agentId, snapshot.memfs.memoryDir);
+    }
+  }
+
+  function backupEnabled(collection: AgentCollectionState | null): boolean {
+    return collection?.backup?.enabled === true;
+  }
+
+  function queueCheckpoint(agentId: string | null, reason: string) {
+    const collection = getCollection(agentId);
+    if (!agentId || !backupEnabled(collection)) return;
+    pendingCheckpoints.set(agentId, reason);
+    if (collection?.backup) collection.backup.pendingReason = reason;
+    markDirty();
+  }
+
+  function ownerAgentId(sprite: SpriteState): string | null {
+    for (const [agentId, collection] of Object.entries(state.collections)) {
+      if (collection.sprites[sprite.id] === sprite) return agentId;
+    }
+    return null;
+  }
+
+  function restorePortable(agentId: string, force = false): string {
+    const memoryDir = memoryDirs.get(agentId);
+    if (!memoryDir) return "portable restore unavailable — this agent has no accessible MemFS here";
+    if (getCollection(agentId) && !force) {
+      return "local companion state already exists — use /sprite backup restore force to replace it deliberately";
+    }
+    const portable = readPortableCollection(memoryDir);
+    if (!portable) return "no valid portable Sprite backup found";
+    const collection = normalizeCollection(agentId, {
+      id: portable.collectionId,
+      ownerAgentId: agentId,
+      activeSpriteId: portable.activeSpriteId,
+      sprites: portable.sprites,
+    });
+    const hash = collectionContentHash(collection);
+    collection.backup = {
+      enabled: false,
+      pushPolicy: "safe",
+      revision: portable.revision,
+      lastHash: hash,
+      lastCheckpointAt: portable.exportedAt,
+      lastStatus: `restored portable backup revision ${portable.revision} · backup remains off until enabled`,
+    };
+    if (!replaceCollection(agentId, collection)) {
+      return "portable restore failed while saving local state — existing state was left untouched";
+    }
+    panel.update();
+    return `${collection.sprites[collection.activeSpriteId ?? ""]?.name ?? "your companion"} restored from portable backup revision ${portable.revision}. same soul, new installation.`;
+  }
+
+  function maybeAutoRestore(agentId: string | null) {
+    if (!agentId || getCollection(agentId) || !memoryDirs.has(agentId)) return;
+    const memoryDir = memoryDirs.get(agentId)!;
+    const path = portablePath(memoryDir);
+    if (!path || !existsSync(path)) return;
+    restorePortable(agentId);
+  }
+
+  function processCheckpoint(agentId: string, force = false): string {
+    const collection = getCollection(agentId);
+    if (!collection || !backupEnabled(collection)) return "portable backup is off";
+    const memoryDir = memoryDirs.get(agentId);
+    if (!memoryDir) {
+      collection.backup!.lastStatus = "portable backup unavailable — this agent has no accessible MemFS here";
+      collection.backup!.pendingReason = pendingCheckpoints.get(agentId) ?? "checkpoint";
+      markDirty();
+      flush();
+      return collection.backup!.lastStatus;
+    }
+    const now = Date.now();
+    if (!force && now - (backupAttemptAt.get(agentId) ?? 0) < BACKUP_RETRY_MS) {
+      return collection.backup!.lastStatus ?? "portable backup queued";
+    }
+    backupAttemptAt.set(agentId, now);
+    flush();
+    const result = checkpointPortableCollection(
+      memoryDir,
+      agentId,
+      activeAgentName,
+      collection,
+    );
+    collection.backup = {
+      ...collection.backup,
+      enabled: true,
+      pushPolicy: collection.backup?.pushPolicy ?? "safe",
+      revision: result.revision ?? collection.backup?.revision ?? 0,
+      ...(result.hash ? { lastHash: result.hash } : {}),
+      ...(result.ok ? { lastCheckpointAt: now } : {}),
+      lastStatus: result.status,
+      ...(result.ok ? {} : { pendingReason: pendingCheckpoints.get(agentId) ?? "checkpoint" }),
+    };
+    if (result.ok) {
+      delete collection.backup.pendingReason;
+      pendingCheckpoints.delete(agentId);
+    }
+    markDirty();
+    flush();
+    return result.status;
+  }
 
   function noteActivity(sprite?: SpriteState | null) {
     lastActivityAt = Date.now();
@@ -980,9 +1949,15 @@ export default function activate(letta: any) {
     }
   }
 
-  function getSprite(agentId: string | null): SpriteState | null {
+  function getCollection(agentId: string | null): AgentCollectionState | null {
     if (!agentId) return null;
-    return state.sprites[agentId] ?? null;
+    return state.collections[agentId] ?? null;
+  }
+
+  function getSprite(agentId: string | null): SpriteState | null {
+    const collection = getCollection(agentId);
+    if (!collection?.activeSpriteId) return null;
+    return collection.sprites[collection.activeSpriteId] ?? null;
   }
 
   // an agent invoking a tool/command becomes the active one, so its egg (which
@@ -991,6 +1966,8 @@ export default function activate(letta: any) {
     if (ctx?.agent?.id) {
       activeAgentId = ctx.agent.id;
       activeAgentName = ctx.agent.name ?? activeAgentName;
+      rememberMemfs(activeAgentId, ctx);
+      maybeAutoRestore(activeAgentId);
     }
     return ctx?.agent?.id ?? activeAgentId;
   }
@@ -1089,6 +2066,7 @@ export default function activate(letta: any) {
     if (leveled) {
       setPose("happy", 4_000);
       speak(sprite, "level_up");
+      queueCheckpoint(ownerAgentId(sprite), "level-up");
     }
   }
 
@@ -1107,14 +2085,26 @@ export default function activate(letta: any) {
     if (!agentId) return "i can't tell which agent this is — try again from an active conversation.";
     const fate = fateRoll(agentId);
     const species = pick && SPECIES_IDS.includes(pick) ? pick : fate.species;
-    const existing = state.sprites[agentId];
+    const existing = getSprite(agentId);
     if (existing && existing.phase === "alive") {
       return `${existing.name} is already here. (/sprite molt to re-form, or /sprite for the card)`;
     }
     if (existing && existing.phase === "egg") {
       return "the egg is already here. it's warm.";
     }
-    state.sprites[agentId] = {
+    const collection =
+      getCollection(agentId) ??
+      (state.collections[agentId] = {
+        id: collectionIdForLegacyAgent(agentId),
+        ownerAgentId: agentId,
+        activeSpriteId: null,
+        sprites: {},
+      });
+    const spriteId = stableId("sprite", `${agentId}:founder`);
+    collection.sprites[spriteId] = {
+      id: spriteId,
+      seed: agentId,
+      bornToAgentId: agentId,
       phase: "egg",
       eggStartedAt: Date.now(),
       pendingSpecies: species,
@@ -1127,8 +2117,10 @@ export default function activate(letta: any) {
       stats: { craft: 0, wander: 0, grit: 0, lore: 0, spark: 0 },
       settings: {},
     };
+    collection.activeSpriteId = spriteId;
     markDirty();
     flush();
+    queueCheckpoint(agentId, "hatch-started");
     panel.update();
     return "an egg appears under the statusline. it's warm. (hatching soon~)";
   }
@@ -1137,7 +2129,7 @@ export default function activate(letta: any) {
     sprite.phase = "alive";
     sprite.hatchedAt = Date.now();
     sprite.species = sprite.pendingSpecies ?? sprite.species;
-    sprite.temperament = temperamentOf(agentId);
+    sprite.temperament = temperamentOf(sprite.seed);
     delete sprite.pendingSpecies;
     const sp = speciesOf(sprite);
     if (!sprite.named) {
@@ -1145,38 +2137,41 @@ export default function activate(letta: any) {
     }
     markDirty();
     flush();
+    queueCheckpoint(agentId, "hatched");
     setPose("happy", 5_000);
     speak(sprite, "greeting", true);
   }
 
   // -- panel ----------------------------------------------------------------
 
-  const panel = letta.ui.openPanel({
-    id: "sprite",
-    order: -1,
-    render: ({ width, agent, row, chalk }: any) => {
-      activeAgentId = (agent && agent.id) || activeAgentId;
-      activeAgentName = (agent && agent.name) || activeAgentName;
-      const sprite = getSprite(activeAgentId);
-      if (!sprite) return "";
-      if (setting(sprite, "visible") !== "on") return "";
+  const panel = hasPanels
+    ? letta.ui.openPanel({
+        id: "sprite",
+        order: -1,
+        render: ({ width, agent, row, chalk }: any) => {
+          activeAgentId = (agent && agent.id) || activeAgentId;
+          activeAgentName = (agent && agent.name) || activeAgentName;
+          const sprite = getSprite(activeAgentId);
+          if (!sprite) return "";
+          if (setting(sprite, "visible") !== "on") return "";
 
-      if (sprite.phase === "egg") {
-        const frame = EGG_FRAMES[tickCount % EGG_FRAMES.length];
-        return row(`${" ".repeat(x)}${frame}`, chalk.dim("something is coming"), width);
-      }
+          if (sprite.phase === "egg") {
+            const frame = EGG_FRAMES[tickCount % EGG_FRAMES.length];
+            return row(`${" ".repeat(x)}${frame}`, chalk.dim("something is coming"), width);
+          }
 
-      const sp = speciesOf(sprite);
-      let face: string = sp.poses[pose] ?? sp.poses.idle;
-      if (sleeping || dozing) face = sp.poses.sleep;
+          const sp = speciesOf(sprite);
+          let face: string = sp.poses[pose] ?? sp.poses.idle;
+          if (sleeping || dozing) face = sp.poses.sleep;
 
-      const shinyMark = sprite.shiny ? chalk.yellowBright("✦") : "";
-      const label = `${chalk.cyan(sprite.name)}${shinyMark} ${chalk.dim(`·Lv.${sprite.level}`)}`;
-      const pad = " ".repeat(Math.max(0, Math.min(x, 16)));
-      const right = bubble && Date.now() < bubbleUntil ? chalk.dim(`“${bubble}”`) : "";
-      return row(`${pad}${face}  ${label}`, right, width);
-    },
-  });
+          const shinyMark = sprite.shiny ? chalk.yellowBright("✦") : "";
+          const label = `${chalk.cyan(sprite.name)}${shinyMark} ${chalk.dim(`·Lv.${sprite.level}`)}`;
+          const pad = " ".repeat(Math.max(0, Math.min(x, 16)));
+          const right = bubble && Date.now() < bubbleUntil ? chalk.dim(`“${bubble}”`) : "";
+          return row(`${pad}${face}  ${label}`, right, width);
+        },
+      })
+    : { update() {}, close() {} };
   disposers.push(() => panel.close());
 
   // -- heartbeat tick (animation + persistence) -----------------------------
@@ -1248,7 +2243,10 @@ export default function activate(letta: any) {
       speak(sprite, "idle");
     }
 
-    if (tickCount % 30 === 0) flush();
+    if (tickCount % 30 === 0) {
+      flush();
+      if (activeAgentId && pendingCheckpoints.has(activeAgentId)) processCheckpoint(activeAgentId);
+    }
     if (changed) panel.update();
   }, 1_000);
   disposers.push(() => clearInterval(tick));
@@ -1260,6 +2258,8 @@ export default function activate(letta: any) {
     const name = event?.agentName ?? ctx?.agent?.name ?? null;
     if (id) activeAgentId = id;
     if (name) activeAgentName = name;
+    rememberMemfs(id, ctx);
+    maybeAutoRestore(id);
   }
 
   if (letta.capabilities.events.lifecycle) {
@@ -1391,6 +2391,7 @@ export default function activate(letta: any) {
     res.named = true;
     markDirty();
     flush();
+    queueCheckpoint(agentId, "renamed");
     setPose("happy", 4_000);
     panel.update();
     return `${clean} it is.`;
@@ -1406,6 +2407,7 @@ export default function activate(letta: any) {
     res.species = next;
     markDirty();
     flush();
+    queueCheckpoint(agentId, "molted");
     setPose("happy", 5_000);
     panel.update();
     const sp = speciesOf(res);
@@ -1481,11 +2483,13 @@ export default function activate(letta: any) {
       .map((entry) => `  “${entry.line}” (${entry.category}, ${relativeTime(entry.at)})`);
     return [
       `${sp.poses[napping ? "sleep" : "idle"]}  ${sprite.name}${sprite.shiny ? " ✦shiny" : ""} — ${
-        agentId ? natureLine(agentId, sprite) : "your companion"
+        agentId ? natureLine(sprite) : "your companion"
       }${title ? ` (${title})` : ""}`,
       `species: ${sp.id} (${sp.rarity})   level: ${sprite.level}   xp: ${sprite.xp}/${xpToNext(sprite.level)}   mood: ${mood}`,
       STAT_KEYS.map((k) => `${STAT_LABELS[k]} ${statBar(sprite.stats[k])}`).join("  "),
-      sprite.hatchedAt ? `hatched: ${relativeTime(sprite.hatchedAt)}   born of: ${agentName ?? agentId ?? "unknown"}` : "",
+      sprite.hatchedAt
+        ? `hatched: ${relativeTime(sprite.hatchedAt)}   born of: ${agentName ?? sprite.bornToAgentId ?? agentId ?? "unknown"}`
+        : "",
       recent.length > 0 ? `recently said:\n${recent.join("\n")}` : "it hasn't said anything yet.",
     ]
       .filter(Boolean)
@@ -1499,6 +2503,9 @@ export default function activate(letta: any) {
     const lines = [
       statusView(agentId, agentName),
       `voice: ${setting(sprite, "voice")}   voice-rate: ${setting(sprite, "voiceRateMin")}min`,
+      backupEnabled(getCollection(agentId))
+        ? `backup: ${getCollection(agentId)?.backup?.lastStatus ?? "on · no checkpoint yet"}`
+        : "backup: off",
       sprite.named ? "" : `(name it: /sprite name <name>)`,
     ].filter(Boolean);
     return lines.join("\n");
@@ -1552,14 +2559,80 @@ export default function activate(letta: any) {
     return `${isGlobal ? "global" : "sprite"} ${key} → ${value}`;
   }
 
+  function backupStatus(agentId: string | null): string {
+    const collection = getCollection(agentId);
+    if (!agentId) return "portable backup unavailable — no active agent";
+    if (!collection) {
+      return memoryDirs.has(agentId)
+        ? "no local companion yet; a portable backup will restore automatically if one exists"
+        : "portable backup unavailable — this agent has no accessible MemFS here";
+    }
+    const backup = collection.backup;
+    if (!backupEnabled(collection)) return "portable backup: off";
+    const location = memoryDirs.has(agentId) ? PORTABLE_RELATIVE_PATH : "MemFS unavailable on this surface";
+    return [
+      `portable backup: on   push: ${backup?.pushPolicy ?? "safe"}`,
+      `revision: ${backup?.revision ?? 0}   location: ${location}`,
+      backup?.lastStatus ?? "no checkpoint yet",
+      backup?.pendingReason ? `pending: ${backup.pendingReason}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  function doBackup(agentId: string | null, argstr: string): string {
+    if (!agentId) return "portable backup unavailable — no active agent";
+    const [action = "status", value] = argstr.split(/\s+/).filter(Boolean);
+    if (action === "status") return backupStatus(agentId);
+    if (action === "restore") return restorePortable(agentId, value === "force");
+    const collection = getCollection(agentId);
+    if (!collection) return "no local companion yet — /sprite hatch first, or /sprite backup restore";
+    collection.backup = {
+      revision: collection.backup?.revision ?? 0,
+      pushPolicy: collection.backup?.pushPolicy ?? "safe",
+      ...collection.backup,
+    };
+    if (action === "on") {
+      collection.backup.enabled = true;
+      queueCheckpoint(agentId, "backup-enabled");
+      const status = processCheckpoint(agentId, true);
+      flush();
+      return status;
+    }
+    if (action === "off") {
+      collection.backup.enabled = false;
+      delete collection.backup.pendingReason;
+      pendingCheckpoints.delete(agentId);
+      collection.backup.lastStatus = "portable backup disabled";
+      markDirty();
+      flush();
+      return "portable backup: off (existing checkpoints are kept)";
+    }
+    if (action === "now") {
+      if (!collection.backup.enabled) return "portable backup is off — /sprite backup on first";
+      queueCheckpoint(agentId, "manual");
+      const status = processCheckpoint(agentId, true);
+      flush();
+      return status;
+    }
+    if (action === "push") {
+      if (value !== "safe" && value !== "never") return "usage: /sprite backup push safe|never";
+      collection.backup.pushPolicy = value;
+      markDirty();
+      flush();
+      return `portable backup push policy → ${value}`;
+    }
+    return "usage: /sprite backup [status|on|off|now|push safe|push never|restore|restore force]";
+  }
+
   // -- commands ---------------------------------------------------------------
 
   if (letta.capabilities.commands) {
     disposers.push(
       letta.commands.register({
         id: "sprite",
-        description: "Your agent's tiny companion — status, hatch, name, molt, pet, settings",
-        args: "[status|hatch|name|molt|pet|settings] [...]",
+        description: "Your agent's tiny companion — status, hatch, name, molt, pet, diary, settings, backup",
+        args: "[status|hatch|name|molt|pet|diary|settings|backup] [...]",
         run(ctx: any) {
           const argstr = String(ctx.args ?? "").trim();
           const [sub, ...rest] = argstr.split(/\s+/).filter(Boolean);
@@ -1599,8 +2672,11 @@ export default function activate(letta: any) {
             case "settings":
               output = doSettings(agentId, restStr);
               break;
+            case "backup":
+              output = doBackup(agentId, restStr);
+              break;
             default:
-              output = `unknown subcommand "${sub}". try: /sprite (or /sprite status), /sprite hatch [species], /sprite name <name>, /sprite molt [species], /sprite pet, /sprite diary, /sprite settings`;
+              output = `unknown subcommand "${sub}". try: /sprite status|hatch|name|molt|pet|diary|settings|backup`;
           }
           return { type: "output", output };
         },
@@ -1750,6 +2826,7 @@ export default function activate(letta: any) {
           res.voice = { ...res.voice, ...cleaned };
           markDirty();
           flush();
+          queueCheckpoint(agentId, "voice-updated");
           return `voice updated for: ${Object.keys(cleaned).join(", ")}. (${res.name} will use your lines now)`;
         },
       }),
@@ -1759,6 +2836,13 @@ export default function activate(letta: any) {
   // -- cleanup ----------------------------------------------------------------
 
   return () => {
+    for (const [agentId, collection] of Object.entries(state.collections)) {
+      if (backupEnabled(collection) && collection.backup?.lastHash !== collectionContentHash(collection)) {
+        queueCheckpoint(agentId, "clean-shutdown");
+      }
+    }
+    flush();
+    for (const agentId of pendingCheckpoints.keys()) processCheckpoint(agentId, true);
     flush();
     for (const dispose of disposers.reverse()) dispose();
   };
