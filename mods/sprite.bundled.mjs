@@ -13406,7 +13406,7 @@ Reply in one line.`, { force: true });
       case "model": {
         const all = w.models ?? [];
         const filter = (w.modelFilter ?? "").toLowerCase();
-        const shown = (filter ? all.filter((m) => m.toLowerCase().includes(filter)) : all).slice(0, 20);
+        const shown = filter ? all.filter((m) => m.toLowerCase().includes(filter)).slice(0, 60) : all.slice(0, 20);
         const list = shown.map((m) => `  ${all.indexOf(m) + 1}. ${m}`);
         return [
           head,
