@@ -3,6 +3,24 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.8.0 — ensoulment
+- `/sprite ensoul`: give a companion a mind of its own — its own Letta agent,
+  with memory it keeps and dreams about. A short guided flow asks where it
+  lives (local or cloud), which model (default `letta/auto-fast`, free), what it
+  may see of your work (nothing, by default), when it comments, and who writes
+  its persona: a template, your agent, or you. Only a person can run it.
+- Its persona holds permanent facts only; it asks `my_stats` / `my_diary` for
+  anything that changes.
+- Pets, greetings, and level-ups go to the mind when it has one (`✦` marks a
+  live line); the corpus is always the fallback.
+- `/sprite talk <text>` and the `sprite_talk` tool: talk to it and hear back.
+  Agents get five messages per five minutes by default (`/sprite soul gate`).
+- `/sprite soul` inspects and changes its model, what it sees, when it
+  comments, dreaming, and the talk gate.
+- Releasing an ensouled companion keeps its agent unless you add
+  `delete-agent`. Bred children of ensouled parents inherit a few voice lines.
+- The mod now ships as a pre-built bundle with the Agent SDK inside.
+
 ## v0.7.1
 - The version bookkeeping added in 0.7.0 could mark state dirty after an
   unreadable load; it no longer does.

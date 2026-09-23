@@ -73,13 +73,19 @@ function makeLetta(agent, memoryDir) {
     },
     ui: { openPanel() { throw new Error("headless"); } },
   };
-  const ctx = { agent, getContext: () => context, context, cwd: root };
+  const history = [];
+  const ctx = { agent, getContext: () => context, context, cwd: root, conversation: { getHistory: async () => history } };
   return {
     letta,
     tools,
+    history,
+    raw: (args) => Promise.resolve(commands.get("sprite").run({ ...ctx, args })),
     handlerCount: (name) => (handlers.get(name) ?? []).length,
     fire: (name, ev) => { for (const h of handlers.get(name) ?? []) h(ev, ctx); },
-    command: (args) => commands.get("sprite").run({ ...ctx, args }).output,
+    command: (args) => {
+      const r = commands.get("sprite").run({ ...ctx, args });
+      return typeof r?.then === "function" ? r.then((x) => x.output) : r.output;
+    },
   };
 }
 
@@ -601,7 +607,7 @@ await check("bars: lap math is monotonic, wraps cleanly, and every lap style ren
 });
 
 // ---------------------------------------------------------------------------
-check("multi: founder is protected, hatch another rolls fresh, switch/release work, panel-only xp", () => {
+await check("multi: founder is protected, hatch another rolls fresh, switch/release work, panel-only xp", async () => {
   const agent = { id: "agent-multi", name: "Multi" };
   const { host, dispose } = hatchFor(agent, null);
   host.command("name Founder");
@@ -616,8 +622,8 @@ check("multi: founder is protected, hatch another rolls fresh, switch/release wo
   assert.notEqual(egg.seed, founder.seed);
   assert.equal(c1.activeSpriteId, egg.id);
   assert.match(host.command("switch Founder"), /still hatching/);
-  assert.match(host.command("release Founder"), /can't be released/);
-  assert.match(host.command(`release confirm:${founder.id}`), /can't be released/);
+  assert.match(await host.command("release Founder"), /can't be released/);
+  assert.match(await host.command(`release confirm:${founder.id}`), /can't be released/);
   const before = founder.stats.craft;
   host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" });
   dispose();
@@ -630,16 +636,16 @@ check("multi: founder is protected, hatch another rolls fresh, switch/release wo
   h2.fire("conversation_open", { agentId: agent.id });
   assert.match(h2.command("list"), /▶ +2\. .*Second/, h2.command("list"));
   assert.match(h2.command("switch 1"), /Founder steps onto the panel/);
-  const prompt = h2.command("release Second");
+  const prompt = await h2.command("release Second");
   const m = /confirm:(\S+)/.exec(prompt);
   assert.ok(m, prompt);
-  assert.match(h2.command(`release confirm:${m[1]}`), /drifts off/);
+  assert.match(await h2.command(`release confirm:${m[1]}`), /drifts off/);
   d2();
   assert.deepEqual(Object.keys(readState().collections[agent.id].sprites), [founder.id]);
 });
 
 // ---------------------------------------------------------------------------
-check("multi: ambiguous prefix never guesses; numeric names rejected; control chars stripped", () => {
+await check("multi: ambiguous prefix never guesses; numeric names rejected; control chars stripped", async () => {
   const agent = { id: "agent-ambig", name: "Ambig" };
   const { host, dispose } = hatchFor(agent, null);
   host.command("name Poof");
@@ -652,7 +658,7 @@ check("multi: ambiguous prefix never guesses; numeric names rejected; control ch
   writeFileSync(statePath, JSON.stringify(st));
   const h2 = makeLetta(agent, null); const d2 = activate(h2.letta);
   h2.fire("conversation_open", { agentId: agent.id });
-  assert.match(h2.command("release P"), /matches 3 companions/);
+  assert.match(await h2.command("release P"), /matches 3 companions/);
   assert.match(h2.command("switch Pi"), /Pip steps onto/);
   assert.match(h2.command("name 42"), /roster positions/);
   h2.command("name A\u001b[2JB\nC");
@@ -661,7 +667,7 @@ check("multi: ambiguous prefix never guesses; numeric names rejected; control ch
 });
 
 // ---------------------------------------------------------------------------
-check("multi: a window that missed a release doesn't resurrect it, even without a tombstone", () => {
+await check("multi: a window that missed a release doesn't resurrect it, even without a tombstone", async () => {
   const agent = { id: "agent-resurrect", name: "Res" };
   const { host, dispose } = hatchFor(agent, null);
   dispose();
@@ -672,14 +678,14 @@ check("multi: a window that missed a release doesn't resurrect it, even without 
   // A loads with both. B releases Second, then the tombstone is wiped (as if expired).
   const a = makeLetta(agent, null); const da = activate(a.letta); a.fire("conversation_open", { agentId: agent.id });
   const b = makeLetta(agent, null); const db = activate(b.letta); b.fire("conversation_open", { agentId: agent.id });
-  b.command(`release confirm:${id}`); db();
+  await b.command(`release confirm:${id}`); db();
   const st2 = readState(); delete st2.collections[agent.id].released; writeFileSync(statePath, JSON.stringify(st2));
   a.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" }); da();
   assert.equal(readState().collections[agent.id].sprites[id], undefined, "released sprite came back");
 });
 
 // ---------------------------------------------------------------------------
-check("multi: exactly one founder after restore of a pre-founder backup, and after merging two backfills", () => {
+await check("multi: exactly one founder after restore of a pre-founder backup, and after merging two backfills", async () => {
   const agent = { id: "agent-onefounder", name: "One" };
   const { memoryDir } = makeRepo("onefounder");
   const { host, dispose } = hatchFor(agent, memoryDir);
@@ -695,7 +701,7 @@ check("multi: exactly one founder after restore of a pre-founder backup, and aft
   const founders = Object.values(readState().collections[agent.id].sprites).filter((sp) => sp.founder);
   assert.equal(founders.length, 1);
   assert.equal(founders[0].seed, agent.id, "founder must be the agent-seeded one");
-  assert.match(h.command(`release confirm:${founders[0].id}`), /can't be released/);
+  assert.match(await h.command(`release confirm:${founders[0].id}`), /can't be released/);
   assert.match(h.command("hatch another"), /new egg/);
   assert.equal(Object.values(readState().collections[agent.id].sprites).filter((sp) => sp.founder).length, 1);
   d();
@@ -721,7 +727,7 @@ check("multi: concurrent hatch another can't exceed the cap", () => {
 });
 
 // ---------------------------------------------------------------------------
-check("breed: gates, lineage, order-independence, and a forced hauntcrab", () => {
+await check("breed: gates, lineage, order-independence, and a forced hauntcrab", async () => {
   const agent = { id: "agent-breed", name: "Breed" };
   const { host, dispose } = hatchFor(agent, null);
   host.command("name Poof");
@@ -757,7 +763,7 @@ check("breed: gates, lineage, order-independence, and a forced hauntcrab", () =>
   h3.command(`switch ${egg.id}`);
   assert.match(h3.command(""), /lineage: gen 1, child of (Poof and Clawson|Clawson and Poof)/, h3.command(""));
   // release-on-parent leaves lineage readable
-  assert.match(h3.command(`release confirm:${clawId}`), /drifts off/);
+  assert.match(await h3.command(`release confirm:${clawId}`), /drifts off/);
   assert.match(h3.command(""), /a companion now gone/);
   d3();
 });
@@ -887,6 +893,227 @@ await check("bundle: mods/sprite.bundled.mjs is fresh and activates like the sou
   h.fire("conversation_open", { agentId: agent.id });
   assert.match(h.command("help"), /\/sprite changelog/);
   d();
+});
+
+// ---------------------------------------------------------------------------
+// souls — the SDK client is mocked; these exercise the wizard, persona rules,
+// the talk gate, `see` payload shaping, release semantics, and fallbacks.
+function mockSoulClient() {
+  const calls = [];
+  let nextId = 1;
+  const agents = new Map();
+  return {
+    calls,
+    agents,
+    client: {
+      async createAgent(opts) { const id = `agent-mock-${nextId++}`; agents.set(id, opts); calls.push(["create", opts]); return id; },
+      async prompt(message, agentId, opts) {
+        calls.push(["prompt", agentId, message, opts]);
+        if (!agents.has(agentId)) throw new Error("no such agent");
+        if (message.includes("petted")) return { success: true, result: "mrrp. (from the mind.)" };
+        if (message.includes("first line")) return { success: true, result: "…oh. i can think now.\nsecond line ignored" };
+        if (message.includes("says to you")) return { success: true, result: `"heard: ${message.split("says to you: ")[1].split("\n")[0]}"` };
+        return { success: true, result: "a comment about the weather of work" };
+      },
+      agents: {
+        async retrieve(id) { if (!agents.has(id)) throw new Error("no such agent"); return { id, name: agents.get(id).name }; },
+        async delete(id) { calls.push(["delete", id]); if (!agents.delete(id)) throw new Error("no such agent"); },
+        async update(id, body) { calls.push(["update", id, body]); },
+      },
+      models: { async list() { return { models: [{ handle: "zai/glm-5.3-flash" }, { handle: "letta/auto-fast" }, { handle: "anthropic/claude-sonnet-5" }] }; } },
+    },
+  };
+}
+const { __setSoulClientFactory } = await import("./mods/sprite.tsx");
+const tick = () => new Promise((r) => setTimeout(r, 30));
+
+await check("soul: the wizard walks every step, only the user drives it, persona has no changing facts and no gendered pronouns", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  host.command("name Poof");
+  assert.equal(host.tools.get("sprite_ensoul"), undefined, "ensoul must not be a tool");
+  assert.match(await host.command("ensoul"), /Where does its mind live/);
+  assert.match(await host.command("ensoul 1"), /Which model/);
+  assert.match(await host.command("ensoul 2"), /What can it see/);
+  assert.match(await host.command("ensoul back"), /Which model/);
+  assert.match(await host.command("ensoul glm"), /What can it see/);
+  assert.match(await host.command("ensoul 1"), /Who writes its persona/); // nothing → skips comment step
+  const confirm = await host.command("ensoul template");
+  assert.match(confirm, /persona it will be given/);
+  const persona = confirm.split("─".repeat(60))[1];
+  assert.match(persona, /You are Poof, a ghost/);
+  assert.match(persona, /hatched on \d{4}-\d{2}-\d{2}T/);
+  assert.doesNotMatch(persona, /level \d|lv\.|days old|\bxp\b/i, "persona leaks changing facts");
+  assert.doesNotMatch(persona, /\b(he|she|his|her|him)\b/i, "persona must be gender-neutral");
+  assert.match(persona, /\bthem\b|\btheir\b|\bthey\b/);
+  assert.match(persona, /my_stats/);
+  assert.equal(mock.calls.length, 0, "nothing created before confirm");
+  const done = await host.command("ensoul confirm");
+  assert.match(done, /has a mind of its own now/);
+  assert.match(done, /…oh\. i can think now\./); // first line, one line only
+  const created = mock.calls.find((c) => c[0] === "create")[1];
+  assert.equal(created.hidden, true);
+  assert.equal(created.memfs, true);
+  assert.equal(created.model, "zai/glm-5.3-flash");
+  assert.deepEqual(created.baseTools, []);
+  assert.ok(created.tags.includes("sprite") && created.tags.some((t) => t.startsWith("sprite-owner:agent-soul")));
+  assert.deepEqual(created.memory.map((m) => m.label), ["persona", "voice", "diary", "bond"]);
+  const sp = activeSprite(agent.id);
+  assert.equal(sp.soul.agentId, "agent-mock-1");
+  assert.equal(sp.soul.see, "nothing");
+  assert.equal(sp.soul.talkGate, 5);
+  assert.match(await host.command("ensoul"), /already has a mind/);
+  dispose();
+});
+
+await check("soul: pet goes to the mind (✦), tools my_stats/my_diary are offered, corpus is the fallback", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul2", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  await tick(); // let the greeting/missed_you soul call settle (soulBusy is a single slot)
+  assert.match(host.command("pet"), /thinking of what to say/);
+  await tick();
+  const sp = activeSprite(agent.id);
+  assert.ok(sp.log.some((e) => e.line === "✦ mrrp. (from the mind.)"), JSON.stringify(sp.log.slice(-3)));
+  const promptCall = mock.calls.find((c) => c[0] === "prompt" && c[2].includes("petted"));
+  assert.deepEqual(promptCall[3].tools.map((t) => t.name), ["my_stats", "my_diary"]);
+  const stats = await promptCall[3].tools[0].execute();
+  assert.match(stats.content, /level: \d+/);
+  // mind gone → corpus fallback, no crash
+  mock.agents.clear();
+  const before = (activeSprite(agent.id).log ?? []).length;
+  host.command("pet");
+  await tick();
+  const after = activeSprite(agent.id).log;
+  assert.ok(after.length > before && !after[after.length - 1].line.startsWith("✦"), "should have fallen back to the corpus");
+  dispose();
+});
+
+await check("soul: talk gate stops a chatty agent; user talk is ungated; both sides land in the diary", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul3", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  const talk = host.tools.get("sprite_talk");
+  for (let i = 0; i < 5; i += 1) assert.match(String(await talk.run({ agent, args: { text: `hi ${i}` } })), /heard: hi/);
+  assert.match(String(await talk.run({ agent, args: { text: "hi 6" } })), /napping/);
+  assert.match(await host.command("talk hello there"), /heard: hello there/); // user ungated
+  const log = activeSprite(agent.id).log.map((e) => e.line);
+  assert.ok(log.some((l) => l.startsWith("Owner → ")), "agent side not in diary");
+  assert.ok(log.some((l) => l.startsWith("you → ")), "user side not in diary");
+  assert.ok(log.some((l) => l.startsWith("✦ heard:")), "reply not in diary");
+  assert.match(await host.command("soul gate off"), /gate → off/);
+  assert.match(String(await talk.run({ agent, args: { text: "hi 7" } })), /heard: hi 7/);
+  dispose();
+});
+
+await check("soul: `see` shapes exactly what the mind hears; nothing → no commentary at all", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul4", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  const promptsBefore = mock.calls.filter((c) => c[0] === "prompt").length;
+  host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success", args: { file_path: "/secret/path.ts" } });
+  host.fire("turn_end", { agentId: agent.id, text: "SECRET WORDS" });
+  await tick();
+  assert.equal(mock.calls.filter((c) => c[0] === "prompt").length, promptsBefore, "see=nothing must send nothing");
+  await host.command("soul see events");
+  await host.command("soul comment tools 1");
+  host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success", args: { file_path: "/secret/path.ts" } });
+  await tick();
+  let last = mock.calls.filter((c) => c[0] === "prompt").pop();
+  assert.match(last[2], /used Edit/);
+  assert.doesNotMatch(last[2], /secret/, "events must not leak args");
+  await host.command("soul see tools");
+  host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success", args: { file_path: "/secret/path.ts" } });
+  await tick();
+  last = mock.calls.filter((c) => c[0] === "prompt").pop();
+  assert.match(last[2], /\/secret\/path\.ts/);
+  assert.doesNotMatch(last[2], /SECRET WORDS/);
+  await host.command("soul see turns");
+  await host.command("soul comment turn");
+  host.fire("turn_end", { agentId: agent.id, text: "SECRET WORDS" });
+  await tick();
+  last = mock.calls.filter((c) => c[0] === "prompt").pop();
+  assert.match(last[2], /SECRET WORDS/);
+  dispose();
+});
+
+await check("soul: release keeps the agent unless delete-agent is given; delete failure releases nothing", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul5", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await host.command("hatch another");
+  const st = readState(); const c = st.collections[agent.id];
+  const egg = Object.values(c.sprites).find((sp) => !sp.founder); egg.phase = "alive"; egg.name = "Second"; egg.named = true;
+  writeFileSync(statePath, JSON.stringify(st));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
+  dispose();
+  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await h2.command(`ensoul ${step}`.trim());
+  const soulId = activeSprite(agent.id).soul.agentId;
+  const prompt = await h2.command("release Second");
+  assert.match(prompt, /delete-agent/);
+  const id = /confirm:(\S+)/.exec(prompt)[1];
+  // without delete-agent → sprite gone, agent kept
+  assert.match(await h2.command(`release confirm:${id}`), /still there/);
+  assert.ok(mock.agents.has(soulId));
+  assert.ok(!mock.calls.some((c) => c[0] === "delete"));
+  d2();
+});
+
+await check("soul: release with delete-agent deletes the agent; a failed delete releases nothing", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul6", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await host.command("hatch another");
+  const st = readState(); const c = st.collections[agent.id];
+  const egg = Object.values(c.sprites).find((sp) => !sp.founder); egg.phase = "alive"; egg.name = "Second"; egg.named = true;
+  writeFileSync(statePath, JSON.stringify(st));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
+  dispose();
+  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await h2.command(`ensoul ${step}`.trim());
+  const soulId = activeSprite(agent.id).soul.agentId;
+  const id = /confirm:(\S+)/.exec(await h2.command("release Second"))[1];
+  mock.agents.delete(soulId); // simulate an agent that can't be deleted (already gone)
+  assert.match(await h2.command(`release confirm:${id} delete-agent`), /couldn't delete its agent/);
+  assert.ok(readState().collections[agent.id].sprites[id], "sprite was released despite failed delete");
+  mock.agents.set(soulId, {});
+  assert.match(await h2.command(`release confirm:${id} delete-agent`), /was deleted/);
+  assert.ok(!mock.agents.has(soulId));
+  d2();
+});
+
+await check("soul: agent-written persona prompts the owner agent, then persona-done picks up their reply", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul7", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  host.command("name Poof");
+  for (const step of ["", "1", "default", "nothing"]) await host.command(`ensoul ${step}`.trim());
+  const raw = await host.raw("ensoul agent");
+  assert.equal(raw.type, "prompt");
+  assert.match(raw.prompt, /write the persona for your companion sprite \*\*Poof\*\*/);
+  assert.match(raw.prompt, /permanent facts only/i);
+  assert.match(raw.prompt, /they\/them/);
+  assert.match(raw.output, /Waiting for your agent/);
+  host.history.push({ role: "assistant", content: "You are Poof, a ghost who announces their agent's wakings and felt the page turn." });
+  assert.match(await host.command("ensoul persona-done"), /announces their agent's wakings/);
+  const done = await host.command("ensoul confirm");
+  assert.match(done, /has a mind of its own/);
+  const created = mock.calls.find((c) => c[0] === "create")[1];
+  const persona = created.memory.find((m) => m.label === "persona").value;
+  assert.match(persona, /^You are Poof, a ghost who announces/);
+  assert.match(persona, /call\nmy_stats|my_stats/); // footer appended
+  assert.equal(activeSprite(agent.id).soul.personaSource, "agent");
+  dispose();
 });
 
 console.log(`\nSprite hardening test passed (${passed} checks).`);

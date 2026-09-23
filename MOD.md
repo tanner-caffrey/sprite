@@ -77,6 +77,9 @@ companion from Signal, Telegram, Discord, or CLI turns.
 | `/sprite backup restore [force]` | Restore a portable soul-backup |
 | `/sprite help` | Explain every subcommand |
 | `/sprite changelog [all]` | What changed since the version you last ran (or everything) |
+| `/sprite ensoul [name]` | Give a companion its own Letta agent (guided; user-only) |
+| `/sprite soul [key value]` | Inspect or change an ensouled companion's mind |
+| `/sprite talk <text>` | Talk to it and hear what it says back |
 
 Settings keys: `voice on|off`, `voiceRateMin <minutes>`, `visible on|off`, `laps count|odometer|belt|pips`, `hue on|off`, `bars on|off`.
 

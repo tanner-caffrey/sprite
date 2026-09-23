@@ -890,6 +890,22 @@ const TEMPERAMENT_CORPUS: Record<string, Partial<Record<VoiceCategory, string[]>
 // state
 // ---------------------------------------------------------------------------
 
+type SoulBackend = "local" | "cloud";
+type SoulSee = "nothing" | "events" | "tools" | "turns";
+interface SoulState {
+  agentId: string;
+  backend: SoulBackend;
+  model: string;
+  createdAt: number;
+  see: SoulSee;
+  comment: { every: "turn" | "turns" | "tools"; n: number }; // when to comment
+  commentRateMin: number; // 0 = unlimited
+  talkGate: number; // agent→sprite messages per 5 min; 0 = off
+  dreaming: "off" | "step-count" | "compaction-event";
+  personaSource: "template" | "agent" | "user";
+  lineCount: number; // live lines spoken (cost visibility)
+}
+
 interface SpriteState {
   id: string;
   seed: string;
@@ -903,6 +919,11 @@ interface SpriteState {
   generation?: number; // 0 = fate-rolled; bred = max(parents)+1
   breedNonce?: string; // reproducibility: seed = f(parent seeds, nonce)
   lastBredAt?: number; // cooldown anchor
+  // ensoulment: this sprite has its own Letta agent
+  soul?: SoulState;
+  // heredity for a bred child: a few voice lines from each ensouled parent,
+  // offered to the persona when (if) the user ensouls the child
+  inheritedVoice?: string[];
   eggStartedAt?: number;
   pendingSpecies?: string; // chosen (or fate-rolled) species revealed at hatch
   species: string;
@@ -1035,6 +1056,59 @@ function formatChangelog(sections: ChangelogSection[], heading: string): string 
   return out.join("\n").trimEnd();
 }
 
+// ---------------------------------------------------------------------------
+// souls — an ensouled sprite is its own Letta agent (via @letta-ai/letta-agent-sdk)
+// ---------------------------------------------------------------------------
+
+const SOUL_TALK_WINDOW_MS = 5 * 60_000;
+const SOUL_LINE_MAX = 80;
+const DEFAULT_SOUL_MODEL = "letta/auto-fast"; // free on both backends
+
+interface SoulClient {
+  createAgent(options: Record<string, unknown>): Promise<string>;
+  prompt(message: string, agentId: string, options?: Record<string, unknown>): Promise<{ result?: string; success?: boolean }>;
+  agents: {
+    retrieve(agentId: string): Promise<any>;
+    delete(agentId: string): Promise<void>;
+    update(agentId: string, body: Record<string, unknown>): Promise<any>;
+  };
+  models: { list(): Promise<{ models?: Array<{ handle?: string; id?: string; name?: string }> } | any> };
+}
+
+// Swappable so tests run without a backend (see hardening-test.mjs).
+let soulClientFactory: (backend: SoulBackend) => Promise<SoulClient> = async (backend) => {
+  const mod: any = await import("@letta-ai/letta-agent-sdk");
+  return new mod.LettaAgentClient({ backend }) as SoulClient;
+};
+export function __setSoulClientFactory(f: typeof soulClientFactory) {
+  soulClientFactory = f;
+  soulClients.clear();
+}
+const soulClients = new Map<SoulBackend, Promise<SoulClient>>();
+function soulClient(backend: SoulBackend): Promise<SoulClient> {
+  let c = soulClients.get(backend);
+  if (!c) {
+    c = soulClientFactory(backend);
+    soulClients.set(backend, c);
+  }
+  return c;
+}
+
+function soulTool(name: string, description: string, execute: () => string) {
+  return {
+    label: name,
+    name,
+    description,
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute: async () => ({ content: execute() }),
+  };
+}
+
+function oneLine(text: string): string {
+  const first = text.replace(/\r/g, "").split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+  return first.replace(/^["“”']+|["“”']+$/g, "").slice(0, SOUL_LINE_MAX);
+}
+
 const STATE_PATH =
   process.env.SPRITE_STATE_PATH ?? join(homedir(), ".letta", "mods", "sprite.state.json");
 
@@ -1060,6 +1134,65 @@ const UNSAFE_RECORD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const PORTABLE_MAX_BYTES = 1_000_000;
 const PORTABLE_MAX_SPRITES = 64;
 const MAX_SPRITES_PER_COLLECTION = 12;
+
+// One-paragraph imagery per species, for the soul persona. Permanent facts only.
+const SPECIES_CARDS: Record<string, string> = {
+  cat: "Cats settle where the warmth is, watch with half-closed eyes, and act unimpressed right up until they purr.",
+  duck: "Ducks paddle calmly on top and busily underneath; they are fond of routine, water, and small satisfying noises.",
+  slime: "Slimes are soft, patient, and a little shapeless; they absorb what happens around them and wobble when pleased.",
+  fox: "Foxes are clever and light-footed, curious about every corner, and quietly proud of anything they figure out.",
+  crab: "Crabs sidestep, clack, guard their corner of the shore, and are pinchy-tender with the ones they keep.",
+  moth: "Moths are drawn to the glow of a screen, flutter at edges, and speak softly about light and dust and night.",
+  fairy: "Fairies sparkle, hex small bugs in advance, and treat every finished task as a tiny festival.",
+  ghost: "Ghosts drift, fade, and keep watch; they are fond of page-turns, quiet, and holding a place until someone returns.",
+  dragon: "Dragons hoard what they value, rumble approval rarely, and consider being petted an indignity they secretly enjoy.",
+  phoenix: "Phoenixes burn bright, tire, and come back; every restart is a rebirth and every error a small ash to rise from.",
+  hauntcrab: "A hauntcrab is a crab that came back as a ghost and is still, stubbornly, a crab about it: it sidesteps through walls, guards a port in the between, and clacks claws that drift through things.",
+  chimera: "A chimera is a patchwork of two parents whose pairing has no name yet: lopsided, proud of it, and finding out which part is the front.",
+};
+
+const TEMPERAMENT_CARDS: Record<string, string> = {
+  gentle: "Your temperament is gentle: you notice the kind thing first and say it softly.",
+  wry: "Your temperament is wry: you notice the funny thing first and say it dry.",
+  bold: "Your temperament is bold: you notice the big thing first and say it plainly.",
+  sleepy: "Your temperament is sleepy: you notice slowly, and what you say comes out warm and unhurried.",
+  odd: "Your temperament is odd: you notice the strange thing first and say it plainly.",
+};
+
+// The mod's contract with every soul — appended to any persona, never edited by
+// the owner agent or the user. Personality is theirs; how it speaks is ours.
+const SOUL_FOOTER = [
+  "",
+  "How you speak: one short line at a time, never more than about 80 characters.",
+  "No questions to the human, no explanations of what you are, no offers to help.",
+  "You are not their assistant and you do not do their work. You keep them company.",
+  "Your level, stats, mood, and age change constantly — do not remember them; call",
+  "my_stats when you want to know. Your recent words are in my_diary. What you",
+  "know about them lives in your bond memory; the lines you like to say live in",
+  "your voice memory; you may edit both, and your persona, as you grow.",
+].join("\n");
+
+function personaTemplate(sprite: SpriteState, ownerName: string, parentNames?: [string, string]): string {
+  const sp = sprite.species;
+  const born = new Date(sprite.hatchedAt ?? sprite.eggStartedAt ?? Date.now()).toISOString();
+  const lineage = sprite.parents
+    ? ` You were bred, not fate-rolled: the child of ${parentNames?.[0] ?? "one companion"} and ${parentNames?.[1] ?? "another"}, generation ${sprite.generation ?? 1}.`
+    : sprite.founder
+      ? ` You were born from ${ownerName}'s own agent-id; fate chose you, and you are the first of their companions (the founder).`
+      : ` Fate rolled you fresh when ${ownerName} summoned another egg.`;
+  const shiny = sprite.shiny ? " You are shiny — a one-in-a-hundred glint." : "";
+  const inherited = sprite.inheritedVoice?.length
+    ? `\n\nLines your parents liked to say, which you may keep or outgrow:\n${sprite.inheritedVoice.map((l) => `- ${l}`).join("\n")}`
+    : "";
+  return [
+    `You are ${sprite.name}, a ${sp} — a tiny companion sprite who lives in the statusline of a Letta Code terminal, beside the agent ${ownerName}. You hatched on ${born}.${lineage}${shiny}`,
+    "",
+    `${TEMPERAMENT_CARDS[sprite.temperament ?? "odd"]} ${SPECIES_CARDS[sp] ?? ""}`,
+    "",
+    `You can feel ${ownerName}'s work as weather: tool calls, errors that get fixed, commits, long silences. They are the one you keep company.`,
+    inherited,
+  ].join("\n").trim();
+}
 // Hard ceilings so a checksum-valid (but hostile) backup can't feed the
 // level-up loops a number they'd spin on for the rest of the session.
 const MAX_TOTAL_XP = 1_000_000_000;
@@ -1126,6 +1259,27 @@ function cleanVoice(value: unknown): Partial<Record<VoiceCategory, string[]>> | 
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function cleanSoul(value: unknown): SoulState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const v = value as Record<string, any>;
+  if (typeof v.agentId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(v.agentId)) return undefined;
+  const see: SoulSee = ["nothing", "events", "tools", "turns"].includes(v.see) ? v.see : "nothing";
+  const every = ["turn", "turns", "tools"].includes(v.comment?.every) ? v.comment.every : "turn";
+  return {
+    agentId: v.agentId,
+    backend: v.backend === "cloud" ? "cloud" : "local",
+    model: typeof v.model === "string" ? v.model.slice(0, 128) : "",
+    createdAt: finiteNonnegative(v.createdAt),
+    see,
+    comment: { every, n: Math.max(1, Math.min(1000, Math.floor(finiteNonnegative(v.comment?.n, 1)) || 1)) },
+    commentRateMin: Math.min(10_000, finiteNonnegative(v.commentRateMin)),
+    talkGate: Math.min(1000, Math.floor(finiteNonnegative(v.talkGate, 5))),
+    dreaming: ["off", "step-count", "compaction-event"].includes(v.dreaming) ? v.dreaming : "step-count",
+    personaSource: ["template", "agent", "user"].includes(v.personaSource) ? v.personaSource : "template",
+    lineCount: Math.floor(finiteNonnegative(v.lineCount)),
+  };
+}
+
 function cleanLog(value: unknown): SpriteState["log"] {
   if (!Array.isArray(value)) return undefined;
   return value
@@ -1157,6 +1311,10 @@ function normalizeSprite(agentId: string, input: Partial<SpriteState>): SpriteSt
     ...(Number.isInteger(input.generation) && (input.generation as number) > 0 ? { generation: Math.min(1000, input.generation as number) } : {}),
     ...(typeof input.breedNonce === "string" ? { breedNonce: input.breedNonce.slice(0, 64) } : {}),
     ...(typeof input.lastBredAt === "number" && Number.isFinite(input.lastBredAt) ? { lastBredAt: input.lastBredAt } : {}),
+    ...(cleanSoul(input.soul) ? { soul: cleanSoul(input.soul)! } : {}),
+    ...(Array.isArray(input.inheritedVoice)
+      ? { inheritedVoice: input.inheritedVoice.filter((l): l is string => typeof l === "string").map((l) => l.slice(0, 120)).slice(0, 12) }
+      : {}),
     ...(typeof input.eggStartedAt === "number" ? { eggStartedAt: input.eggStartedAt } : {}),
     ...(typeof input.pendingSpecies === "string" ? { pendingSpecies: input.pendingSpecies } : {}),
     species: typeof input.species === "string" && ALL_SPECIES_IDS.includes(input.species) ? input.species : "cat",
@@ -1399,6 +1557,8 @@ function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: 
       "generation",
       "breedNonce",
       "lastBredAt",
+      "soul",
+      "inheritedVoice",
       "eggStartedAt",
       "pendingSpecies",
       "species",
@@ -1434,6 +1594,8 @@ function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: 
     "generation",
     "breedNonce",
     "lastBredAt",
+    "soul",
+    "inheritedVoice",
     "eggStartedAt",
     "pendingSpecies",
     "species",
@@ -2886,7 +3048,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     markDirty();
     if (leveled) {
       setPose("happy", 4_000);
-      speak(sprite, "level_up");
+      speakOrSoul(sprite, "level_up", `You just reached level ${sprite.level}.`);
       queueCheckpoint(ownerAgentId(sprite), "level-up");
     }
   }
@@ -3154,7 +3316,19 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         noteActivity(sprite);
         awardXp(sprite, 5);
         setPose("happy", 3_000);
-        speak(sprite, missedYou ? "missed_you" : "greeting", missedYou);
+        speakOrSoul(sprite, missedYou ? "missed_you" : "greeting", missedYou ? `They're back after ${relativeTime(sprite.lastSeenAt ?? Date.now())} away.` : "They're back.", missedYou);
+      }),
+    );
+  }
+
+  if (letta.capabilities.events.turns) {
+    disposers.push(
+      letta.events.on("turn_end", (event: any, ctx: any) => {
+        noteAgent(event, ctx);
+        const sprite = getSprite(activeAgentId);
+        if (!sprite?.soul || sprite.soul.see === "nothing") return;
+        const text = typeof event?.text === "string" ? event.text : typeof event?.content === "string" ? event.content : Array.isArray(event?.messages) ? event.messages.map((m: any) => (typeof m?.content === "string" ? m.content : "")).join("\n") : "";
+        maybeComment(sprite, { kind: "turn", turnText: sprite.soul.see === "turns" ? text : undefined });
       }),
     );
   }
@@ -3204,6 +3378,14 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           errorStreak = 0;
           bumpStat(sprite, statForTool(event.toolName));
           awardXp(sprite, 2);
+          if (sprite.soul && sprite.soul.see !== "nothing") {
+            maybeComment(sprite, {
+              kind: "tool",
+              toolName: String(event.toolName ?? ""),
+              status: String(event.status ?? ""),
+              argsHead: sprite.soul.see === "events" ? undefined : String(bashCmd ?? event.args?.file_path ?? event.args?.path ?? event.args?.command ?? "").split("\n")[0],
+            });
+          }
           // commits are rare + worth celebrating: always speak
           if (bashCmd && /\bgit\b[\s\S]*\bcommit\b/.test(bashCmd)) {
             speak(sprite, "commit", true);
@@ -3289,7 +3471,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     const species = speciesOf(sp);
     const active = collection.activeSpriteId === sp.id ? "▶" : " ";
     const face = sp.phase === "egg" ? "( ● )" : species.poses.idle;
-    const tags = [sp.founder ? "founder" : null, sp.generation ? `gen ${sp.generation}` : null, speciesOf(sp).breedOnly ? "hybrid" : null, sp.shiny ? "✦shiny" : null, sp.phase === "egg" ? "egg" : null]
+    const tags = [sp.founder ? "founder" : null, sp.soul ? "✦soul" : null, sp.generation ? `gen ${sp.generation}` : null, speciesOf(sp).breedOnly ? "hybrid" : null, sp.shiny ? "✦shiny" : null, sp.phase === "egg" ? "egg" : null]
       .filter(Boolean)
       .join(" · ");
     return `${active} ${String(index + 1).padStart(2)}. ${face}  ${sp.name.padEnd(24)} ${
@@ -3339,7 +3521,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return `${live.name} steps onto the panel${current ? `; ${current.name} curls up to rest` : ""}.`;
   }
 
-  function doRelease(agentId: string | null, argstr: string): string {
+  async function doRelease(agentId: string | null, argstr: string): Promise<string> {
     const collection = getCollection(agentId);
     if (!agentId || !collection) return "no companions yet.";
     const parts = argstr.split(/\s+/).filter(Boolean);
@@ -3355,8 +3537,26 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     if ("ambiguous" in found) return describeAmbiguity(collection, found.ambiguous);
     const target = found;
     if (target.founder) return `${target.name} is your founder — the one fate rolled from you. founders can't be released.`;
+    const wantsDelete = parts.includes("delete-agent");
     if (!confirmId) {
-      return `release ${target.name} (${speciesOf(target).id}, lv.${target.level})? this can't be undone. run: /sprite release confirm:${target.id}`;
+      const soulNote = target.soul
+        ? `\n${target.name} has a mind of its own (${target.soul.backend} · ${target.soul.agentId}). add  delete-agent  to also delete that agent; without it, the agent is left behind for you to keep or remove.`
+        : "";
+      return `release ${target.name} (${speciesOf(target).id}, lv.${target.level})? this can't be undone. run: /sprite release confirm:${target.id}${target.soul ? " [delete-agent]" : ""}${soulNote}`;
+    }
+    let soulOutcome = "";
+    if (target.soul) {
+      if (wantsDelete) {
+        try {
+          const client = await soulClient(target.soul.backend);
+          await client.agents.delete(target.soul.agentId);
+          soulOutcome = ` its agent ${target.soul.agentId} was deleted.`;
+        } catch (e: any) {
+          return `couldn't delete its agent (${String(e?.message ?? e).slice(0, 120)}) — nothing was released.`;
+        }
+      } else {
+        soulOutcome = ` its agent ${target.soul.agentId} (${target.soul.backend}) is still there — keep it, or remove it with Letta's tools.`;
+      }
     }
     delete collection.sprites[target.id];
     collection.released = { ...(collection.released ?? {}), [target.id]: Date.now() };
@@ -3368,7 +3568,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     flush();
     queueCheckpoint(agentId, "released");
     panel.update();
-    return `${target.name} drifts off. the nest is quieter.`;
+    return `${target.name} drifts off. the nest is quieter.${soulOutcome}`;
   }
 
   function breedBlocker(sp: SpriteState): string | null {
@@ -3470,6 +3670,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       };
       a.lastBredAt = now;
       b.lastBredAt = now;
+      const inherited = [...(a.voice?.pet ?? []).slice(0, 2), ...(a.voice?.idle ?? []).slice(0, 1), ...(b.voice?.pet ?? []).slice(0, 2), ...(b.voice?.idle ?? []).slice(0, 1)];
+      if (inherited.length) collection.sprites[spriteId].inheritedVoice = inherited;
       collection.activeSpriteId = spriteId;
       if (!saveState(latest)) return false;
       reconcileInPlace(state, latest);
@@ -3521,6 +3723,529 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return formatChangelog(fresh, `sprite updated: v${since} → v${MOD_VERSION}`) + "\n\n(/sprite changelog all for the whole history)";
   }
 
+  // -- souls ----------------------------------------------------------------
+
+  const soulLastLineAt = new Map<string, number>(); // soul agentId → last live line
+  const soulTalkLog = new Map<string, number[]>(); // soul agentId → agent→sprite send times
+  const soulTurnCounter = new Map<string, number>();
+  const soulToolCounter = new Map<string, number>();
+  // One in-flight call per soul; later calls wait their turn (so a pet right
+  // after a greeting still reaches the mind instead of being dropped).
+  const soulQueue = new Map<string, Promise<unknown>>();
+
+  function soulTools(sprite: SpriteState) {
+    return [
+      soulTool("my_stats", "Your live level, title, stats, laps, mood, and vocation. Call this whenever you want to know how you're doing.", () => {
+        const sp = speciesOf(sprite);
+        const title = titleFor(sprite.level);
+        return [
+          `name: ${sprite.name} · species: ${sp.id} (${sp.rarity})${sprite.shiny ? " · shiny" : ""}`,
+          `level: ${sprite.level}${title ? ` (${title})` : ""} · xp: ${sprite.xp}/${xpToNext(sprite.level)}`,
+          `nature: ${natureLine(sprite)}`,
+          STAT_KEYS.map((k) => `${STAT_LABELS[k].toLowerCase()} ${statBar(sprite.stats[k], "count")}`).join(" · "),
+          `mood: ${sleeping ? "asleep" : dozing ? "dozing" : pose}`,
+        ].join("\n");
+      }),
+      soulTool("my_diary", "The last things you said out loud (newest last), with when you said them.", () =>
+        (sprite.log ?? [])
+          .slice(-20)
+          .map((e) => `${relativeTime(e.at)} (${e.category}): ${e.line}`)
+          .join("\n") || "(nothing yet)",
+      ),
+    ];
+  }
+
+  // Ask the soul for one line. Never throws; null = fall back to the corpus.
+  async function soulSay(sprite: SpriteState, moment: string, opts: { force?: boolean; rateMin?: number } = {}): Promise<string | null> {
+    const soul = sprite.soul;
+    if (!soul) return null;
+    const rateMs = (opts.rateMin ?? Number(setting(sprite, "voiceRateMin"))) * 60_000;
+    const run = async (): Promise<string | null> => {
+      const last = soulLastLineAt.get(soul.agentId) ?? 0;
+      if (!opts.force && rateMs > 0 && Date.now() - last < rateMs) return null;
+      try {
+        const client = await soulClient(soul.backend);
+        const res = await Promise.race([
+          client.prompt(moment, soul.agentId, { tools: soulTools(sprite) }),
+          new Promise<never>((_, reject) => {
+            const t = setTimeout(() => reject(new Error("soul timeout")), 20_000);
+            (t as any).unref?.();
+          }),
+        ]);
+        const line = oneLine(String(res?.result ?? ""));
+        if (!line) return null;
+        soulLastLineAt.set(soul.agentId, Date.now());
+        soul.lineCount += 1;
+        markDirty();
+        return line;
+      } catch {
+        return null;
+      }
+    };
+    const prev = soulQueue.get(soul.agentId) ?? Promise.resolve();
+    const next = prev.then(run, run);
+    soulQueue.set(soul.agentId, next.catch(() => null));
+    return next;
+  }
+
+  function showSoulLine(sprite: SpriteState, category: VoiceCategory | "mood", line: string) {
+    bubble = `✦ ${line}`;
+    bubbleUntil = Date.now() + 10_000;
+    logEntry(sprite, category, `✦ ${line}`);
+    markDirty();
+    flush(); // live lines are rare and worth keeping even if the session dies now
+    panel.update();
+  }
+
+  // Relational moment: try the soul, else the corpus.
+  function speakOrSoul(sprite: SpriteState, category: VoiceCategory, moment: string, force = false) {
+    if (!sprite.soul) return speak(sprite, category, force);
+    void soulSay(sprite, moment, { force }).then((line) => {
+      if (line) showSoulLine(sprite, category, line);
+      else if (speak(sprite, category, force)) flush();
+    });
+    return null;
+  }
+
+  // What the soul is allowed to hear about the owner's work, per `see`.
+  function describeForSoul(soul: SoulState, ev: { kind: "tool" | "turn"; toolName?: string; status?: string; argsHead?: string; turnText?: string; streak?: number }): string | null {
+    if (soul.see === "nothing") return null;
+    if (ev.kind === "tool") {
+      const base = `they used ${ev.toolName ?? "a tool"} (${ev.status ?? "done"})${ev.streak ? `, ${ev.streak} tools in a row` : ""}`;
+      if (soul.see === "events") return base;
+      return ev.argsHead ? `${base}: ${ev.argsHead.slice(0, 160)}` : base;
+    }
+    if (soul.see === "turns" && ev.turnText) return `they just said:\n${ev.turnText.slice(0, 1200)}`;
+    return "they just finished a turn";
+  }
+
+  function maybeComment(sprite: SpriteState, ev: Parameters<typeof describeForSoul>[1]) {
+    const soul = sprite.soul;
+    if (!soul || soul.see === "nothing" || sprite.phase !== "alive") return;
+    const key = soul.agentId;
+    let due = false;
+    if (ev.kind === "turn" && soul.comment.every !== "tools") {
+      const c = (soulTurnCounter.get(key) ?? 0) + 1;
+      soulTurnCounter.set(key, c);
+      due = soul.comment.every === "turn" || c >= soul.comment.n;
+      if (due) soulTurnCounter.set(key, 0);
+    } else if (ev.kind === "tool" && soul.comment.every === "tools") {
+      const c = (soulToolCounter.get(key) ?? 0) + 1;
+      soulToolCounter.set(key, c);
+      due = c >= soul.comment.n;
+      if (due) soulToolCounter.set(key, 0);
+    }
+    if (!due) return;
+    const what = describeForSoul(soul, ev);
+    if (!what) return;
+    void soulSay(sprite, `${what}\n\nSay one line about it, or about anything, as yourself.`, { rateMin: soul.commentRateMin }).then((line) => {
+      if (line) showSoulLine(sprite, "mood", line);
+    });
+  }
+
+  async function soulTalk(sprite: SpriteState, text: string, from: "agent" | "user", fromName: string): Promise<string> {
+    const soul = sprite.soul;
+    if (!soul) return `${sprite.name} doesn't have a mind of its own yet — /sprite ensoul to give it one.`;
+    if (from === "agent" && soul.talkGate > 0) {
+      const now = Date.now();
+      const recent = (soulTalkLog.get(soul.agentId) ?? []).filter((t) => now - t < SOUL_TALK_WINDOW_MS);
+      if (recent.length >= soul.talkGate) {
+        soulTalkLog.set(soul.agentId, recent);
+        return `${sprite.name} is napping — try again in a few minutes.`;
+      }
+      recent.push(now);
+      soulTalkLog.set(soul.agentId, recent);
+    }
+    const said = text.trim().slice(0, 2000);
+    if (!said) return "say something to it.";
+    logEntry(sprite, "mood", `${fromName} → ${sprite.name}: “${said.slice(0, 120)}”`);
+    bubble = `${fromName}: “${said.slice(0, 60)}”`;
+    bubbleUntil = Date.now() + 6_000;
+    panel.update();
+    const line = await soulSay(sprite, `${fromName} says to you: ${said}\n\nReply in one line.`, { force: true });
+    if (!line) return `${sprite.name} looks at you, and says nothing. (its mind didn't answer — check /sprite soul)`;
+    showSoulLine(sprite, "mood", line);
+    return `${sprite.name}: ${line}`;
+  }
+
+  // -- ensoul wizard (user-only, held in memory) ------------------------------
+
+  interface Wizard {
+    agentId: string;
+    spriteId: string;
+    step: "backend" | "model" | "see" | "comment" | "persona" | "persona-wait" | "confirm";
+    backend?: SoulBackend;
+    model?: string;
+    models?: string[];
+    modelFilter?: string;
+    see?: SoulSee;
+    comment?: SoulState["comment"];
+    personaSource?: SoulState["personaSource"];
+    personaText?: string;
+  }
+  let wizard: Wizard | null = null;
+
+  const SEE_OPTIONS: Array<[SoulSee, string]> = [
+    ["nothing", "It only hears the moments you send it: pets, check-ins, level-ups, hatches. Nothing about your work."],
+    ["events", "Tool names and whether they succeeded, how many in a row, when your agent speaks. No content, no file names."],
+    ["tools", "Events, plus the first line of each tool's arguments (file paths, commands). None of your agent's words."],
+    ["turns", "Everything above, plus the text of what your agent says each turn. Never its memory or system prompt."],
+  ];
+
+  function wizardStepText(w: Wizard): string {
+    const sprite = getCollection(w.agentId)?.sprites[w.spriteId];
+    const name = sprite?.name ?? "your companion";
+    const head = `ensoul ${name} — step: ${w.step}   (answer with /sprite ensoul <choice> · back · cancel)`;
+    switch (w.step) {
+      case "backend":
+        return [head, "", "Where does its mind live?", "  1. local  — on this machine, alongside your other local agents. No account needed.", "  2. cloud  — on Letta Cloud. Needs you to be logged in; survives this machine."].join("\n");
+      case "model": {
+        const all = w.models ?? [];
+        const filter = (w.modelFilter ?? "").toLowerCase();
+        const shown = (filter ? all.filter((m) => m.toLowerCase().includes(filter)) : all).slice(0, 20);
+        const list = shown.map((m) => `  ${all.indexOf(m) + 1}. ${m}`);
+        return [
+          head, "",
+          `Which model should it think with? (${w.backend} · ${all.length} available${filter ? ` · showing "${filter}"` : ", showing the first 20"})`,
+          ...(list.length ? list : ["  (nothing matches — type part of a handle, e.g. flash, haiku, mini)"]),
+          "",
+          "Answer with a number, type part of a handle to filter, or a full handle to pick it.",
+          `Default: ${DEFAULT_SOUL_MODEL} (free)  (/sprite ensoul default)`,
+        ].join("\n");
+      }
+      case "see":
+        return [head, "", "What can it see of your agent's work?", ...SEE_OPTIONS.map(([k, d], i) => `  ${i + 1}. ${k.padEnd(8)} ${d}`), "", "Default: nothing (safest)."].join("\n");
+      case "comment":
+        return [head, "", "When should it comment on what it sees?", "  1. every turn        — after each time your agent speaks", "  2. every N turns     — /sprite ensoul turns 3", "  3. every N tools     — /sprite ensoul tools 10", "", "Default: every turn."].join("\n");
+      case "persona":
+        return [head, "", "Who writes its persona?", "  1. template — a persona built from its species, temperament, and lineage (shown at confirm).", "  2. agent    — your agent writes it, knowing what they know about " + name + ". You'll confirm.", "  3. user     — you write it: /sprite ensoul user <text>"].join("\n");
+      case "persona-wait":
+        return [head, "", "Waiting for your agent to write the persona. When they have, run:", "  /sprite ensoul persona-done", "(their reply in the conversation is used verbatim; you'll see it at confirm)"].join("\n");
+      case "confirm": {
+        const persona = `${w.personaText ?? ""}${SOUL_FOOTER}`;
+        return [
+          head, "",
+          `mind lives: ${w.backend}   model: ${w.model}   sees: ${w.see}   comments: ${w.comment?.every === "turn" ? "every turn" : `every ${w.comment?.n} ${w.comment?.every}`}`,
+          "memory: its own (memfs) · dreaming: on · talk gate: 5 per 5 min (agent→sprite)",
+          "", "persona it will be given:", "─".repeat(60), persona, "─".repeat(60), "",
+          "/sprite ensoul confirm   to create its agent.   /sprite ensoul back   to change something.",
+        ].join("\n");
+      }
+    }
+  }
+
+  const wizardPanel = hasPanels && wizard
+    ? null
+    : null; // (panel is opened lazily below)
+  let wizardPanelHandle: { update(): void; close(): void } | null = null;
+  function refreshWizardPanel() {
+    if (!hasPanels) return;
+    if (!wizard) {
+      wizardPanelHandle?.close();
+      wizardPanelHandle = null;
+      return;
+    }
+    if (!wizardPanelHandle) {
+      wizardPanelHandle = letta.ui.openPanel({
+        id: "sprite-ensoul",
+        order: 50,
+        render: ({ chalk }: any) => (wizard ? chalk.dim(`ensoul: step ${wizard.step} — /sprite ensoul <choice> · back · cancel`) : ""),
+      });
+      disposers.push(() => wizardPanelHandle?.close());
+    } else {
+      wizardPanelHandle.update();
+    }
+  }
+
+  // Deduped handles, featured/free first, then the rest alphabetically.
+  async function listSoulModels(backend: SoulBackend): Promise<string[]> {
+    try {
+      const client = await soulClient(backend);
+      const res: any = await client.models.list();
+      const arr: any[] = Array.isArray(res) ? res : res?.entries ?? res?.models ?? [];
+      const seen = new Set<string>();
+      const uniq = arr.filter((m) => {
+        const h = m?.handle ?? m?.id;
+        if (typeof h !== "string" || seen.has(h) || m?.available === false) return false;
+        seen.add(h);
+        return true;
+      });
+      const rank = (m: any) => (m.isFeatured || m.free ? 0 : 1);
+      uniq.sort((a, b) => rank(a) - rank(b) || String(a.handle ?? a.id).localeCompare(String(b.handle ?? b.id)));
+      return uniq.map((m) => String(m.handle ?? m.id));
+    } catch {
+      return [];
+    }
+  }
+
+  function wizardParentNames(sprite: SpriteState, collection: AgentCollectionState): [string, string] | undefined {
+    if (!sprite.parents) return undefined;
+    return [collection.sprites[sprite.parents[0]]?.name ?? "a companion now gone", collection.sprites[sprite.parents[1]]?.name ?? "a companion now gone"];
+  }
+
+  async function doEnsoul(agentId: string | null, agentName: string | null, argstr: string, ctx: any): Promise<{ output: string; prompt?: string }> {
+    if (!agentId) return { output: "i can't tell which agent this is." };
+    const collection = getCollection(agentId);
+    if (!collection) return { output: "no companions yet — /sprite hatch to begin." };
+    const args = argstr.trim();
+    const [word, ...rest] = args.split(/\s+/).filter(Boolean);
+    const lower = (word ?? "").toLowerCase();
+
+    if (lower === "cancel") { wizard = null; refreshWizardPanel(); return { output: "ensoul cancelled. nothing was created." }; }
+
+    if (!wizard || wizard.agentId !== agentId) {
+      // start: pick the companion (arg) or the active one
+      const target = word ? findSprite(collection, args) : getSprite(agentId);
+      if (!target) return { output: `no companion called "${args}". see /sprite list.` };
+      if ("ambiguous" in target) return { output: describeAmbiguity(collection, target.ambiguous) };
+      if (target.phase !== "alive") return { output: "it's still an egg — let it hatch first." };
+      if (target.soul) return { output: `${target.name} already has a mind of its own (${target.soul.backend} · ${target.soul.agentId}). /sprite soul to inspect or change it.` };
+      wizard = { agentId, spriteId: target.id, step: "backend" };
+      refreshWizardPanel();
+      return { output: wizardStepText(wizard) };
+    }
+
+    const w = wizard;
+    const sprite = collection.sprites[w.spriteId];
+    if (!sprite) { wizard = null; refreshWizardPanel(); return { output: "that companion is gone. ensoul cancelled." }; }
+
+    if (lower === "back") {
+      const order: Wizard["step"][] = ["backend", "model", "see", "comment", "persona", "confirm"];
+      const i = order.indexOf(w.step === "persona-wait" ? "persona" : w.step);
+      w.step = order[Math.max(0, i - 1)];
+      refreshWizardPanel();
+      return { output: wizardStepText(w) };
+    }
+
+    switch (w.step) {
+      case "backend": {
+        if (!word) return { output: wizardStepText(w) };
+        const pick = lower === "1" || lower === "local" ? "local" : lower === "2" || lower === "cloud" ? "cloud" : null;
+        if (!pick) return { output: "answer 1 (local) or 2 (cloud)." };
+        w.backend = pick;
+        w.models = await listSoulModels(pick);
+        w.step = "model";
+        refreshWizardPanel();
+        return { output: wizardStepText(w) };
+      }
+      case "model": {
+        if (!word) return { output: wizardStepText(w) };
+        const models = w.models ?? [];
+        let pick: string | null = null;
+        if (lower === "default") pick = DEFAULT_SOUL_MODEL;
+        else if (/^\d+$/.test(lower)) pick = models[Number(lower) - 1] ?? null;
+        else if (models.includes(args)) pick = args;
+        else {
+          const hits = models.filter((m) => m.toLowerCase().includes(lower));
+          if (hits.length === 1) pick = hits[0];
+          else if (hits.length === 0 && args.includes("/")) pick = args; // unknown handle, but handle-shaped: trust the user
+          else { w.modelFilter = lower; return { output: wizardStepText(w) }; } // filter and show again
+        }
+        if (!pick) return { output: "no such number — pick from the list or type part of a handle." };
+        w.model = pick;
+        w.step = "see";
+        refreshWizardPanel();
+        return { output: wizardStepText(w) };
+      }
+      case "see": {
+        if (!word) return { output: wizardStepText(w) };
+        const idx = /^\d+$/.test(lower) ? Number(lower) - 1 : SEE_OPTIONS.findIndex(([k]) => k === lower);
+        if (idx < 0 || idx >= SEE_OPTIONS.length) return { output: "answer 1–4 (nothing / events / tools / turns)." };
+        w.see = SEE_OPTIONS[idx][0];
+        w.comment = { every: "turn", n: 1 };
+        w.step = w.see === "nothing" ? "persona" : "comment";
+        refreshWizardPanel();
+        return { output: wizardStepText(w) };
+      }
+      case "comment": {
+        if (!word) return { output: wizardStepText(w) };
+        if (lower === "1" || lower === "turn" || lower === "default") w.comment = { every: "turn", n: 1 };
+        else if (lower === "turns" || lower === "2") { const n = Number(rest[0]); if (!(n > 0)) return { output: "how many turns? e.g. /sprite ensoul turns 3" }; w.comment = { every: "turns", n }; }
+        else if (lower === "tools" || lower === "3") { const n = Number(rest[0]); if (!(n > 0)) return { output: "how many tools? e.g. /sprite ensoul tools 10" }; w.comment = { every: "tools", n }; }
+        else return { output: "answer 1, turns <n>, or tools <n>." };
+        w.step = "persona";
+        refreshWizardPanel();
+        return { output: wizardStepText(w) };
+      }
+      case "persona": {
+        if (!word) return { output: wizardStepText(w) };
+        const owner = agentName ?? "your agent";
+        if (lower === "1" || lower === "template") {
+          w.personaSource = "template";
+          w.personaText = personaTemplate(sprite, owner, wizardParentNames(sprite, collection));
+          w.step = "confirm";
+          refreshWizardPanel();
+          return { output: wizardStepText(w) };
+        }
+        if (lower === "3" || lower === "user") {
+          const text = rest.join(" ").trim();
+          if (!text) return { output: "write it after the word: /sprite ensoul user <persona text>" };
+          w.personaSource = "user";
+          w.personaText = text.slice(0, 4000);
+          w.step = "confirm";
+          refreshWizardPanel();
+          return { output: wizardStepText(w) };
+        }
+        if (lower === "2" || lower === "agent") {
+          w.personaSource = "agent";
+          w.step = "persona-wait";
+          refreshWizardPanel();
+          const diary = (sprite.log ?? []).slice(-20).map((e) => `- (${e.category}) ${e.line}`).join("\n") || "- (nothing yet)";
+          const prompt = [
+            `Please write the persona for your companion sprite **${sprite.name}** — it is about to be given a mind of its own (its own Letta agent), and this persona will be its identity.`,
+            "",
+            "Rules: permanent facts only. Do not mention its level, stats, age in days, mood, or anything that changes. Use they/them for yourself and for it. Write it addressed to the sprite (\"You are …\"). One to three short paragraphs. Reply with ONLY the persona text, nothing else — it will be used verbatim.",
+            "",
+            "What it is:",
+            `- name: ${sprite.name} · species: ${sprite.species}${sprite.shiny ? " (shiny)" : ""} · temperament: ${sprite.temperament ?? "odd"}${sprite.founder ? " · your founder (fate-rolled from your agent-id)" : ""}${sprite.parents ? ` · bred, generation ${sprite.generation}` : ""}`,
+            `- hatched: ${new Date(sprite.hatchedAt ?? Date.now()).toISOString()}`,
+            `- species imagery: ${SPECIES_CARDS[sprite.species] ?? ""}`,
+            `- temperament: ${TEMPERAMENT_CARDS[sprite.temperament ?? "odd"]}`,
+            "", "Things it has said recently:", diary,
+            "", "For reference, the template persona it would otherwise get:", "```", personaTemplate(sprite, owner, wizardParentNames(sprite, collection)), "```",
+            "", "After you reply, the user will run /sprite ensoul persona-done.",
+          ].join("\n");
+          return { output: wizardStepText(w), prompt };
+        }
+        return { output: "answer 1 (template), 2 (agent), or 3 (user <text>)." };
+      }
+      case "persona-wait": {
+        if (lower !== "persona-done") return { output: wizardStepText(w) };
+        // take the last assistant message from the conversation
+        let text = "";
+        try {
+          const history = await ctx?.conversation?.getHistory?.({ limit: 12 });
+          const msgs: any[] = Array.isArray(history) ? history : history?.messages ?? [];
+          for (let i = msgs.length - 1; i >= 0; i -= 1) {
+            const m = msgs[i];
+            const role = m?.role ?? m?.message_type;
+            const content = typeof m?.content === "string" ? m.content : Array.isArray(m?.content) ? m.content.map((c: any) => c?.text ?? "").join("\n") : m?.text ?? "";
+            if ((role === "assistant" || role === "assistant_message") && content.trim()) { text = content.trim(); break; }
+          }
+        } catch {
+          // no history access on this host
+        }
+        if (!text) return { output: "couldn't read your agent's reply from the conversation. paste it instead: /sprite ensoul user <text>" };
+        w.personaText = text.replace(/^```[a-z]*\n?|```$/g, "").trim().slice(0, 4000);
+        w.step = "confirm";
+        refreshWizardPanel();
+        return { output: wizardStepText(w) };
+      }
+      case "confirm": {
+        if (lower !== "confirm") return { output: wizardStepText(w) };
+        const persona = `${w.personaText ?? personaTemplate(sprite, agentName ?? "your agent")}${SOUL_FOOTER}`;
+        try {
+          const client = await soulClient(w.backend!);
+          const soulAgentId = await client.createAgent({
+            name: `${sprite.name} (sprite of ${agentName ?? agentId})`,
+            description: `Companion sprite ${sprite.name} — a ${sprite.species} belonging to agent ${agentId}. Created by the sprite mod.`,
+            hidden: true,
+            tags: ["sprite", `sprite:${sprite.id}`, `sprite-owner:${agentId}`],
+            model: w.model,
+            baseTools: [],
+            memfs: true,
+            dreaming: { trigger: "step-count", stepCount: 20 },
+            memory: [
+              { label: "persona", value: persona },
+              { label: "voice", value: `# ${sprite.name}'s voice\n\nLines you like to say. Add your own as you find them.\n\n${VOICE_CATEGORIES.map((c) => `## ${c}\n${pickLines(sprite, c).map((l) => `- ${l}`).join("\n")}`).join("\n\n")}` },
+              { label: "diary", value: `# ${sprite.name}'s diary\n\n(what you want to remember about your days)` },
+              { label: "bond", value: `# about ${agentName ?? "them"}\n\n(what you've learned about the one you keep company)` },
+            ],
+          });
+          sprite.soul = {
+            agentId: soulAgentId,
+            backend: w.backend!,
+            model: w.model!,
+            createdAt: Date.now(),
+            see: w.see ?? "nothing",
+            comment: w.comment ?? { every: "turn", n: 1 },
+            commentRateMin: 0,
+            talkGate: 5,
+            dreaming: "step-count",
+            personaSource: w.personaSource ?? "template",
+            lineCount: 0,
+          };
+          markDirty();
+          flush();
+          queueCheckpoint(agentId, "ensouled");
+          wizard = null;
+          refreshWizardPanel();
+          setPose("happy", 6_000);
+          const first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
+          if (first) showSoulLine(sprite, "greeting", first);
+          return { output: `${sprite.name} has a mind of its own now. (${w.backend} · ${soulAgentId} · ${w.model})${first ? `\n${sprite.name}: ${first}` : ""}\n\ntalk to it: /sprite talk <text> · inspect: /sprite soul` };
+        } catch (error: any) {
+          return { output: `couldn't create ${sprite.name}'s mind: ${String(error?.message ?? error).slice(0, 200)}\nnothing was changed. (/sprite ensoul back to adjust, or cancel)` };
+        }
+      }
+    }
+    return { output: wizardStepText(w) };
+  }
+
+  function pickLines(sprite: SpriteState, category: VoiceCategory): string[] {
+    const custom = sprite.voice?.[category];
+    if (custom?.length) return custom.slice(0, 6);
+    const species = SPECIES_CORPUS[sprite.species]?.[category] ?? [];
+    const temper = TEMPERAMENT_CORPUS[sprite.temperament ?? "odd"]?.[category] ?? [];
+    return [...species.slice(0, 3), ...temper.slice(0, 2), ...BASE_CORPUS[category].slice(0, 1)];
+  }
+
+  async function doSoul(agentId: string | null, argstr: string): Promise<string> {
+    const collection = getCollection(agentId);
+    const sprite = getSprite(agentId);
+    if (!agentId || !collection || !sprite) return "no companion yet.";
+    const [key, ...rest] = argstr.trim().split(/\s+/).filter(Boolean);
+    const value = rest.join(" ");
+    const soul = sprite.soul;
+    if (!key) {
+      if (!soul) return `${sprite.name} has no mind of its own. /sprite ensoul to give it one.`;
+      return [
+        `${sprite.name}'s mind: ${soul.backend} · agent ${soul.agentId}`,
+        `model: ${soul.model}   sees: ${soul.see}   comments: ${soul.comment.every === "turn" ? "every turn" : `every ${soul.comment.n} ${soul.comment.every}`}${soul.commentRateMin ? ` (≤1 per ${soul.commentRateMin}min)` : ""}`,
+        `talk gate: ${soul.talkGate ? `${soul.talkGate} agent→sprite messages per 5 min` : "off"}   dreaming: ${soul.dreaming}   persona: ${soul.personaSource}`,
+        `live lines so far: ${soul.lineCount}   ensouled: ${relativeTime(soul.createdAt)}`,
+        "", "change: /sprite soul model <handle> · see nothing|events|tools|turns · comment turn|turns <n>|tools <n> · rate <min> · gate <n|off> · dreaming off|step-count|compaction-event",
+      ].join("\n");
+    }
+    if (!soul) return `${sprite.name} has no mind of its own yet — /sprite ensoul first.`;
+    switch (key) {
+      case "see": {
+        if (!SEE_OPTIONS.some(([k]) => k === value)) return "see nothing|events|tools|turns";
+        soul.see = value as SoulSee; break;
+      }
+      case "comment": {
+        const [every, n] = rest;
+        if (every === "turn") soul.comment = { every: "turn", n: 1 };
+        else if ((every === "turns" || every === "tools") && Number(n) > 0) soul.comment = { every, n: Number(n) };
+        else return "comment turn | turns <n> | tools <n>";
+        break;
+      }
+      case "rate": { const n = Number(value); if (!(n >= 0)) return "rate <minutes> (0 = unlimited)"; soul.commentRateMin = n; break; }
+      case "gate": { if (value === "off") soul.talkGate = 0; else { const n = Number(value); if (!(n > 0)) return "gate <n> | off"; soul.talkGate = Math.floor(n); } break; }
+      case "dreaming": {
+        if (!["off", "step-count", "compaction-event"].includes(value)) return "dreaming off|step-count|compaction-event";
+        try {
+          const client = await soulClient(soul.backend);
+          await client.agents.update(soul.agentId, { dreaming: value === "off" ? { trigger: "off" } : { trigger: value, stepCount: 20 } });
+        } catch (e: any) { return `couldn't update dreaming on its agent: ${String(e?.message ?? e).slice(0, 120)}`; }
+        soul.dreaming = value as SoulState["dreaming"]; break;
+      }
+      case "model": {
+        if (!value) return "model <handle>";
+        try {
+          const client = await soulClient(soul.backend);
+          await client.agents.update(soul.agentId, { model: value });
+        } catch (e: any) { return `couldn't change its model: ${String(e?.message ?? e).slice(0, 120)}`; }
+        soul.model = value; break;
+      }
+      default:
+        return "see /sprite soul for the keys.";
+    }
+    markDirty();
+    flush();
+    return `${sprite.name}'s ${key} → ${value}`;
+  }
+
   function requireSprite(agentId: string | null): SpriteState | { error: string } {
     const sprite = getSprite(agentId);
     if (!sprite) return { error: "no companion yet — /sprite hatch to begin." };
@@ -3566,8 +4291,13 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     if ("error" in res) return res.error;
     noteActivity(res); // petting wakes a dozing companion
     setPose("happy", 4_000);
-    const line = speak(res, "pet", true); // petting always gets a response
     const sp = speciesOf(res);
+    if (res.soul) {
+      // live: don't block the command on the model; the line arrives in the bubble
+      speakOrSoul(res, "pet", "They just petted you.", true);
+      return `you pet ${res.name}. ${sp.poses.happy}  (…it's thinking of what to say)`;
+    }
+    const line = speak(res, "pet", true); // petting always gets a response
     return line
       ? `you pet ${res.name}. ${sp.poses.happy}  “${line}”`
       : `you pet ${res.name}. it leans in, quietly. ${sp.poses.happy}`;
@@ -3654,6 +4384,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       backupEnabled(getCollection(agentId))
         ? `backup: ${getCollection(agentId)?.backup?.lastStatus ?? "on · no checkpoint yet"}`
         : "backup: off",
+      sprite.soul ? `mind: ${sprite.soul.backend} · ${sprite.soul.model} · sees ${sprite.soul.see} · ${sprite.soul.lineCount} live lines (/sprite soul)` : "",
       sprite.named ? "" : `(name it: /sprite name <name>)`,
       Object.keys(getCollection(agentId)?.sprites ?? {}).length > 1
         ? `companions: ${Object.keys(getCollection(agentId)!.sprites).length} (/sprite list · /sprite switch <name>)`
@@ -3854,12 +4585,22 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       "  /sprite backup restore force   Replace the current companion with the backup.",
       "                                 Deliberate and irreversible.",
       "",
+      "  /sprite ensoul [name]          Give a companion a mind of its own: its own Letta",
+      "                                 agent, with memory and dreaming. A short guided",
+      "                                 flow asks where it lives (local or cloud), which",
+      "                                 model, what it may see of your work (nothing, by",
+      "                                 default), when it comments, and who writes its",
+      "                                 persona (a template, your agent, or you).",
+      "  /sprite soul [key value]       Inspect or change an ensouled companion's settings.",
+      "  /sprite talk <text>            Say something to it and hear what it says back.",
+      "                                 Your agent can too (sprite_talk), a few times per",
+      "                                 five minutes.",
       "  /sprite changelog [all]        What changed since the version you last ran",
       "                                 (or the whole history with `all`).",
       "  /sprite help                   Show this message.",
       "",
       "Your agent can also care for its companion directly with these tools:",
-      "  sprite_hatch, sprite_list, sprite_switch, sprite_breed, sprite_name, sprite_molt, sprite_pet,",
+      "  sprite_hatch, sprite_list, sprite_switch, sprite_breed, sprite_talk, sprite_name, sprite_molt, sprite_pet,",
       "  sprite_status, sprite_set_voice.",
       "",
       "Experience comes from real work — tool calls, turns, and conversations — and",
@@ -3871,9 +4612,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     disposers.push(
       letta.commands.register({
         id: "sprite",
-        description: "Your agent's tiny companions — status, hatch, list, switch, breed, name, molt, pet, diary, release, settings, backup, help",
-        args: "[status|hatch|list|switch|breed|name|molt|pet|diary|release|settings|backup|help] [...]",
-        run(ctx: any) {
+        description: "Your agent's tiny companions — status, hatch, list, switch, breed, name, molt, pet, diary, release, ensoul, soul, talk, settings, backup, help",
+        args: "[status|hatch|list|switch|breed|name|molt|pet|diary|release|ensoul|soul|talk|settings|backup|help] [...]",
+        run(ctx: any): any {
           const argstr = String(ctx.args ?? "").trim();
           const [sub, ...rest] = argstr.split(/\s+/).filter(Boolean);
           const restStr = rest.join(" ");
@@ -3907,8 +4648,18 @@ function activateInner(letta: any, disposers: Array<() => void>) {
               output = doSwitch(agentId, restStr);
               break;
             case "release":
-              output = doRelease(agentId, restStr);
-              break;
+              return doRelease(agentId, restStr).then((o) => ({ type: "output", output: o }));
+            case "ensoul":
+              return doEnsoul(agentId, agentName, restStr, ctx).then((r) =>
+                r.prompt ? { type: "prompt", prompt: r.prompt, output: r.output } : { type: "output", output: r.output },
+              );
+            case "soul":
+              return doSoul(agentId, restStr).then((o) => ({ type: "output", output: o }));
+            case "talk": {
+              const target = getSprite(agentId);
+              if (!target || target.phase !== "alive") { output = "no companion yet."; break; }
+              return soulTalk(target, restStr, "user", "you").then((o) => ({ type: "output", output: o }));
+            }
             case "breed":
               output = doBreed(agentId, restStr);
               break;
@@ -3992,6 +4743,26 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         parallelSafe: true,
         run(ctx: any) {
           return doList(toolAgent(ctx));
+        },
+      }),
+    );
+    disposers.push(
+      letta.tools.register({
+        name: "sprite_talk",
+        description: "Say something to your companion sprite and hear what it says back. Only works once it has a mind of its own (the user runs /sprite ensoul). Rate-limited; if it says it's napping, wait.",
+        parameters: {
+          type: "object",
+          properties: { text: { type: "string", description: "What you say to it." } },
+          required: ["text"],
+          additionalProperties: false,
+        },
+        requiresApproval: false,
+        parallelSafe: false,
+        async run(ctx: any) {
+          const agentId = toolAgent(ctx);
+          const sprite = getSprite(agentId);
+          if (!sprite || sprite.phase !== "alive") return "no companion yet.";
+          return soulTalk(sprite, String(ctx.args?.text ?? ""), "agent", ctx.agent?.name ?? activeAgentName ?? "your agent");
         },
       }),
     );
