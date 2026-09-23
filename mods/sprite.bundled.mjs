@@ -13946,8 +13946,14 @@ ${sprite.name}: ${line}` : `
     setPose("happy", 4000);
     const sp = speciesOf(res);
     if (res.soul) {
-      speakOrSoul(res, "pet", "They just petted you.", true);
-      return `you pet ${res.name}. ${sp.poses.happy}  (\u2026it's thinking of what to say)`;
+      return soulSay(res, "They just petted you.", { force: true }).then((line2) => {
+        if (line2) {
+          showSoulLine(res, "pet", line2);
+          return `you pet ${res.name}. ${sp.poses.happy}  \u201C${line2}\u201D`;
+        }
+        const canned = speak(res, "pet", true);
+        return canned ? `you pet ${res.name}. ${sp.poses.happy}  (${canned})` : `you pet ${res.name}. it leans in, quietly. ${sp.poses.happy}`;
+      });
     }
     const line = speak(res, "pet", true);
     return line ? `you pet ${res.name}. ${sp.poses.happy}  \u201C${line}\u201D` : `you pet ${res.name}. it leans in, quietly. ${sp.poses.happy}`;
@@ -14306,9 +14312,13 @@ ${recent.join(`
           case "molt":
             output = doMolt(agentId, rest[0]?.toLowerCase());
             break;
-          case "pet":
-            output = doPet(agentId);
+          case "pet": {
+            const r = doPet(agentId);
+            if (typeof r !== "string")
+              return r.then((o) => ({ type: "output", output: o }));
+            output = r;
             break;
+          }
           case "diary":
             output = doDiary(agentId);
             break;

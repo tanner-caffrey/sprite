@@ -978,9 +978,8 @@ await check("soul: pet goes to the mind (✦), tools my_stats/my_diary are offer
   const agent = { id: "agent-soul2", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
   for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
-  await tick(); // let the greeting/missed_you soul call settle (soulBusy is a single slot)
-  assert.match(host.command("pet"), /thinking of what to say/);
   await tick();
+  assert.match(await host.command("pet"), /“mrrp\. \(from the mind\.\)”/);
   const sp = activeSprite(agent.id);
   assert.ok(sp.log.some((e) => e.line === "mrrp. (from the mind.)"), JSON.stringify(sp.log.slice(-3)));
   const promptCall = mock.calls.find((c) => c[0] === "prompt" && c[2].includes("petted"));
@@ -990,7 +989,7 @@ await check("soul: pet goes to the mind (✦), tools my_stats/my_diary are offer
   // mind gone → corpus fallback, no crash
   mock.agents.clear();
   const before = (activeSprite(agent.id).log ?? []).length;
-  host.command("pet");
+  assert.match(await host.command("pet"), /\(.*\)/); // canned fallback, parenthesised
   await tick();
   const after = activeSprite(agent.id).log;
   assert.ok(after.length > before && after[after.length - 1].line.startsWith("("), "fallback should be a parenthesised corpus line: " + after[after.length - 1].line);

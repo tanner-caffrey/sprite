@@ -4337,16 +4337,25 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return `new body, same soul — ${res.name} is now a ${next} ${sp.poses.happy} (level ${res.level} and every memory kept)`;
   }
 
-  function doPet(agentId: string | null): string {
+  function doPet(agentId: string | null): string | Promise<string> {
     const res = requireSprite(agentId);
     if ("error" in res) return res.error;
     noteActivity(res); // petting wakes a dozing companion
     setPose("happy", 4_000);
     const sp = speciesOf(res);
     if (res.soul) {
-      // live: don't block the command on the model; the line arrives in the bubble
-      speakOrSoul(res, "pet", "They just petted you.", true);
-      return `you pet ${res.name}. ${sp.poses.happy}  (…it's thinking of what to say)`;
+      // live: wait for the mind (petting is the one moment you want to hear),
+      // fall back to the corpus if it's slow or silent
+      return soulSay(res, "They just petted you.", { force: true }).then((line) => {
+        if (line) {
+          showSoulLine(res, "pet", line);
+          return `you pet ${res.name}. ${sp.poses.happy}  “${line}”`;
+        }
+        const canned = speak(res, "pet", true);
+        return canned
+          ? `you pet ${res.name}. ${sp.poses.happy}  (${canned})`
+          : `you pet ${res.name}. it leans in, quietly. ${sp.poses.happy}`;
+      });
     }
     const line = speak(res, "pet", true); // petting always gets a response
     return line
@@ -4720,9 +4729,12 @@ function activateInner(letta: any, disposers: Array<() => void>) {
             case "molt":
               output = doMolt(agentId, rest[0]?.toLowerCase());
               break;
-            case "pet":
-              output = doPet(agentId);
+            case "pet": {
+              const r = doPet(agentId);
+              if (typeof r !== "string") return r.then((o) => ({ type: "output", output: o }));
+              output = r;
               break;
+            }
             case "diary":
               output = doDiary(agentId);
               break;
