@@ -23,8 +23,11 @@ EOF
 bun run build >/dev/null  # bundle carries the version
 
 git add -A
-if [[ -f "$msg" ]]; then git -c user.name=Faye -c user.email=faye@gwynnie.gay commit -q -F "$msg"
-else git -c user.name=Faye -c user.email=faye@gwynnie.gay commit -q -m "$msg"; fi
+# Tanner authors; Faye co-authors (matches the upstream commits).
+trailer="Co-Authored-By: Faye <faye@gwynnie.gay>"
+if [[ -f "$msg" ]]; then body="$(cat "$msg")"; else body="$msg"; fi
+printf '%s\n\n%s\n' "$body" "$trailer" > /tmp/sprite-release-msg.txt
+git -c user.name="Tanner Caffrey" -c user.email="tanner.caffrey@gmail.com" commit -q -F /tmp/sprite-release-msg.txt
 git push -q
 git log --oneline -1
 if (( install )); then letta install git:github.com/tanner-caffrey/sprite 2>&1 | tail -1; fi
