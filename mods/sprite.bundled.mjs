@@ -1,16 +1,12 @@
 // @bun
 var __defProp = Object.defineProperty;
-var __returnValue = (v) => v;
-function __exportSetter(name, newValue) {
-  this[name] = __returnValue.bind(null, newValue);
-}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: __exportSetter.bind(all, name)
+      set: (newValue) => all[name] = () => newValue
     });
 };
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
@@ -10970,6 +10966,7 @@ var HELP = [
     usage: ["/sprite ensoul", "/sprite ensoul <name>"],
     details: [
       "This hands your agent a walkthrough. It asks you, one question at a time: where the mind lives (local or cloud), which model (from the real catalog; the free letta/auto-fast is the default), what it may see of your work, when it comments, and who writes its persona (a template, your agent, or you). It shows a summary and creates the agent only after you confirm \u2014 and the creation itself asks for your approval.",
+      "The local model catalog lists handles, not proof that their provider is connected. For a local chatgpt-plus-pro/ model, connect the ChatGPT plan first with letta connect chatgpt (device-code login is also supported). If a mind does not answer, /sprite soul shows the last turn error; changing its model does not connect the provider automatically.",
       "Once ensouled, every line on the panel is live: greetings, pets, idle mutters, commits, errors. Built-in lines only appear in (parentheses) when the mind doesn't answer.",
       "Its persona holds permanent facts only. Its level and stats change, so it asks for those with its own tools instead of remembering them. It never sees your agent's memory or system prompt \u2014 only what `see` allows."
     ],
@@ -13852,6 +13849,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
           });
           const collect = (async () => {
             let fromResult = "";
+            let sawResult = false;
             for await (const msg of session.stream()) {
               if (msg?.type === "assistant") {
                 if (typeof msg.content === "string")
@@ -13859,11 +13857,18 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
                 else if (Array.isArray(msg.content))
                   text += msg.content.map((c) => typeof c?.text === "string" ? c.text : "").join("");
               } else if (msg?.type === "result") {
+                sawResult = true;
+                if (msg.success === false) {
+                  const detail = String(msg.errorDetail ?? msg.error ?? msg.errorCode ?? "model request failed").slice(0, 200);
+                  throw new Error(`mind turn failed: ${detail}`);
+                }
                 if (typeof msg.result === "string")
                   fromResult = msg.result;
                 break;
               }
             }
+            if (!sawResult)
+              throw new Error("mind turn ended without a result");
             if (!text.trim() && fromResult)
               text = fromResult;
           })();
@@ -13877,6 +13882,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
         const line = oneLine(text);
         if (!line)
           return null;
+        soulLastError = "";
         soulLastLineAt.set(soul.agentId, Date.now());
         soul.lineCount += 1;
         markDirty();
@@ -14394,7 +14400,7 @@ ${sprite.name}: ${line}` : ""}`;
           showSoulLine(sprite, "mood", line);
         return `${sprite.name}'s model \u2192 ${value}${line ? `
 ${sprite.name}: ${line}` : `
-\u26A0 set, but it didn't answer \u2014 that model may not be available here.`}`;
+\u26A0 set, but it didn't answer \u2014 check /sprite soul for the last error.`}`;
       }
       default:
         return "see /sprite soul for the keys.";

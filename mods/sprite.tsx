@@ -1085,6 +1085,7 @@ export const HELP: HelpEntry[] = [
     usage: ["/sprite ensoul", "/sprite ensoul <name>"],
     details: [
       "This hands your agent a walkthrough. It asks you, one question at a time: where the mind lives (local or cloud), which model (from the real catalog; the free letta/auto-fast is the default), what it may see of your work, when it comments, and who writes its persona (a template, your agent, or you). It shows a summary and creates the agent only after you confirm — and the creation itself asks for your approval.",
+      "The local model catalog lists handles, not proof that their provider is connected. For a local chatgpt-plus-pro/ model, connect the ChatGPT plan first with letta connect chatgpt (device-code login is also supported). If a mind does not answer, /sprite soul shows the last turn error; changing its model does not connect the provider automatically.",
       "Once ensouled, every line on the panel is live: greetings, pets, idle mutters, commits, errors. Built-in lines only appear in (parentheses) when the mind doesn't answer.",
       "Its persona holds permanent facts only. Its level and stats change, so it asks for those with its own tools instead of remembering them. It never sees your agent's memory or system prompt — only what `see` allows.",
     ],
@@ -4343,15 +4344,22 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           });
           const collect = (async () => {
             let fromResult = "";
+            let sawResult = false;
             for await (const msg of session.stream()) {
               if (msg?.type === "assistant") {
                 if (typeof msg.content === "string") text += msg.content;
                 else if (Array.isArray(msg.content)) text += msg.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("");
               } else if (msg?.type === "result") {
+                sawResult = true;
+                if (msg.success === false) {
+                  const detail = String(msg.errorDetail ?? msg.error ?? msg.errorCode ?? "model request failed").slice(0, 200);
+                  throw new Error(`mind turn failed: ${detail}`);
+                }
                 if (typeof msg.result === "string") fromResult = msg.result;
                 break;
               }
             }
+            if (!sawResult) throw new Error("mind turn ended without a result");
             // some backends deliver the reply only on the result event
             if (!text.trim() && fromResult) text = fromResult;
           })();
@@ -4362,6 +4370,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         }
         const line = oneLine(text);
         if (!line) return null;
+        soulLastError = "";
         soulLastLineAt.set(soul.agentId, Date.now());
         soul.lineCount += 1;
         markDirty();
@@ -4804,7 +4813,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         flush();
         const line = await soulSay(sprite, `Your mind now runs on a different model (${value}). Say one line.`, { force: true });
         if (line) showSoulLine(sprite, "mood", line);
-        return `${sprite.name}'s model → ${value}${line ? `\n${sprite.name}: ${line}` : `\n⚠ set, but it didn't answer — that model may not be available here.`}`;
+        return `${sprite.name}'s model → ${value}${line ? `\n${sprite.name}: ${line}` : `\n⚠ set, but it didn't answer — check /sprite soul for the last error.`}`;
       }
       default:
         return "see /sprite soul for the keys.";
