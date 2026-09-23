@@ -20,20 +20,20 @@
     "url": "https://github.com/tanner-caffrey/sprite.git"
   },
   "files": [
-    "README.md",
+    "CHANGELOG.md",
     "MOD.md",
-    "mods",
+    "README.md",
     "breeding",
-    "smoke-test.mjs",
-    "persistence-test.mjs",
     "hardening-test.mjs",
+    "mods",
+    "persistence-test.mjs",
     "scripts",
-    "CHANGELOG.md"
+    "smoke-test.mjs"
   ],
   "letta": {
     "manifestVersion": 1,
     "mods": [
-      "mods/sprite.tsx"
+      "mods/sprite.bundled.mjs"
     ],
     "capabilities": [
       "commands",
@@ -50,6 +50,10 @@
   },
   "scripts": {
     "test": "bun smoke-test.mjs && bun persistence-test.mjs && bun hardening-test.mjs && node breeding/genetics.test.mjs",
-    "changelog": "node scripts/changelog.mjs"
+    "changelog": "node scripts/changelog.mjs",
+    "build": "node scripts/build.mjs"
+  },
+  "dependencies": {
+    "@letta-ai/letta-agent-sdk": "0.5.0"
   }
 }

@@ -874,4 +874,19 @@ check("changelog: update nudge appears once, /sprite changelog shows the gap, th
   assert.equal(readState().global.updateNoticeFrom, undefined);
 });
 
+// ---------------------------------------------------------------------------
+await check("bundle: mods/sprite.bundled.mjs is fresh and activates like the source", async () => {
+  const { statSync } = await import("node:fs");
+  const src = statSync(join(import.meta.dirname, "mods", "sprite.tsx")).mtimeMs;
+  const bundled = statSync(join(import.meta.dirname, "mods", "sprite.bundled.mjs")).mtimeMs;
+  assert.ok(bundled >= src, "bundle is older than source — run `bun run build`");
+  const { default: activateBundled } = await import("./mods/sprite.bundled.mjs");
+  const agent = { id: "agent-bundle", name: "Bundle" };
+  seedAlive(agent.id);
+  const h = makeLetta(agent, null); const d = activateBundled(h.letta);
+  h.fire("conversation_open", { agentId: agent.id });
+  assert.match(h.command("help"), /\/sprite changelog/);
+  d();
+});
+
 console.log(`\nSprite hardening test passed (${passed} checks).`);
