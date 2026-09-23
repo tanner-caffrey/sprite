@@ -3,6 +3,15 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.8.8
+- `/sprite soul persona` rewrites an ensouled companion's persona — from the
+  template, written by your agent, or by you — then `/sprite ensoul apply`
+  writes it into its memory. Its voice, diary, and bond are untouched.
+- When your agent writes a persona, the prompt now tells you exactly what to
+  run next (`/sprite ensoul persona-done`).
+- `/sprite soul` shows a rough token cost per line and so far, with a nudge
+  if the model is a big one for a pet.
+
 ## v0.8.5
 - An ensouled companion speaks live for everything — idle mutters, commits,
   errors, compaction naps, not just pets and greetings. The built-in lines

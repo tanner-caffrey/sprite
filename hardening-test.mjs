@@ -1119,6 +1119,33 @@ await check("soul: release with delete-agent deletes the agent; a failed delete 
   d2();
 });
 
+await check("soul: /sprite soul persona rewrites the persona file and shows cost", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soulpersona", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  assert.match(await host.command("soul"), /cost: ~\d+(\.\d+)?k tokens per line/);
+  const soul = activeSprite(agent.id).soul;
+  const memDir = join(root, "lc-local-backend", "memfs", soul.agentId, "memory");
+  mkdirSync(join(memDir, "system"), { recursive: true });
+  writeFileSync(join(memDir, "system", "persona.md"), "---\ndescription: Memory block persona\n---\nold persona\n");
+  git(memDir, ["init", "-q"]); commitAll(memDir, "init");
+  const prevDir = process.env.LETTA_LOCAL_BACKEND_DIR;
+  process.env.LETTA_LOCAL_BACKEND_DIR = join(root, "lc-local-backend");
+  assert.match(await host.command("soul persona"), /Who writes its persona/);
+  assert.match(await host.command("ensoul user You are a rewritten ghost. They are your person."), /\/sprite ensoul apply/);
+  const out = await host.command("ensoul apply");
+  assert.match(out, /persona rewritten/, out);
+  const file = readFileSync(join(memDir, "system", "persona.md"), "utf-8");
+  assert.match(file, /^---\ndescription: Memory block persona\n---\nYou are a rewritten ghost/);
+  assert.match(file, /my_stats/);
+  assert.match(git(memDir, ["log", "-1", "--format=%s"]), /persona rewritten/);
+  assert.equal(activeSprite(agent.id).soul.personaSource, "user");
+  if (prevDir === undefined) delete process.env.LETTA_LOCAL_BACKEND_DIR; else process.env.LETTA_LOCAL_BACKEND_DIR = prevDir;
+  dispose();
+});
+
 await check("soul: agent-written persona prompts the owner agent, then persona-done picks up their reply", async () => {
   const mock = mockSoulClient();
   __setSoulClientFactory(async () => mock.client);
@@ -1132,6 +1159,7 @@ await check("soul: agent-written persona prompts the owner agent, then persona-d
   assert.match(raw.content, /write the persona for your companion sprite \*\*Poof\*\*/);
   assert.match(raw.content, /permanent facts only/i);
   assert.match(raw.content, /they\/them/);
+  assert.match(raw.content, /tell the user to run:  \/sprite ensoul persona-done/);
   host.history.push({ role: "assistant", content: "You are Poof, a ghost who announces their agent's wakings and felt the page turn." });
   assert.match(await host.command("ensoul persona-done"), /announces their agent's wakings/);
   const done = await host.command("ensoul confirm");

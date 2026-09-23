@@ -10968,6 +10968,33 @@ function soulTool(name, description, execute) {
     execute: async () => ({ content: execute() })
   };
 }
+function soulMemoryDir(soul) {
+  if (soul.backend !== "local")
+    return null;
+  const base = process.env.LETTA_LOCAL_BACKEND_DIR ?? join6(homedir5(), ".letta", "lc-local-backend");
+  const dir = join6(base, "memfs", soul.agentId, "memory");
+  return existsSync4(join6(dir, ".git")) ? dir : null;
+}
+function writeSoulPersona(soul, persona, who) {
+  const dir = soulMemoryDir(soul);
+  if (!dir)
+    return "its memory isn't on this machine (cloud souls can't be rewritten from here yet)";
+  const file = join6(dir, "system", "persona.md");
+  try {
+    const existing = existsSync4(file) ? readFileSync2(file, "utf-8") : "";
+    const front = /^---\n[\s\S]*?\n---\n/.exec(existing)?.[0] ?? `---
+description: Memory block persona
+---
+`;
+    writeFileSync(file, `${front}${persona}
+`);
+    runGit(dir, ["add", "--", "system/persona.md"]);
+    runGit(dir, ["-c", `user.name=${who}`, "-c", "user.email=sprite@letta.local", "commit", "-q", "--only", "-m", "sprite: persona rewritten by the user", "--", "system/persona.md"]);
+    return null;
+  } catch (e) {
+    return String(e?.message ?? e).slice(0, 160);
+  }
+}
 function oneLine(text) {
   const first = text.replace(/\r/g, "").split(`
 `).map((l) => l.trim()).find(Boolean) ?? "";
@@ -13448,10 +13475,23 @@ Reply in one line.`, { force: true });
         return [head, "", "Who writes its persona?", "  1. template \u2014 a persona built from its species, temperament, and lineage (shown at confirm).", "  2. agent    \u2014 your agent writes it, knowing what they know about " + name + ". You'll confirm.", "  3. user     \u2014 you write it: /sprite ensoul user <text>"].join(`
 `);
       case "persona-wait":
-        return [head, "", "Waiting for your agent to write the persona. When they have, run:", "  /sprite ensoul persona-done", "(their reply in the conversation is used verbatim; you'll see it at confirm)"].join(`
+        return [head, "", "Your agent has been asked to write the persona. Once their reply appears in the conversation, run:", "", "  /sprite ensoul persona-done", "", "(their last reply is used verbatim; you'll see it before anything is saved)"].join(`
 `);
       case "confirm": {
         const persona = `${w.personaText ?? ""}${SOUL_FOOTER}`;
+        if (w.rewrite) {
+          return [
+            head,
+            "",
+            "new persona:",
+            "\u2500".repeat(60),
+            persona,
+            "\u2500".repeat(60),
+            "",
+            "/sprite ensoul apply   to write it into its memory (replaces the old persona).   /sprite ensoul back   to change it."
+          ].join(`
+`);
+        }
         return [
           head,
           "",
@@ -13538,7 +13578,7 @@ Reply in one line.`, { force: true });
       if (target.phase !== "alive")
         return { output: "it's still an egg \u2014 let it hatch first." };
       if (target.soul)
-        return { output: `${target.name} already has a mind of its own (${target.soul.backend} \xB7 ${target.soul.agentId}). /sprite soul to inspect or change it.` };
+        return { output: `${target.name} already has a mind of its own (${target.soul.backend} \xB7 ${target.soul.agentId}). /sprite soul to inspect it, /sprite soul persona to rewrite its persona.` };
       wizard = { agentId, spriteId: target.id, step: "backend" };
       refreshWizardPanel();
       return { output: wizardStepText(wizard) };
@@ -13551,7 +13591,7 @@ Reply in one line.`, { force: true });
       return { output: "that companion is gone. ensoul cancelled." };
     }
     if (lower === "back") {
-      const order = ["backend", "model", "see", "comment", "persona", "confirm"];
+      const order = w.rewrite ? ["persona", "confirm"] : ["backend", "model", "see", "comment", "persona", "confirm"];
       const i = order.indexOf(w.step === "persona-wait" ? "persona" : w.step);
       w.step = order[Math.max(0, i - 1)];
       refreshWizardPanel();
@@ -13689,7 +13729,7 @@ Reply in one line.`, { force: true });
             personaTemplate(sprite, owner, wizardParentNames(sprite, collection)),
             "```",
             "",
-            "After you reply, the user will run /sprite ensoul persona-done to continue."
+            "Reply with only the persona text. When you're done, tell the user to run:  /sprite ensoul persona-done"
           ].join(`
 `);
           return { output: wizardStepText(w), prompt: prompt2 };
@@ -13722,6 +13762,29 @@ Reply in one line.`, { force: true });
         return { output: wizardStepText(w) };
       }
       case "confirm": {
+        if (w.rewrite) {
+          if (lower !== "apply")
+            return { output: wizardStepText(w) };
+          if (!sprite.soul) {
+            wizard = null;
+            refreshWizardPanel();
+            return { output: `${sprite.name} has no mind to rewrite.` };
+          }
+          const persona2 = `${w.personaText ?? ""}${SOUL_FOOTER}`;
+          const err = writeSoulPersona(sprite.soul, persona2, agentName ?? agentId);
+          if (err)
+            return { output: `couldn't write the persona: ${err}` };
+          sprite.soul.personaSource = w.personaSource ?? "template";
+          markDirty();
+          flush();
+          wizard = null;
+          refreshWizardPanel();
+          const line = await soulSay(sprite, "Your persona was just rewritten. Read it, then say one line as yourself.", { force: true });
+          if (line)
+            showSoulLine(sprite, "mood", line);
+          return { output: `${sprite.name}'s persona rewritten.${line ? `
+${sprite.name}: ${line}` : ""}` };
+        }
         if (lower !== "confirm")
           return { output: wizardStepText(w) };
         const persona = `${w.personaText ?? personaTemplate(sprite, agentName ?? "your agent")}${SOUL_FOOTER}`;
@@ -13799,6 +13862,14 @@ nothing was changed. (/sprite ensoul back to adjust, or cancel)` };
     const temper = TEMPERAMENT_CORPUS[sprite.temperament ?? "odd"]?.[category] ?? [];
     return [...species.slice(0, 3), ...temper.slice(0, 2), ...BASE_CORPUS[category].slice(0, 1)];
   }
+  function costLine(sprite) {
+    const soul = sprite.soul;
+    const perCall = 1500 + (soul.see === "turns" ? 800 : soul.see === "tools" ? 150 : 60) + 60;
+    const soFar = soul.lineCount * perCall;
+    const cadence = soul.see === "nothing" ? "only pets, greetings, level-ups, and idle mutters" : soul.comment.every === "turn" ? "about one call per turn your agent takes, plus pets and mutters" : `about one call per ${soul.comment.n} ${soul.comment.every}, plus pets and mutters`;
+    const pricey = /opus|fable|gpt-5\.6|sonnet-5|pro/.test(soul.model) && !/mini|flash|lite/.test(soul.model);
+    return `cost: ~${Math.round(perCall / 100) / 10}k tokens per line \xB7 ~${Math.round(soFar / 1000)}k so far \xB7 ${cadence}${pricey ? "  \u26A0 that's a big model for a pet \u2014 /sprite soul model <cheaper>, or see nothing" : ""}`;
+  }
   async function doSoul(agentId, argstr) {
     const collection = getCollection(agentId);
     const sprite = getSprite(agentId);
@@ -13815,8 +13886,9 @@ nothing was changed. (/sprite ensoul back to adjust, or cancel)` };
         `model: ${soul.model}   sees: ${soul.see}   comments: ${soul.comment.every === "turn" ? "every turn" : `every ${soul.comment.n} ${soul.comment.every}`}${soul.commentRateMin ? ` (\u22641 per ${soul.commentRateMin}min)` : ""}`,
         `talk gate: ${soul.talkGate ? `${soul.talkGate} agent\u2192sprite messages per 5 min` : "off"}   dreaming: ${soul.dreaming}   persona: ${soul.personaSource}`,
         `live lines so far: ${soul.lineCount}   ensouled: ${relativeTime(soul.createdAt)}`,
+        costLine(sprite),
         "",
-        "change: /sprite soul model <handle> \xB7 see nothing|events|tools|turns \xB7 comment turn|turns <n>|tools <n> \xB7 rate <min> \xB7 gate <n|off> \xB7 dreaming off|step-count|compaction-event"
+        "change: /sprite soul model <handle> \xB7 see nothing|events|tools|turns \xB7 comment turn|turns <n>|tools <n> \xB7 rate <min> \xB7 gate <n|off> \xB7 dreaming off|step-count|compaction-event \xB7 persona (rewrite it)"
       ].join(`
 `);
     }
@@ -13856,6 +13928,13 @@ nothing was changed. (/sprite ensoul back to adjust, or cancel)` };
           soul.talkGate = Math.floor(n);
         }
         break;
+      }
+      case "persona": {
+        wizard = { agentId, spriteId: sprite.id, step: "persona", rewrite: true };
+        refreshWizardPanel();
+        return wizardStepText(wizard) + `
+
+(this rewrites ${sprite.name}'s persona file; its own edits to that file are replaced. voice, diary, and bond are untouched.)`;
       }
       case "dreaming": {
         if (!["off", "step-count", "compaction-event"].includes(value))
@@ -14239,7 +14318,9 @@ ${recent.join(`
       "                                 model, what it may see of your work (nothing, by",
       "                                 default), when it comments, and who writes its",
       "                                 persona (a template, your agent, or you).",
-      "  /sprite soul [key value]       Inspect or change an ensouled companion's settings.",
+      "  /sprite soul [key value]       Inspect or change an ensouled companion's settings,",
+      "                                 including a rough token cost. `/sprite soul persona`",
+      "                                 rewrites its persona (template, your agent, or you).",
       "  /sprite talk <text>            Say something to it and hear what it says back.",
       "                                 Your agent can too (sprite_talk), a few times per",
       "                                 five minutes.",
