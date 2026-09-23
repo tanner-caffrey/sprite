@@ -41,6 +41,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // species roster
@@ -967,6 +968,72 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   hue: "on", // colour the bars by lap age (panel + card)
   bars: "off", // also show a compact stat strip on the panel row
 };
+
+// ---------------------------------------------------------------------------
+// version + changelog (CHANGELOG.md ships in the package beside mods/)
+// ---------------------------------------------------------------------------
+
+const MOD_DIR = (() => {
+  try {
+    return dirname(fileURLToPath(import.meta.url));
+  } catch {
+    return null;
+  }
+})();
+
+function readPackageVersion(): string {
+  try {
+    if (!MOD_DIR) return "0.0.0";
+    return String(JSON.parse(readFileSync(join(MOD_DIR, "..", "package.json"), "utf-8")).version ?? "0.0.0");
+  } catch {
+    return "0.0.0";
+  }
+}
+const MOD_VERSION = readPackageVersion();
+
+function semverCompare(a: string, b: string): number {
+  const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i += 1) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+  return 0;
+}
+
+interface ChangelogSection {
+  version: string;
+  title: string;
+  body: string[];
+}
+
+function readChangelog(): ChangelogSection[] {
+  try {
+    if (!MOD_DIR) return [];
+    const text = readFileSync(join(MOD_DIR, "..", "CHANGELOG.md"), "utf-8");
+    const sections: ChangelogSection[] = [];
+    let current: ChangelogSection | null = null;
+    for (const raw of text.split(/\r?\n/)) {
+      const m = /^## v?(\d+\.\d+\.\d+)\s*(?:[—–-]\s*(.*))?$/.exec(raw);
+      if (m) {
+        current = { version: m[1], title: m[2]?.trim() ?? "", body: [] };
+        sections.push(current);
+      } else if (current && raw.trim()) {
+        current.body.push(raw.replace(/\s+$/, ""));
+      }
+    }
+    return sections;
+  } catch {
+    return [];
+  }
+}
+
+function formatChangelog(sections: ChangelogSection[], heading: string): string {
+  if (sections.length === 0) return `${heading}\n(no changelog entries found)`;
+  const out = [heading, ""];
+  for (const sec of sections) {
+    out.push(`## v${sec.version}${sec.title ? ` — ${sec.title}` : ""}`);
+    out.push(...sec.body, "");
+  }
+  return out.join("\n").trimEnd();
+}
 
 const STATE_PATH =
   process.env.SPRITE_STATE_PATH ?? join(homedir(), ".letta", "mods", "sprite.state.json");
@@ -2477,6 +2544,16 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return replaced ?? false;
   };
 
+  // Update nudge: remember the last version that ran; if it moved, say so once
+  // (on the panel via the active sprite's diary, and in the card).
+  const seenVersion = typeof state.global.lastSeenVersion === "string" ? state.global.lastSeenVersion : null;
+  const updatedFrom = seenVersion && semverCompare(MOD_VERSION, seenVersion) > 0 ? seenVersion : null;
+  if (seenVersion !== MOD_VERSION) {
+    state.global.lastSeenVersion = MOD_VERSION;
+    if (updatedFrom) state.global.updateNoticeFrom = updatedFrom;
+    dirty = true;
+  }
+
   if (dirty) flush();
 
   // -- live (non-persisted) presentation state --
@@ -2664,6 +2741,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
 
   function noteActivity(sprite?: SpriteState | null) {
     lastActivityAt = Date.now();
+    if (sprite && sprite.phase === "alive") maybeAnnounceUpdate(sprite);
     if (dozing) {
       dozing = false;
       if (sprite && sprite.phase === "alive") {
@@ -2765,6 +2843,14 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   }
 
   const DIARY_MAX = 40;
+
+  let updateAnnounced = false;
+  function maybeAnnounceUpdate(sprite: SpriteState) {
+    if (updateAnnounced || typeof state.global.updateNoticeFrom !== "string") return;
+    updateAnnounced = true;
+    logEntry(sprite, "mood", `(learned new tricks: v${state.global.updateNoticeFrom} → v${MOD_VERSION} — /sprite changelog)`);
+    markDirty();
+  }
 
   function logEntry(sprite: SpriteState, category: string, line: string) {
     sprite.log = [...(sprite.log ?? []), { at: Date.now(), category: category as VoiceCategory | "mood", line }].slice(
@@ -3416,6 +3502,24 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return `lineage: gen ${sprite.generation ?? 1}, child of ${names[0]} and ${names[1]}${kind}`;
   }
 
+  function doChangelog(argstr: string): string {
+    const all = argstr.trim().toLowerCase() === "all";
+    const sections = readChangelog();
+    if (all) return formatChangelog(sections, `sprite v${MOD_VERSION} — full changelog`);
+    const since = typeof state.global.updateNoticeFrom === "string" ? state.global.updateNoticeFrom : null;
+    if (!since) {
+      const latest = sections.find((sec) => sec.version === MOD_VERSION) ?? sections[0];
+      return formatChangelog(latest ? [latest] : [], `sprite v${MOD_VERSION} — you're up to date. latest release:`) +
+        "\n\n(/sprite changelog all for the whole history)";
+    }
+    const fresh = sections.filter((sec) => semverCompare(sec.version, since) > 0 && semverCompare(sec.version, MOD_VERSION) <= 0);
+    delete state.global.updateNoticeFrom; // read once → nudge goes away
+    markDirty();
+    flush();
+    panel.update();
+    return formatChangelog(fresh, `sprite updated: v${since} → v${MOD_VERSION}`) + "\n\n(/sprite changelog all for the whole history)";
+  }
+
   function requireSprite(agentId: string | null): SpriteState | { error: string } {
     const sprite = getSprite(agentId);
     if (!sprite) return { error: "no companion yet — /sprite hatch to begin." };
@@ -3552,6 +3656,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       sprite.named ? "" : `(name it: /sprite name <name>)`,
       Object.keys(getCollection(agentId)?.sprites ?? {}).length > 1
         ? `companions: ${Object.keys(getCollection(agentId)!.sprites).length} (/sprite list · /sprite switch <name>)`
+        : "",
+      typeof state.global.updateNoticeFrom === "string"
+        ? `✨ ${sprite.name} learned new tricks (v${state.global.updateNoticeFrom} → v${MOD_VERSION}) — /sprite changelog`
         : "",
     ].filter(Boolean);
     return lines.join("\n");
@@ -3746,6 +3853,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       "  /sprite backup restore force   Replace the current companion with the backup.",
       "                                 Deliberate and irreversible.",
       "",
+      "  /sprite changelog [all]        What changed since the version you last ran",
+      "                                 (or the whole history with `all`).",
       "  /sprite help                   Show this message.",
       "",
       "Your agent can also care for its companion directly with these tools:",
@@ -3819,6 +3928,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
               break;
             case "backup":
               output = doBackup(agentId, restStr);
+              break;
+            case "changelog":
+            case "whatsnew":
+            case "version":
+              output = doChangelog(restStr);
               break;
             case "help":
             case "-h":

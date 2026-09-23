@@ -76,6 +76,7 @@ companion from Signal, Telegram, Discord, or CLI turns.
 | `/sprite backup push safe\|never` | Configure direct MemFS Git sync |
 | `/sprite backup restore [force]` | Restore a portable soul-backup |
 | `/sprite help` | Explain every subcommand |
+| `/sprite changelog [all]` | What changed since the version you last ran (or everything) |
 
 Settings keys: `voice on|off`, `voiceRateMin <minutes>`, `visible on|off`, `laps count|odometer|belt|pips`, `hue on|off`, `bars on|off`.
 

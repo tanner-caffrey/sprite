@@ -149,6 +149,7 @@ check on or pet its sprite just like a CLI conversation can.
 | `/sprite backup push safe\|never` | Configure conservative Git sync |
 | `/sprite backup restore [force]` | Restore from agent MemFS (`force` replaces local state) |
 | `/sprite help` | Explain every subcommand |
+| `/sprite changelog [all]` | What changed since the version you last ran (or everything) |
 
 Settings keys: `voice on|off` · `voiceRateMin <minutes>` · `visible on|off` · `laps count|odometer|belt|pips` · `hue on|off` · `bars on|off`
 

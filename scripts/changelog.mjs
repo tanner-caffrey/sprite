@@ -4,6 +4,7 @@
 //   bun run changelog              since the newest v* tag (or the whole history if none)
 //   bun run changelog v0.2.0       since a given tag/commit
 //   bun run changelog --release    also print a suggested `git tag` for package.json's version
+//   bun run changelog --draft      print a CHANGELOG.md stub for package.json's version
 //
 // Commits are grouped by the version they were shipped under (read from
 // package.json at each commit), newest first. Each group shows the commit
@@ -81,6 +82,13 @@ for (const g of groups) {
     }
   }
   console.log();
+}
+
+if (args.includes("--draft")) {
+  const mine = groups.find((g) => g.version === current);
+  console.log(`\n## v${current} — <title>`);
+  for (const cm of mine?.commits ?? []) console.log(`- ${cm.subject.replace(/^sprite v[\d.]+: /, "")}`);
+  console.log("\n(paste into CHANGELOG.md above the previous release, then rewrite for humans)");
 }
 
 if (release) {

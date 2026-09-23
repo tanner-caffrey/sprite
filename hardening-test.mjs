@@ -847,4 +847,22 @@ check("breed: gates are transactional across windows; tool keeps its a/b boundar
   assert.equal(eggs.length, 1);
 });
 
+// ---------------------------------------------------------------------------
+check("changelog: update nudge appears once, /sprite changelog shows the gap, then clears it", () => {
+  const agent = { id: "agent-changelog", name: "CL" };
+  seedAlive(agent.id);
+  const st = JSON.parse(readFileSync(statePath, "utf-8")); st.global.lastSeenVersion = "0.5.1"; writeFileSync(statePath, JSON.stringify(st));
+  const h = makeLetta(agent, null); const d = activate(h.letta); h.fire("conversation_open", { agentId: agent.id });
+  assert.match(h.command(""), /learned new tricks \(v0\.5\.1 → v\d+\.\d+\.\d+\)/);
+  const out = h.command("changelog");
+  assert.match(out, /^sprite updated: v0\.5\.1 → /);
+  assert.match(out, /## v0\.6\.0 — breeding/);
+  assert.doesNotMatch(out, /## v0\.5\.1/);
+  assert.doesNotMatch(h.command(""), /learned new tricks/);
+  assert.match(h.command("changelog"), /up to date/);
+  assert.match(h.command("changelog all"), /## v0\.2\.0/);
+  d();
+  assert.equal(readState().global.updateNoticeFrom, undefined);
+});
+
 console.log(`\nSprite hardening test passed (${passed} checks).`);
