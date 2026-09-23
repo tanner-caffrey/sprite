@@ -250,7 +250,7 @@ Give a companion a mind of its own: its own Letta agent, with memory it keeps an
 
 This hands your agent a walkthrough. It asks you, one question at a time: where the mind lives (local or cloud), which model (from the real catalog; the free letta/auto-fast is the default), what it may see of your work, when it comments, and who writes its persona (a template, your agent, or you). It shows a summary and creates the agent only after you confirm — and the creation itself asks for your approval.
 
-The local model catalog lists handles, not proof that their provider is connected. For a local `chatgpt-plus-pro/` model, connect the ChatGPT plan to the local backend first with `letta --backend local connect chatgpt` (device-code login is also supported). If a mind does not answer, `/sprite soul` shows the last turn error; changing its model does not connect the provider automatically.
+The local model catalog lists handles, not proof that their provider is connected. For a local chatgpt-plus-pro/ model, connect the ChatGPT plan first with letta connect chatgpt (device-code login is also supported). If a mind does not answer, /sprite soul shows the last turn error; changing its model does not connect the provider automatically.
 
 Once ensouled, every line on the panel is live: greetings, pets, idle mutters, commits, errors. Built-in lines only appear in (parentheses) when the mind doesn't answer.
 
