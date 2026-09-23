@@ -1375,11 +1375,34 @@ interface SoulClient {
 // CLI login is used, and no LETTA_API_KEY has to be set anywhere. The SDK's
 // native `backend: "cloud"` client only reads LETTA_API_KEY, which is why we
 // don't use it.
+// The CLI keeps the Letta Cloud login in the OS keyring, and on Linux it only
+// opens the keyring when DBUS_SESSION_BUS_ADDRESS is set. A TUI launched from
+// a service or a bare shell often lacks it, and the spawned app-server
+// inherits that — so `createAgent` on cloud fails with "Missing
+// LETTA_API_KEY" while a logged-in user watches. Find the session bus.
+function ensureSessionBus(): void {
+  if (process.platform !== "linux" || process.env.DBUS_SESSION_BUS_ADDRESS?.trim()) return;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const candidates = [
+    process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, "bus") : null,
+    uid !== null ? `/run/user/${uid}/bus` : null,
+  ].filter((p): p is string => Boolean(p));
+  for (const bus of candidates) {
+    if (existsSync(bus)) {
+      process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${bus}`;
+      soulSetBus = true;
+      return;
+    }
+  }
+}
+let soulSetBus = false;
+
 let soulClientFactory: (backend: SoulBackend) => Promise<SoulClient> = async (backend) => {
   if (!process.env.LETTA_CLI_PATH) {
     const bin = process.env.LETTA_CODE_BIN;
     if (bin && existsSync(bin)) { process.env.LETTA_CLI_PATH = bin; soulSetCliPath = true; }
   }
+  if (backend === "cloud") ensureSessionBus();
   const mod: any = await import("@letta-ai/letta-agent-sdk");
   return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: backend === "cloud" ? "api" : "local" } }) as SoulClient;
 };
@@ -1399,6 +1422,7 @@ async function closeSoulClients() {
   }
   soulClients.clear();
   if (soulSetCliPath) { delete process.env.LETTA_CLI_PATH; soulSetCliPath = false; }
+  if (soulSetBus) { delete process.env.DBUS_SESSION_BUS_ADDRESS; soulSetBus = false; }
 }
 function soulClient(backend: SoulBackend): Promise<SoulClient> {
   let c = soulClients.get(backend);
@@ -1423,6 +1447,13 @@ function soulTool(name: string, description: string, execute: () => string) {
 // it must carry the `sprite:<soulId>` tag we wrote at creation. A restored
 // backup can point `soul.agentId` anywhere; without this, "delete-agent"
 // or a persona write could hit an arbitrary agent — including the owner.
+// Ownership marker written into the agent's description at creation. Tags
+// are checked too, but some backends don't return tags on retrieve (cloud via
+// the harness), so the description carries the same proof.
+function soulMarker(spriteId: string, ownerAgentId: string): string {
+  return `[sprite:${spriteId} owner:${ownerAgentId}]`;
+}
+
 async function verifySoulOwnership(client: SoulClient, sprite: SpriteState, ownerAgentId: string): Promise<string | null> {
   const soul = sprite.soul;
   if (!soul) return "no soul";
@@ -1430,9 +1461,12 @@ async function verifySoulOwnership(client: SoulClient, sprite: SpriteState, owne
   try {
     const a: any = await client.agents.retrieve(soul.agentId);
     const tags: string[] = Array.isArray(a?.tags) ? a.tags : [];
-    if (!tags.includes(`sprite:${sprite.id}`)) return `agent ${soul.agentId} is not tagged as ${sprite.name}'s soul — refusing`;
-    if (!tags.includes(`sprite-owner:${ownerAgentId}`)) return `agent ${soul.agentId} belongs to a different owner — refusing`;
-    return null;
+    const desc = typeof a?.description === "string" ? a.description : "";
+    const byTags = tags.includes(`sprite:${sprite.id}`) && tags.includes(`sprite-owner:${ownerAgentId}`);
+    const byMarker = desc.includes(soulMarker(sprite.id, ownerAgentId));
+    if (byTags || byMarker) return null;
+    if (tags.includes(`sprite:${sprite.id}`) || desc.includes(`[sprite:${sprite.id} `)) return `agent ${soul.agentId} belongs to a different owner — refusing`;
+    return `agent ${soul.agentId} is not marked as ${sprite.name}'s soul — refusing`;
   } catch (e: any) {
     return `couldn't verify its agent: ${String(e?.message ?? e).slice(0, 120)}`;
   }
@@ -4133,6 +4167,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   // (allowedTools + toolset none + canUseTool deny) is what keeps the sprite out
   // of the filesystem, the sandbox is a second layer. Remembered per process.
   let confinementUnavailable = false;
+  let soulLastError = "";
   function soulSessionOptions(sprite: SpriteState, confined = true): Record<string, unknown> {
     const soul = sprite.soul!;
     return {
@@ -4237,10 +4272,18 @@ function activateInner(letta: any, disposers: Array<() => void>) {
             timer.unref?.();
           });
           const collect = (async () => {
+            let fromResult = "";
             for await (const msg of session.stream()) {
-              if (msg?.type === "assistant" && typeof msg.content === "string") text += msg.content;
-              else if (msg?.type === "result") break;
+              if (msg?.type === "assistant") {
+                if (typeof msg.content === "string") text += msg.content;
+                else if (Array.isArray(msg.content)) text += msg.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("");
+              } else if (msg?.type === "result") {
+                if (typeof msg.result === "string") fromResult = msg.result;
+                break;
+              }
             }
+            // some backends deliver the reply only on the result event
+            if (!text.trim() && fromResult) text = fromResult;
           })();
           await Promise.race([collect, timeout]);
         } finally {
@@ -4253,7 +4296,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         soul.lineCount += 1;
         markDirty();
         return line;
-      } catch {
+      } catch (e: any) {
+        if (process.env.SPRITE_DEBUG) console.error("[sprite soul]", String(e?.message ?? e).slice(0, 300));
+        soulLastError = String(e?.message ?? e).slice(0, 200);
         return null;
       }
     };
@@ -4520,7 +4565,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       const client = await soulClient(backend);
       const soulAgentId = await client.createAgent({
         name: `${sprite.name} (sprite of ${ownerName})`,
-        description: `Companion sprite ${sprite.name} — a ${sprite.species} belonging to agent ${agentId}. Created by the sprite mod.`,
+        description: `Companion sprite ${sprite.name} — a ${sprite.species} belonging to agent ${agentId}. Created by the sprite mod. ${soulMarker(sprite.id, agentId)}`,
         hidden: true,
         tags: ["sprite", `sprite:${sprite.id}`, `sprite-owner:${agentId}`],
         model,
@@ -4543,7 +4588,13 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       flush();
       queueCheckpoint(agentId, "ensouled");
       setPose("happy", 6_000);
-      const first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
+      // A freshly created agent (cloud especially) can take a moment to be
+      // ready for its first turn; try a few times before calling it silent.
+      let first: string | null = null;
+      for (let attempt = 0; attempt < 3 && !first; attempt += 1) {
+        if (attempt) await new Promise((r) => setTimeout(r, 1500 * attempt));
+        first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
+      }
       if (first) showSoulLine(sprite, "greeting", first);
       const verdict = first
         ? `\n${sprite.name}: ${first}`
@@ -4551,7 +4602,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       return `${sprite.name} has a mind of its own now. (${backend} · ${soulAgentId} · ${model} · sees ${see})${verdict}\n\ntalk to it: /sprite talk <text> · inspect: /sprite soul`;
     } catch (error: any) {
       unreserve();
-      return `couldn't create ${sprite.name}'s mind: ${String(error?.message ?? error).slice(0, 200)}\nnothing was changed.`;
+      const msg = String(error?.message ?? error).slice(0, 200);
+      const hint = /Missing LETTA_API_KEY/.test(msg) && backend === "cloud"
+        ? "\nThis Letta Code can't reach the login keyring from here (no session bus). Start Letta Code from a desktop session, or set LETTA_API_KEY in its environment."
+        : "";
+      return `couldn't create ${sprite.name}'s mind: ${msg}${hint}\nnothing was changed.`;
     }
   }
 
@@ -4630,6 +4685,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         `talk gate: ${soul.talkGate ? `${soul.talkGate} agent→sprite messages per 5 min` : "off"}   dreaming: ${soul.dreaming}   persona: ${soul.personaSource}`,
         `live lines so far: ${soul.lineCount}   ensouled: ${relativeTime(soul.createdAt)}`,
         costLine(sprite),
+        soulLastError ? `last error: ${soulLastError}` : "",
         "", "change: /sprite soul model <handle> · see nothing|events|tools|turns · comment turn|turns <n>|tools <n> · rate <min> · gate <n|off> · dreaming off|step-count|compaction-event · persona (rewrite it)",
       ].join("\n");
     }

@@ -929,6 +929,7 @@ function mockSoulClient(opts = {}) {
           async send(text) { calls.push(["prompt", agentId, text, sessionOpts]); if (!agents.has(agentId)) throw new Error("no such agent"); session._msg = text; },
           async *stream() {
             if (opts.hang?.(session._msg)) { await new Promise((r) => { session._resolveHang = r; }); if (session.aborted) return; }
+            if (opts.resultOnly) { yield { type: "result", success: true, result: reply(session._msg) }; return; }
             yield { type: "assistant", content: reply(session._msg) };
             yield { type: "result", success: true };
           },
@@ -1206,7 +1207,7 @@ await check("soul: a forged soul pointer can't delete or rewrite an unrelated ag
   assert.equal(String(h3.tools.get("sprite_list").run({ agent, args: {} })).includes("Second"), true);
   const inMem = String(await h3.command("soul")); // window's own view
   const rel = await h3.command(`release confirm:${id} delete-agent`);
-  assert.match(rel, /not tagged as Second's soul/, `view=${inMem.split("\n")[0]} retrieves=${JSON.stringify(mock.calls.filter((c) => c[0] === "delete"))} out=${rel}`);
+  assert.match(rel, /not marked as Second's soul/, `view=${inMem.split("\n")[0]} retrieves=${JSON.stringify(mock.calls.filter((c) => c[0] === "delete"))} out=${rel}`);
   assert.ok(mock.agents.has(victim), "victim was deleted");
   assert.ok(readState().collections[agent.id].sprites[id], "sprite released despite refusal");
   d3();
@@ -1266,7 +1267,7 @@ await check("soul: a `see` downgrade applies to payloads already queued; voice o
 });
 
 await check("soul: timeout aborts the session; replies are sanitized; agent-facing result is framed as data", async () => {
-  const mock = mockSoulClient({ reply: (m) => m.includes("says to you") ? undefined : "ok" });
+  const mock = mockSoulClient({ reply: (m) => m.includes("says to you") ? undefined : "ok", resultOnly: true });
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-sanitize", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);

@@ -3,6 +3,21 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.9.6
+- Cloud minds from a Letta Code that was started without a desktop session
+  (no D-Bus) now find the login keyring themselves. If they still can't, the
+  error says exactly what to do.
+
+## v0.9.6 — cloud minds, for real
+- Choosing `cloud` now works from any Letta Code that's logged in — even one
+  started without a desktop session. The companion's mind is a real Letta
+  Cloud agent, created through your own login; nothing to configure.
+- Ownership of a cloud mind is proven by a marker in the agent's description
+  (cloud doesn't return tags), so talk, pet, and every other operation work
+  there too.
+- A first line that arrives on the result event (as cloud does) is heard.
+- `/sprite soul` shows the last error its mind hit, if any.
+
 ## v0.9.5
 - On machines where the kernel memory sandbox isn't available, an ensouled
   companion still speaks: its session keeps the tool fence (only its own

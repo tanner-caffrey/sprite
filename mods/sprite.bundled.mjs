@@ -11234,6 +11234,23 @@ function quoteObs(text) {
 }
 var SOUL_LINE_MAX = 80;
 var DEFAULT_SOUL_MODEL = "letta/auto-fast";
+function ensureSessionBus() {
+  if (process.platform !== "linux" || process.env.DBUS_SESSION_BUS_ADDRESS?.trim())
+    return;
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const candidates = [
+    process.env.XDG_RUNTIME_DIR ? join6(process.env.XDG_RUNTIME_DIR, "bus") : null,
+    uid !== null ? `/run/user/${uid}/bus` : null
+  ].filter((p) => Boolean(p));
+  for (const bus of candidates) {
+    if (existsSync4(bus)) {
+      process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${bus}`;
+      soulSetBus = true;
+      return;
+    }
+  }
+}
+var soulSetBus = false;
 var soulClientFactory = async (backend) => {
   if (!process.env.LETTA_CLI_PATH) {
     const bin = process.env.LETTA_CODE_BIN;
@@ -11242,6 +11259,8 @@ var soulClientFactory = async (backend) => {
       soulSetCliPath = true;
     }
   }
+  if (backend === "cloud")
+    ensureSessionBus();
   const mod = await Promise.resolve().then(() => (init_dist(), exports_dist));
   return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: backend === "cloud" ? "api" : "local" } });
 };
@@ -11264,6 +11283,10 @@ async function closeSoulClients() {
     delete process.env.LETTA_CLI_PATH;
     soulSetCliPath = false;
   }
+  if (soulSetBus) {
+    delete process.env.DBUS_SESSION_BUS_ADDRESS;
+    soulSetBus = false;
+  }
 }
 function soulClient(backend) {
   let c = soulClients.get(backend);
@@ -11282,6 +11305,9 @@ function soulTool(name, description, execute) {
     execute: async () => ({ content: execute() })
   };
 }
+function soulMarker(spriteId, ownerAgentId) {
+  return `[sprite:${spriteId} owner:${ownerAgentId}]`;
+}
 async function verifySoulOwnership(client, sprite, ownerAgentId) {
   const soul = sprite.soul;
   if (!soul)
@@ -11291,11 +11317,14 @@ async function verifySoulOwnership(client, sprite, ownerAgentId) {
   try {
     const a = await client.agents.retrieve(soul.agentId);
     const tags = Array.isArray(a?.tags) ? a.tags : [];
-    if (!tags.includes(`sprite:${sprite.id}`))
-      return `agent ${soul.agentId} is not tagged as ${sprite.name}'s soul \u2014 refusing`;
-    if (!tags.includes(`sprite-owner:${ownerAgentId}`))
+    const desc = typeof a?.description === "string" ? a.description : "";
+    const byTags = tags.includes(`sprite:${sprite.id}`) && tags.includes(`sprite-owner:${ownerAgentId}`);
+    const byMarker = desc.includes(soulMarker(sprite.id, ownerAgentId));
+    if (byTags || byMarker)
+      return null;
+    if (tags.includes(`sprite:${sprite.id}`) || desc.includes(`[sprite:${sprite.id} `))
       return `agent ${soul.agentId} belongs to a different owner \u2014 refusing`;
-    return null;
+    return `agent ${soul.agentId} is not marked as ${sprite.name}'s soul \u2014 refusing`;
   } catch (e) {
     return `couldn't verify its agent: ${String(e?.message ?? e).slice(0, 120)}`;
   }
@@ -13644,6 +13673,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
   const soulToolCounter = new Map;
   const soulQueue = new Map;
   let confinementUnavailable = false;
+  let soulLastError = "";
   function soulSessionOptions(sprite, confined = true) {
     const soul = sprite.soul;
     return {
@@ -13740,12 +13770,21 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
             timer.unref?.();
           });
           const collect = (async () => {
+            let fromResult = "";
             for await (const msg of session.stream()) {
-              if (msg?.type === "assistant" && typeof msg.content === "string")
-                text += msg.content;
-              else if (msg?.type === "result")
+              if (msg?.type === "assistant") {
+                if (typeof msg.content === "string")
+                  text += msg.content;
+                else if (Array.isArray(msg.content))
+                  text += msg.content.map((c) => typeof c?.text === "string" ? c.text : "").join("");
+              } else if (msg?.type === "result") {
+                if (typeof msg.result === "string")
+                  fromResult = msg.result;
                 break;
+              }
             }
+            if (!text.trim() && fromResult)
+              text = fromResult;
           })();
           await Promise.race([collect, timeout]);
         } finally {
@@ -13761,7 +13800,10 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
         soul.lineCount += 1;
         markDirty();
         return line;
-      } catch {
+      } catch (e) {
+        if (process.env.SPRITE_DEBUG)
+          console.error("[sprite soul]", String(e?.message ?? e).slice(0, 300));
+        soulLastError = String(e?.message ?? e).slice(0, 200);
         return null;
       }
     };
@@ -14036,7 +14078,7 @@ Reply in one line.`, { force: true });
       const client = await soulClient(backend);
       const soulAgentId = await client.createAgent({
         name: `${sprite.name} (sprite of ${ownerName})`,
-        description: `Companion sprite ${sprite.name} \u2014 a ${sprite.species} belonging to agent ${agentId}. Created by the sprite mod.`,
+        description: `Companion sprite ${sprite.name} \u2014 a ${sprite.species} belonging to agent ${agentId}. Created by the sprite mod. ${soulMarker(sprite.id, agentId)}`,
         hidden: true,
         tags: ["sprite", `sprite:${sprite.id}`, `sprite-owner:${agentId}`],
         model,
@@ -14080,7 +14122,12 @@ ${pickLines(sprite, c).map((l) => `- ${l}`).join(`
       flush();
       queueCheckpoint(agentId, "ensouled");
       setPose("happy", 6000);
-      const first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
+      let first = null;
+      for (let attempt = 0;attempt < 3 && !first; attempt += 1) {
+        if (attempt)
+          await new Promise((r) => setTimeout(r, 1500 * attempt));
+        first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
+      }
       if (first)
         showSoulLine(sprite, "greeting", first);
       const verdict = first ? `
@@ -14091,7 +14138,10 @@ ${sprite.name}: ${first}` : `
 talk to it: /sprite talk <text> \xB7 inspect: /sprite soul`;
     } catch (error) {
       unreserve();
-      return `couldn't create ${sprite.name}'s mind: ${String(error?.message ?? error).slice(0, 200)}
+      const msg = String(error?.message ?? error).slice(0, 200);
+      const hint = /Missing LETTA_API_KEY/.test(msg) && backend === "cloud" ? `
+This Letta Code can't reach the login keyring from here (no session bus). Start Letta Code from a desktop session, or set LETTA_API_KEY in its environment.` : "";
+      return `couldn't create ${sprite.name}'s mind: ${msg}${hint}
 nothing was changed.`;
     }
   }
@@ -14180,6 +14230,7 @@ ${sprite.name}: ${line}` : ""}`;
         `talk gate: ${soul.talkGate ? `${soul.talkGate} agent\u2192sprite messages per 5 min` : "off"}   dreaming: ${soul.dreaming}   persona: ${soul.personaSource}`,
         `live lines so far: ${soul.lineCount}   ensouled: ${relativeTime(soul.createdAt)}`,
         costLine(sprite),
+        soulLastError ? `last error: ${soulLastError}` : "",
         "",
         "change: /sprite soul model <handle> \xB7 see nothing|events|tools|turns \xB7 comment turn|turns <n>|tools <n> \xB7 rate <min> \xB7 gate <n|off> \xB7 dreaming off|step-count|compaction-event \xB7 persona (rewrite it)"
       ].join(`
