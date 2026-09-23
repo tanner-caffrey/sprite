@@ -27,7 +27,18 @@
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -789,6 +800,10 @@ interface AgentCollectionState {
   activeSpriteId: string | null;
   sprites: Record<string, SpriteState>;
   backup?: PortableBackupState;
+  // Bumped by force-restore. A merge whose remote generation is newer than its
+  // base treats remote as authoritative: sprites the restore removed stay
+  // removed instead of being resurrected by a stale writer's local copy.
+  generation?: number;
 }
 
 interface ModState {
@@ -800,6 +815,9 @@ interface ModState {
 interface StateLoadResult {
   state: ModState;
   migrated: boolean;
+  // The file exists but couldn't be read/parsed. Callers must NOT save over it:
+  // a truncated file is a recoverable sprite, an overwritten one is gone.
+  corrupt?: boolean;
 }
 
 const DEFAULT_SETTINGS: Record<string, unknown> = {
@@ -832,6 +850,15 @@ function spriteIdForLegacyAgent(agentId: string, sprite: Partial<SpriteState>): 
 const UNSAFE_RECORD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const PORTABLE_MAX_BYTES = 1_000_000;
 const PORTABLE_MAX_SPRITES = 64;
+// Hard ceilings so a checksum-valid (but hostile) backup can't feed the
+// level-up loops a number they'd spin on for the rest of the session.
+const MAX_LEVEL = 10_000;
+const MAX_STAT = 10_000_000;
+const MAX_TOTAL_XP = 1_000_000_000;
+
+function boundedNonnegative(value: unknown, max: number, fallback = 0): number {
+  return Math.min(max, finiteNonnegative(value, fallback));
+}
 
 function safeIdentifier(value: unknown, fallback: string): string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(value)
@@ -911,14 +938,14 @@ function normalizeSprite(agentId: string, input: Partial<SpriteState>): SpriteSt
     name: typeof input.name === "string" && input.name ? input.name.slice(0, 24) : "Sprite",
     named: input.named === true,
     ...(typeof input.hatchedAt === "number" ? { hatchedAt: input.hatchedAt } : {}),
-    xp: finiteNonnegative(input.xp),
-    level: Math.max(1, Math.floor(finiteNonnegative(input.level, 1))),
+    xp: boundedNonnegative(input.xp, MAX_TOTAL_XP),
+    level: Math.max(1, Math.floor(boundedNonnegative(input.level, MAX_LEVEL, 1))),
     stats: {
-      craft: finiteNonnegative(input.stats?.craft),
-      wander: finiteNonnegative(input.stats?.wander),
-      grit: finiteNonnegative(input.stats?.grit),
-      lore: finiteNonnegative(input.stats?.lore),
-      spark: finiteNonnegative(input.stats?.spark),
+      craft: boundedNonnegative(input.stats?.craft, MAX_STAT),
+      wander: boundedNonnegative(input.stats?.wander, MAX_STAT),
+      grit: boundedNonnegative(input.stats?.grit, MAX_STAT),
+      lore: boundedNonnegative(input.stats?.lore, MAX_STAT),
+      spark: boundedNonnegative(input.stats?.spark, MAX_STAT),
     },
     ...(voice ? { voice } : {}),
     settings: cleanSettings(input.settings),
@@ -944,6 +971,9 @@ function normalizeCollection(agentId: string, input: Partial<AgentCollectionStat
     activeSpriteId,
     sprites,
     ...(input.backup && typeof input.backup === "object" ? { backup: input.backup } : {}),
+    ...(Number.isInteger(input.generation) && (input.generation as number) > 0
+      ? { generation: input.generation }
+      : {}),
   };
 }
 
@@ -985,17 +1015,50 @@ function parseState(raw: unknown): StateLoadResult {
 }
 
 function loadState(): StateLoadResult {
+  let text: string;
   try {
-    const raw = JSON.parse(readFileSync(STATE_PATH, "utf-8"));
-    return parseState(raw);
-  } catch {
-    // missing or malformed → fresh state
+    text = readFileSync(STATE_PATH, "utf-8");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return { state: emptyState(), migrated: false };
+    return { state: emptyState(), migrated: false, corrupt: true }; // EISDIR, EACCES, …
   }
-  return { state: emptyState(), migrated: false };
+  if (text.trim() === "") return { state: emptyState(), migrated: false };
+  try {
+    const result = parseState(JSON.parse(text));
+    if (result.migrated) preserveLegacyState(text);
+    return result;
+  } catch {
+    // Malformed JSON: move the original aside so nothing can overwrite it,
+    // then report "absent" — the quarantined copy is the recoverable one.
+    if (quarantineCorruptState(text)) return { state: emptyState(), migrated: false };
+    return { state: emptyState(), migrated: false, corrupt: true };
+  }
+}
+
+// One-time copy of the pre-migration file so a bad migration is never the
+// only surviving version. Sits beside the live state, never overwritten.
+function preserveLegacyState(text: string) {
+  const path = `${STATE_PATH}.pre-migration.json`;
+  try {
+    if (!existsSync(path)) writeFileSync(path, text, { flag: "wx" });
+  } catch {
+    // best-effort
+  }
+}
+
+function quarantineCorruptState(text: string): boolean {
+  const path = `${STATE_PATH}.corrupt.${Date.now().toString(36)}.json`;
+  try {
+    writeFileSync(path, text, { flag: "wx" });
+    rmSync(STATE_PATH, { force: true }); // live path is now genuinely absent
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function saveState(state: ModState): boolean {
-  const tmp = `${STATE_PATH}.tmp`;
+  const tmp = `${STATE_PATH}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(STATE_PATH), { recursive: true });
     writeFileSync(tmp, JSON.stringify(state, null, 2));
@@ -1022,19 +1085,26 @@ function mergeValue<T>(base: T, local: T, remote: T): T {
   return cloneState(local);
 }
 
+// xpToNext is arithmetic (100, 150, 200, …) so the cumulative cost to reach a
+// level has a closed form — no loops that scale with attacker-chosen numbers.
+function xpToReachLevel(level: number): number {
+  const n = Math.max(0, Math.floor(level) - 1);
+  return 100 * n + 25 * n * (n - 1);
+}
+
 function totalXp(sprite: SpriteState): number {
-  let total = sprite.xp;
-  for (let level = 1; level < sprite.level; level += 1) total += xpToNext(level);
-  return total;
+  const level = Math.min(MAX_LEVEL, Math.max(1, Math.floor(sprite.level)));
+  return Math.min(MAX_TOTAL_XP, Math.max(0, sprite.xp) + xpToReachLevel(level));
 }
 
 function applyTotalXp(sprite: SpriteState, total: number) {
-  sprite.level = 1;
-  sprite.xp = Math.max(0, total);
-  while (sprite.xp >= xpToNext(sprite.level)) {
-    sprite.xp -= xpToNext(sprite.level);
-    sprite.level += 1;
-  }
+  const capped = Math.min(MAX_TOTAL_XP, Math.max(0, Number.isFinite(total) ? total : 0));
+  // Solve 25n² + 75n - capped ≤ 0 for the highest whole n (= level - 1).
+  let n = Math.floor((-75 + Math.sqrt(75 * 75 + 100 * capped)) / 50);
+  while (n > 0 && xpToReachLevel(n + 1) > capped) n -= 1;
+  while (n + 1 < MAX_LEVEL && xpToReachLevel(n + 2) <= capped) n += 1;
+  sprite.level = Math.min(MAX_LEVEL, n + 1);
+  sprite.xp = capped - xpToReachLevel(sprite.level);
 }
 
 function entryKey(entry: { at: number; category: VoiceCategory | "mood"; line: string }): string {
@@ -1153,6 +1223,18 @@ function mergeCollection(
       backup: mergeBackup(undefined, local.backup, remote.backup),
     };
   }
+  const remoteGen = remote.generation ?? 0;
+  if (remoteGen > (base.generation ?? 0)) {
+    // Remote was force-restored since we loaded. Our local view is of a soul
+    // that no longer exists there — don't carry it back. Keep only XP/stat
+    // deltas for sprites that still exist on the remote.
+    const sprites = cloneState(remote.sprites);
+    for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
+      if (!sprites[spriteId] || !base.sprites[spriteId]) continue;
+      sprites[spriteId] = mergeSprite(base.sprites[spriteId], localSprite, sprites[spriteId]);
+    }
+    return { ...cloneState(remote), sprites, ownerAgentId: local.ownerAgentId };
+  }
   const sprites = cloneState(remote.sprites);
   for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
     sprites[spriteId] = mergeSprite(base.sprites[spriteId], localSprite, remote.sprites[spriteId]);
@@ -1163,6 +1245,7 @@ function mergeCollection(
     activeSpriteId: mergeValue(base.activeSpriteId, local.activeSpriteId, remote.activeSpriteId),
     sprites,
     backup: mergeBackup(base.backup, local.backup, remote.backup),
+    ...(remoteGen > 0 ? { generation: remoteGen } : {}),
   };
 }
 
@@ -1230,10 +1313,17 @@ function writeLockOwner(lockPath: string) {
   }
 }
 
+const LOCK_MAX_AGE_MS = 10 * 60_000;
+
+// true = a live owner holds it; false = owner is dead; null = unknown owner.
+// A live-looking PID is only trusted while the lock is younger than
+// LOCK_MAX_AGE_MS — PIDs get reused, and no sprite critical section takes
+// ten minutes.
 function lockOwnerIsAlive(lockPath: string): boolean | null {
   try {
     const owner = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf-8"));
     if (!Number.isInteger(owner?.pid) || owner.pid <= 0) return null;
+    if (Number.isFinite(owner?.acquiredAt) && Date.now() - owner.acquiredAt > LOCK_MAX_AGE_MS) return false;
     try {
       process.kill(owner.pid, 0);
       return true;
@@ -1245,12 +1335,18 @@ function lockOwnerIsAlive(lockPath: string): boolean | null {
   }
 }
 
-function clearStaleLock(lockPath: string, maxAgeMs = 10 * 60_000): boolean {
+// Reclaim atomically: rename the stale lock dir to a unique name first. Only
+// the process whose rename succeeds removes it; a second reclaimer's rename
+// fails (ENOENT) and it goes back to retrying — it can never delete a lock
+// someone else has just acquired.
+function clearStaleLock(lockPath: string, maxAgeMs = LOCK_MAX_AGE_MS): boolean {
   try {
     const ownerAlive = lockOwnerIsAlive(lockPath);
     if (ownerAlive === true) return false;
     if (ownerAlive === null && Date.now() - statSync(lockPath).mtimeMs <= maxAgeMs) return false;
-    rmSync(lockPath, { recursive: true, force: true });
+    const graveyard = `${lockPath}.stale.${process.pid}.${Date.now().toString(36)}`;
+    renameSync(lockPath, graveyard);
+    rmSync(graveyard, { recursive: true, force: true });
     return true;
   } catch {
     return false;
@@ -1258,7 +1354,11 @@ function clearStaleLock(lockPath: string, maxAgeMs = 10 * 60_000): boolean {
 }
 
 function withLocalStateLock<T>(fn: () => T): T | null {
-  mkdirSync(dirname(LOCAL_STATE_LOCK_PATH), { recursive: true });
+  try {
+    mkdirSync(dirname(LOCAL_STATE_LOCK_PATH), { recursive: true });
+  } catch {
+    return null; // unwritable parent — persistence is best-effort, never throw into the session
+  }
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       mkdirSync(LOCAL_STATE_LOCK_PATH);
@@ -1378,16 +1478,67 @@ function parsePortableCollection(raw: string): PortableCollectionV1 | null {
   }
 }
 
+// Git env vars that can redirect the operation to a different repo/index or
+// inject config. Everything else from the parent env is dropped too; only a
+// minimal, explicit environment reaches git.
+const GIT_ENV_PASSTHROUGH = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "SSH_AUTH_SOCK", "XDG_CONFIG_HOME"];
+
+function gitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of GIT_ENV_PASSTHROUGH) if (process.env[key] !== undefined) env[key] = process.env[key];
+  // Refuse any repo-level config that could run a program. Not exhaustive by
+  // nature (git keeps growing), but covers the documented executable knobs.
+  env.GIT_CONFIG_COUNT = "0";
+  env.GIT_TERMINAL_PROMPT = "0";
+  return env;
+}
+
+function emptyHooksDir(memoryDir: string): string | null {
+  const path = join(memoryDir, ".git", "sprite-empty-hooks");
+  try {
+    mkdirSync(path, { recursive: true });
+    if (lstatSync(path).isSymbolicLink()) return null;
+    // Must actually be empty — a planted pre-commit here would run.
+    if (readdirSync(path).length > 0) return null;
+    return path;
+  } catch {
+    return null;
+  }
+}
+
 function runGit(memoryDir: string, args: string[]): string {
-  const emptyHooksPath = join(memoryDir, ".git", "sprite-empty-hooks");
-  mkdirSync(emptyHooksPath, { recursive: true });
+  const hooks = emptyHooksDir(memoryDir);
+  if (!hooks) throw new Error("sprite: hook directory is not empty or not a directory");
   return execFileSync(
     "git",
-    ["-C", memoryDir, "-c", `core.hooksPath=${emptyHooksPath}`, "-c", "core.fsmonitor=false", ...args],
+    [
+      "-C", memoryDir,
+      "-c", `core.hooksPath=${hooks}`,
+      "-c", "core.fsmonitor=false",
+      "-c", "core.sshCommand=ssh",
+      "-c", "credential.helper=",
+      "-c", "commit.gpgSign=false",
+      "-c", "tag.gpgSign=false",
+      "-c", "push.gpgSign=false",
+      "-c", "diff.external=",
+      "-c", "gpg.program=",
+      "-c", "filter.lfs.clean=",
+      "-c", "filter.lfs.smudge=",
+      "-c", "filter.lfs.process=",
+      "-c", "filter.lfs.required=false",
+      "-c", "protocol.allow=never",
+      "-c", "protocol.https.allow=always",
+      "-c", "protocol.ssh.allow=always",
+      "-c", "protocol.file.allow=always",
+      "-c", "protocol.git.allow=always",
+      "-c", "uploadpack.allowFilter=false",
+      ...args,
+    ],
     {
-    encoding: "utf-8",
-    timeout: 15_000,
-    stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf-8",
+      timeout: 15_000,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: gitEnv(),
     },
   ).trim();
 }
@@ -1401,12 +1552,16 @@ function tryGit(memoryDir: string, args: string[]): string | null {
 }
 
 function hasOnlySpritePaths(memoryDir: string, commit: string): boolean {
-  const paths = tryGit(memoryDir, ["diff-tree", "--no-commit-id", "--name-only", "-r", commit]);
+  // Sprite never creates merge commits. A merge's diff-tree is empty by default,
+  // which would let an "evil merge" carrying agent memory pass — so refuse any
+  // commit with more than one parent outright.
+  const parents = tryGit(memoryDir, ["rev-list", "--parents", "-n", "1", commit]);
+  if (parents === null || parents.split(/\s+/).filter(Boolean).length > 2) return false;
+  const paths = tryGit(memoryDir, ["diff-tree", "--no-commit-id", "--name-only", "-r", "--root", commit]);
   if (paths === null) return false;
-  return paths
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .every((path) => path === PORTABLE_RELATIVE_PATH || path.startsWith("data/mods/letta-ai-sprite/"));
+  const list = paths.split(/\r?\n/).filter(Boolean);
+  if (list.length === 0) return false;
+  return list.every((path) => path === PORTABLE_RELATIVE_PATH || path.startsWith("data/mods/letta-ai-sprite/"));
 }
 
 function isSpriteOwnedCommit(memoryDir: string, commit: string): boolean {
@@ -1414,10 +1569,17 @@ function isSpriteOwnedCommit(memoryDir: string, commit: string): boolean {
   return body !== null && body.includes(PORTABLE_COMMIT_TRAILER) && hasOnlySpritePaths(memoryDir, commit);
 }
 
+// Push a specific, already-validated object — never the moving name HEAD. If
+// HEAD advanced between validation and push (another process committing agent
+// memory), that commit is simply not part of what we send.
+function pushValidated(memoryDir: string, remote: string, branch: string, sha: string) {
+  runGit(memoryDir, ["push", remote, `${sha}:refs/heads/${branch}`]);
+}
+
 function safePushTarget(memoryDir: string, refreshRemote: boolean):
   | { kind: "none" }
   | { kind: "blocked"; reason: string }
-  | { kind: "ready"; remote: string; branch: string; ahead: number } {
+  | { kind: "ready"; remote: string; branch: string; ahead: number; head: string } {
   const upstream = tryGit(memoryDir, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
   if (!upstream) return { kind: "none" };
   const slash = upstream.indexOf("/");
@@ -1427,12 +1589,15 @@ function safePushTarget(memoryDir: string, refreshRemote: boolean):
   if (refreshRemote && tryGit(memoryDir, ["fetch", remote, branch]) === null) {
     return { kind: "blocked", reason: "could not refresh MemFS upstream" };
   }
-  const counts = tryGit(memoryDir, ["rev-list", "--left-right", "--count", `${upstream}...HEAD`]);
+  // Pin HEAD once; every check below and the eventual push use this exact object.
+  const head = tryGit(memoryDir, ["rev-parse", "--verify", "HEAD^{commit}"]);
+  if (!head || !/^[0-9a-f]{40,64}$/.test(head)) return { kind: "blocked", reason: "could not resolve HEAD" };
+  const counts = tryGit(memoryDir, ["rev-list", "--left-right", "--count", `${upstream}...${head}`]);
   if (!counts) return { kind: "blocked", reason: "could not compare upstream" };
   const [behind, ahead] = counts.split(/\s+/).map(Number);
   if (behind > 0) return { kind: "blocked", reason: "MemFS branch is behind or diverged" };
   if (ahead > 0) {
-    const commits = tryGit(memoryDir, ["rev-list", `${upstream}..HEAD`]);
+    const commits = tryGit(memoryDir, ["rev-list", `${upstream}..${head}`]);
     if (!commits) return { kind: "blocked", reason: "could not inspect unpushed commits" };
     for (const commit of commits.split(/\r?\n/).filter(Boolean)) {
       if (!isSpriteOwnedCommit(memoryDir, commit)) {
@@ -1440,7 +1605,7 @@ function safePushTarget(memoryDir: string, refreshRemote: boolean):
       }
     }
   }
-  return { kind: "ready", remote, branch, ahead };
+  return { kind: "ready", remote, branch, ahead, head };
 }
 
 function portablePath(memoryDir: string): string | null {
@@ -1505,7 +1670,7 @@ function checkpointPortableCollection(
     if (collection.backup?.lastHash === hash) {
       if (pushPolicy === "safe" && pushTarget.kind === "ready" && pushTarget.ahead > 0) {
         try {
-          runGit(memoryDir, ["push", pushTarget.remote, `HEAD:${pushTarget.branch}`]);
+          pushValidated(memoryDir, pushTarget.remote, pushTarget.branch, pushTarget.head);
           return {
             ok: true,
             status: "portable backup synced",
@@ -1538,7 +1703,16 @@ function checkpointPortableCollection(
     }
     mkdirSync(dirname(outputPath), { recursive: true });
     const previous = existsSync(outputPath) ? readFileSync(outputPath) : null;
-    const tmp = `${outputPath}.tmp`;
+    // Unique tmp name per process + never follow a pre-planted symlink at it.
+    const tmp = `${outputPath}.${process.pid}.${Date.now().toString(36)}.tmp`;
+    try {
+      if (lstatSync(tmp).isSymbolicLink()) {
+        return { ok: false, status: "portable backup blocked — Sprite's MemFS path contains a symlink" } satisfies BackupResult;
+      }
+      rmSync(tmp, { force: true });
+    } catch {
+      // absent — expected
+    }
     const commitMessage = [
       `mod-state(sprite): checkpoint ${collection.sprites[collection.activeSpriteId ?? ""]?.name ?? "collection"}`,
       "",
@@ -1546,8 +1720,10 @@ function checkpointPortableCollection(
       "",
       PORTABLE_COMMIT_TRAILER,
     ].join("\n");
+    let committed: string | null = null;
     try {
-      writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`);
+      // `wx` = O_CREAT|O_EXCL: fails if anything (including a symlink) exists at tmp.
+      writeFileSync(tmp, `${JSON.stringify(payload, null, 2)}\n`, { flag: "wx" });
       renameSync(tmp, outputPath);
       runGit(memoryDir, ["add", "--", PORTABLE_RELATIVE_PATH]);
       runGit(memoryDir, [
@@ -1562,6 +1738,7 @@ function checkpointPortableCollection(
         "--",
         PORTABLE_RELATIVE_PATH,
       ]);
+      committed = runGit(memoryDir, ["rev-parse", "--verify", "HEAD^{commit}"]);
     } catch {
       tryGit(memoryDir, ["reset", "HEAD", "--", PORTABLE_RELATIVE_PATH]);
       rmSync(tmp, { force: true });
@@ -1577,7 +1754,19 @@ function checkpointPortableCollection(
       status += " · no remote configured";
     } else {
       try {
-        runGit(memoryDir, ["push", pushTarget.remote, `HEAD:${pushTarget.branch}`]);
+        // Only push if the commit we just made sits directly on the HEAD we
+        // validated and is itself sprite-only. Anything else = someone else
+        // committed in between; leave it for the host to push.
+        const parent = tryGit(memoryDir, ["rev-parse", "--verify", `${committed}^{commit}^`]);
+        if (!committed || parent !== pushTarget.head || !isSpriteOwnedCommit(memoryDir, committed)) {
+          return {
+            ok: false,
+            status: "portable backup committed locally · push skipped (MemFS changed underneath)",
+            revision,
+            hash,
+          } satisfies BackupResult;
+        }
+        pushValidated(memoryDir, pushTarget.remote, pushTarget.branch, committed);
         status = "portable backup synced";
       } catch {
         return {
@@ -1716,13 +1905,35 @@ function statForTool(name: string): (typeof STAT_KEYS)[number] {
 // activation
 // ---------------------------------------------------------------------------
 
+// One activation per host object. If the same mod gets loaded twice into one
+// host (hand-copied file + installed package, say) the second copy would
+// register its own listeners and double-count every event into shared state.
+// Keyed on the host (not the process) so genuinely separate hosts — tests, or
+// a runtime that spins several — still each get their own sprite.
+const ACTIVE_HOSTS: WeakSet<object> = ((globalThis as any)[Symbol.for("@faye/sprite:hosts")] ??= new WeakSet());
+
 export default function activate(letta: any) {
   // Sprites are Tamagotchi-like companions for agents, not for a specific UI.
   // Keep tools/events available in headless channel listeners even when there is
   // no statusline panel to render.
   const hasPanels = Boolean(letta.capabilities.ui.panels);
 
+  if (letta && typeof letta === "object") {
+    if (ACTIVE_HOSTS.has(letta)) {
+      try {
+        letta.log?.warn?.("sprite: already active on this host — skipping duplicate activation");
+      } catch {
+        // logging is optional
+      }
+      return undefined;
+    }
+    ACTIVE_HOSTS.add(letta);
+  }
+
   const disposers: Array<() => void> = [];
+  disposers.push(() => {
+    if (letta && typeof letta === "object") ACTIVE_HOSTS.delete(letta);
+  });
   const loaded = loadState();
   const state = loaded.state;
   let baseState = cloneState(state);
@@ -1741,10 +1952,13 @@ export default function activate(letta: any) {
   const markDirty = () => {
     dirty = true;
   };
-  const flush = () => {
-    if (!dirty) return;
+  const flush = (evenIfClean = false) => {
+    if (!dirty && !evenIfClean) return;
     const flushed = withLocalStateLock(() => {
-      const remote = loadState().state;
+      const loadedNow = loadState();
+      // Never merge over a file we couldn't read — it's quarantined for a human.
+      if (loadedNow.corrupt) return false;
+      const remote = loadedNow.state;
       const merged = mergeState(baseState, state, remote);
       if (!saveState(merged)) return false;
       reconcileInPlace(state, merged);
@@ -1754,18 +1968,35 @@ export default function activate(letta: any) {
     if (flushed) dirty = false;
   };
 
-  const replaceCollection = (agentId: string, replacement: AgentCollectionState): boolean => {
+  // Returns true on success, false on save failure, "exists" when `force` is off
+  // and another process already created a collection for this agent — the
+  // absence check has to happen on disk, under the lock, not against our
+  // possibly-stale in-memory snapshot.
+  const replaceCollection = (
+    agentId: string,
+    replacement: AgentCollectionState,
+    force: boolean,
+  ): true | false | "exists" => {
     flush();
-    const replaced = withLocalStateLock(() => {
-      const latest = loadState().state;
-      latest.collections[agentId] = cloneState(replacement);
+    const replaced = withLocalStateLock<true | false | "exists">(() => {
+      const loadedNow = loadState();
+      if (loadedNow.corrupt) return false;
+      const latest = loadedNow.state;
+      if (!force && latest.collections[agentId]) {
+        reconcileInPlace(state, latest);
+        baseState = cloneState(latest);
+        return "exists";
+      }
+      const next = cloneState(replacement);
+      if (force) next.generation = (latest.collections[agentId]?.generation ?? 0) + 1;
+      latest.collections[agentId] = next;
       if (!saveState(latest)) return false;
       reconcileInPlace(state, latest);
       baseState = cloneState(latest);
       return true;
     });
-    if (replaced) dirty = false;
-    return replaced === true;
+    if (replaced === true || replaced === "exists") dirty = false;
+    return replaced ?? false;
   };
 
   if (dirty) flush();
@@ -1877,7 +2108,12 @@ export default function activate(letta: any) {
       lastCheckpointAt: portable.exportedAt,
       lastStatus: `restored portable backup revision ${portable.revision} · backup remains off until enabled`,
     };
-    if (!replaceCollection(agentId, collection)) {
+    const outcome = replaceCollection(agentId, collection, force);
+    if (outcome === "exists") {
+      panel.update();
+      return "local companion state already exists — use /sprite backup restore force to replace it deliberately";
+    }
+    if (!outcome) {
       return "portable restore failed while saving local state — existing state was left untouched";
     }
     panel.update();
@@ -1886,6 +2122,9 @@ export default function activate(letta: any) {
 
   function maybeAutoRestore(agentId: string | null) {
     if (!agentId || getCollection(agentId) || !memoryDirs.has(agentId)) return;
+    // Another window may have hatched since we loaded; refresh from disk first.
+    flush(true);
+    if (getCollection(agentId)) return;
     const memoryDir = memoryDirs.get(agentId)!;
     const path = portablePath(memoryDir);
     if (!path || !existsSync(path)) return;
@@ -2054,14 +2293,14 @@ export default function activate(letta: any) {
 
   // -- xp -------------------------------------------------------------------
 
+  function bumpStat(sprite: SpriteState, key: (typeof STAT_KEYS)[number]) {
+    sprite.stats[key] = Math.min(MAX_STAT, sprite.stats[key] + 1);
+  }
+
   function awardXp(sprite: SpriteState, amount: number) {
-    sprite.xp += amount;
-    let leveled = false;
-    while (sprite.xp >= xpToNext(sprite.level)) {
-      sprite.xp -= xpToNext(sprite.level);
-      sprite.level += 1;
-      leveled = true;
-    }
+    const before = sprite.level;
+    applyTotalXp(sprite, totalXp(sprite) + Math.max(0, amount));
+    const leveled = sprite.level > before;
     markDirty();
     if (leveled) {
       setPose("happy", 4_000);
@@ -2317,11 +2556,11 @@ export default function activate(letta: any) {
           if (errorStreak === 1) speak(sprite, "tool_error");
         } else {
           if (errorStreak >= 2) {
-            sprite.stats.grit += 1;
+            bumpStat(sprite, "grit");
             speak(sprite, "error_resolved");
           }
           errorStreak = 0;
-          sprite.stats[statForTool(event.toolName)] += 1;
+          bumpStat(sprite, statForTool(event.toolName));
           awardXp(sprite, 2);
           // commits are rare + worth celebrating: always speak
           if (bashCmd && /\bgit\b[\s\S]*\bcommit\b/.test(bashCmd)) {
@@ -2340,7 +2579,7 @@ export default function activate(letta: any) {
         const sprite = getSprite(activeAgentId);
         if (!sprite || sprite.phase !== "alive") return;
         noteActivity(sprite);
-        sprite.stats.spark += 1;
+        bumpStat(sprite, "spark");
         awardXp(sprite, 1);
       }),
     );
@@ -2836,14 +3075,30 @@ export default function activate(letta: any) {
   // -- cleanup ----------------------------------------------------------------
 
   return () => {
-    for (const [agentId, collection] of Object.entries(state.collections)) {
-      if (backupEnabled(collection) && collection.backup?.lastHash !== collectionContentHash(collection)) {
-        queueCheckpoint(agentId, "clean-shutdown");
+    try {
+      for (const [agentId, collection] of Object.entries(state.collections)) {
+        if (backupEnabled(collection) && collection.backup?.lastHash !== collectionContentHash(collection)) {
+          queueCheckpoint(agentId, "clean-shutdown");
+        }
+      }
+      flush();
+      for (const agentId of pendingCheckpoints.keys()) {
+        try {
+          processCheckpoint(agentId, true);
+        } catch {
+          // a failed checkpoint must not stop the rest of shutdown
+        }
+      }
+      flush();
+    } finally {
+      // Always unregister handlers + clear the heartbeat, even if persistence threw.
+      for (const dispose of disposers.reverse()) {
+        try {
+          dispose();
+        } catch {
+          // keep going
+        }
       }
     }
-    flush();
-    for (const agentId of pendingCheckpoints.keys()) processCheckpoint(agentId, true);
-    flush();
-    for (const dispose of disposers.reverse()) dispose();
   };
 }

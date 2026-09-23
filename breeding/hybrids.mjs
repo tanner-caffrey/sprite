@@ -11,6 +11,18 @@
 // Clacks claws that drift through things. Sideways-scuttles through walls. Pinchy-tender like
 // dad-crab, page-turn-fond and fading like mom-ghost. The first of its kind — and it knows it.
 export const HYBRID_POSES = {
+  // chimera — the generic unauthored hybrid. Two parents whose pairing has no curated
+  // species yet. Patchwork body, lopsided, proud of it. Every authored hybrid was a
+  // chimera first — this is what "no combo table yet" looks like from the inside.
+  chimera: {
+    idle: "(◕ω◔)~",
+    blink: "(-ω◔)~",
+    work: "(◕ω◔)~✎",
+    peek: "(◕ω◔)?",
+    sleep: "(-ω-)~ ᶻ",
+    happy: "＼(◕ω◔)／",
+    oops: "(◕;ω;◔)~",
+  },
   hauntcrab: {
     idle: "(👻ω👻)⌐",
     blink: "(👻-👻)⌐",
@@ -23,6 +35,51 @@ export const HYBRID_POSES = {
 };
 
 export const HYBRID_CORPUS = {
+  chimera: {
+    commit: [
+      "stitched it in. one side of me likes it. the other side is thinking about it.",
+      "committed! both halves agree, which is rare. mark the calendar.",
+    ],
+    tool_error: [
+      "one half tripped over the other half. we're working on coordination.",
+      "that went wrong in a way neither of my parents could have managed alone. proud, sort of.",
+    ],
+    greeting: [
+      "hi. i'm a bit of both. don't ask which bits — i'm still finding out.",
+      "you're back! i rearranged myself while you were gone. mostly on purpose.",
+      "hello hello~ two voices, one small body, no manual.",
+    ],
+    missed_you: [
+      "you were gone long enough that i figured out which foot is which. mostly.",
+      "waited. one half paced, the other half napped. teamwork.",
+    ],
+    error_resolved: [
+      "fixed! we voted. it was 2-0. we are 1 creature but we vote anyway.",
+      "gone. one of my halves is great at bugs. we don't know which one yet.",
+    ],
+    compact_done: [
+      "you tidied your memory. i tidied mine — it's in two piles. it's fine.",
+      "page-turn. i held still, which for me takes concentration.",
+    ],
+    level_up: [
+      "grew! unevenly! that's the brand.",
+      "leveled up. neither parent could have grown quite this way. new shape, all mine.",
+    ],
+    idle: [
+      "figuring out which of my parts is the front.",
+      "quiet. i'm sorting through what i inherited. it's a lot of drawers.",
+      "no one's made one of me before. i'm taking notes for the next one.",
+    ],
+    pet: [
+      "oh! that half likes it. the other half is now jealous. again please.",
+      "mm. patchwork purr. it comes out in two pitches.",
+      "you're the first to pet a me. i'll remember it in both memories.",
+    ],
+    hatch: [
+      "...huh. i'm not either of them. i'm a new thing. hi. hi!",
+      "no table said i'd be this. so i get to decide what this is. okay.",
+    ],
+  },
   hauntcrab: {
     commit: [
       "clamped it into the shell. the shell's a haunting now too, but it holds.",

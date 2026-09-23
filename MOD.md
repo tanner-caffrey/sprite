@@ -84,23 +84,41 @@ token cost.
   ID/fate seed; legacy one-sprite-per-agent state migrates automatically.
 - Local persistence uses atomic temp+rename writes under a cross-process lock
   and three-way merges additive counters/logs against the latest disk state.
-  Persistence remains best-effort and never breaks a session.
+  Persistence remains best-effort and never breaks a session. Locks expire
+  after 10 minutes regardless of PID liveness (PIDs get reused) and are
+  reclaimed atomically. A malformed state file is moved aside to
+  `sprite.state.json.corrupt.<stamp>.json` rather than overwritten; a v1→v2
+  migration keeps `sprite.state.json.pre-migration.json`. XP, level, and stat
+  values are hard-capped so no state file can stall the session.
+- Activating the mod twice on one host (e.g. a hand-copied file plus the
+  installed package) is a no-op the second time — events are never counted
+  twice.
 - Portable backup is opt-in. It checkpoints checksum-protected JSON beneath
   the fixed agent-MemFS namespace
   `data/mods/letta-ai-sprite/collection-v1.json`, which is excluded from prompt
   compilation. Local state remains authoritative and fast.
 - `safe` Git sync stages/commits only Sprite's file, marks commits with
   `Letta-Mod-State: @faye/sprite`, and refuses to proceed around unrelated
-  dirty or unpushed memory work. `never` disables direct pushes. No remote
-  means local versioned checkpoints only.
-- Restore is automatic only when local state is absent. Replacing a live local
-  collection requires the explicit `restore force` command. A restored sprite
-  keeps its stable soul ID, birth agent, fate seed, stats, voice, and diary
-  while ownership rebinds to the current agent ID. Portable backup remains off
-  after restore until explicitly re-enabled on the new installation.
+  dirty or unpushed memory work. It pushes the exact commit it validated (never
+  the moving `HEAD`), treats merge commits as never sprite-owned, and skips the
+  push if the repository changed underneath it. `never` disables direct pushes.
+  No remote means local versioned checkpoints only.
+- Restore is automatic only when local state is absent — checked on disk under
+  the lock, so a collection another window just created is never overwritten.
+  Replacing a live local collection requires the explicit `restore force`
+  command, which bumps a collection generation so stale writers cannot
+  resurrect removed sprites. A restored sprite keeps its stable soul ID, birth
+  agent, fate seed, stats, voice, and diary while ownership rebinds to the
+  current agent ID. Portable backup remains off after restore until explicitly
+  re-enabled on the new installation.
 - Portable backup uses scoped filesystem access plus argument-array Git
-  subprocesses; no shell strings and no conversation-content reads. With
-  backup disabled, no Git or network activity occurs.
+  subprocesses; no shell strings and no conversation-content reads. Git runs
+  with a scrubbed environment (no `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CONFIG_*`
+  inheritance), an empty hooks directory that is verified empty on every call,
+  and executable config knobs (filters, credential helpers, signing, external
+  diff) disabled. Temp files use per-process names created with `O_EXCL`, so a
+  planted symlink is never followed. With backup disabled, no Git or network
+  activity occurs.
 - All capabilities are guarded (`ui.panels`, `events.*`, `commands`, `tools`)
   so the mod degrades gracefully on hosts that lack them.
 - Remove: delete the mod file and `/reload`. Delete the state file to release

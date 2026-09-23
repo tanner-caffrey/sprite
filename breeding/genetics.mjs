@@ -78,7 +78,9 @@ export function rarityOf(species) {
 // order-independent (crab×ghost === ghost×crab); reproducible from the recorded nonce.
 export function childFateSeed(parentSeedA, parentSeedB, breedNonce) {
   const [a, b] = [String(parentSeedA), String(parentSeedB)].sort();
-  return String(hashString(`breed:${a}|${b}|${breedNonce}`));
+  // length-prefix each field so ("a","b|c") and ("a|b","c") can't collide
+  const field = (s) => `${s.length}:${s}`;
+  return String(hashString(`breed:${field(a)}${field(b)}${field(String(breedNonce))}`));
 }
 
 // --- 2a. species roll: ~45% A · ~45% B · ~8% mutation · hybrid (rarity-gated) ---
