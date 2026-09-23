@@ -982,7 +982,7 @@ await check("soul: pet goes to the mind (✦), tools my_stats/my_diary are offer
   assert.match(host.command("pet"), /thinking of what to say/);
   await tick();
   const sp = activeSprite(agent.id);
-  assert.ok(sp.log.some((e) => e.line === "✦ mrrp. (from the mind.)"), JSON.stringify(sp.log.slice(-3)));
+  assert.ok(sp.log.some((e) => e.line === "mrrp. (from the mind.)"), JSON.stringify(sp.log.slice(-3)));
   const promptCall = mock.calls.find((c) => c[0] === "prompt" && c[2].includes("petted"));
   assert.deepEqual(promptCall[3].tools.map((t) => t.name), ["my_stats", "my_diary"]);
   const stats = await promptCall[3].tools[0].execute();
@@ -993,7 +993,7 @@ await check("soul: pet goes to the mind (✦), tools my_stats/my_diary are offer
   host.command("pet");
   await tick();
   const after = activeSprite(agent.id).log;
-  assert.ok(after.length > before && !after[after.length - 1].line.startsWith("✦"), "should have fallen back to the corpus");
+  assert.ok(after.length > before && after[after.length - 1].line.startsWith("("), "fallback should be a parenthesised corpus line: " + after[after.length - 1].line);
   dispose();
 });
 
@@ -1010,11 +1010,34 @@ await check("soul: talk gate stops a chatty agent; user talk is ungated; both si
   const log = activeSprite(agent.id).log.map((e) => e.line);
   assert.ok(log.some((l) => l.startsWith("Owner → ")), "agent side not in diary");
   assert.ok(log.some((l) => l.startsWith("you → ")), "user side not in diary");
-  assert.ok(log.some((l) => l.startsWith("✦ heard:")), "reply not in diary");
+  assert.ok(log.some((l) => l.startsWith("heard:")), "reply not in diary");
   assert.match(await host.command("soul gate off"), /gate → off/);
   assert.match(await host.command("soul model letta/auto-fast"), /model → letta\/auto-fast/);
   assert.ok(mock.calls.some((c) => c[0] === "updateModel" && c[2] === "letta/auto-fast"), "model change must go through session.updateModel");
   assert.match(String(await talk.run({ agent, args: { text: "hi 7" } })), /heard: hi 7/);
+  dispose();
+});
+
+await check("soul: ambient lines (commit, errors) are live once ensouled; `see` gates the detail", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soulamb", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  await tick();
+  const n0 = mock.calls.filter((c) => c[0] === "prompt").length;
+  host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "t1", args: { command: "git commit -m 'secret msg'" } });
+  host.fire("tool_end", { agentId: agent.id, toolName: "Bash", toolCallId: "t1", status: "success" });
+  await tick();
+  const commit = mock.calls.filter((c) => c[0] === "prompt").slice(n0).find((c) => /commit/i.test(c[2]));
+  assert.ok(commit, "commit should reach the mind");
+  assert.doesNotMatch(commit[2], /secret msg/, "see=nothing must not leak the commit message");
+  await host.command("soul see tools");
+  host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "t2", args: { command: "git commit -m 'visible msg'" } });
+  host.fire("tool_end", { agentId: agent.id, toolName: "Bash", toolCallId: "t2", status: "success" });
+  await tick();
+  const commit2 = mock.calls.filter((c) => c[0] === "prompt").pop();
+  assert.match(commit2[2], /visible msg/);
   dispose();
 });
 

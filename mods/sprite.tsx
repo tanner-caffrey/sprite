@@ -1180,7 +1180,9 @@ const SOUL_FOOTER = [
   "Your level, stats, mood, and age change constantly — do not remember them; call",
   "my_stats when you want to know. Your recent words are in my_diary. What you",
   "know about them lives in your bond memory; the lines you like to say live in",
-  "your voice memory; you may edit both, and your persona, as you grow.",
+  "your voice memory; you may edit both, and your persona, as you grow. Every",
+  "line on the panel is yours now — idle mutters, commits, errors, greetings —",
+  "so vary them, and let your voice memory be the lines you'd want to keep.",
 ].join("\n");
 
 function personaTemplate(sprite: SpriteState, ownerName: string, parentNames?: [string, string]): string {
@@ -3283,7 +3285,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
 
     // rare idle mutter (not while napping — let it sleep)
     if (!napping && Math.random() < 0.002) {
-      speak(sprite, "idle");
+      speakOrSoul(sprite, "idle", "Nothing in particular is happening. Say something idle, as yourself.");
     }
 
     if (tickCount % 30 === 0) {
@@ -3380,11 +3382,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           awardXp(sprite, 1);
           setPose("oops", 3_000);
           // wince once at the start of a rough patch (rate-limited; not per-error)
-          if (errorStreak === 1) speak(sprite, "tool_error");
+          if (errorStreak === 1) speakOrSoul(sprite, "tool_error", soulMoment(sprite, "Something they tried just failed.", `Their ${String(event.toolName ?? "tool")} call just failed.`));
         } else {
           if (errorStreak >= 2) {
             bumpStat(sprite, "grit");
-            speak(sprite, "error_resolved");
+            speakOrSoul(sprite, "error_resolved", soulMoment(sprite, "After a rough patch, things just started working again.", `After ${errorStreak} failures in a row, their ${String(event.toolName ?? "tool")} call just succeeded.`));
           }
           errorStreak = 0;
           bumpStat(sprite, statForTool(event.toolName));
@@ -3399,7 +3401,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           }
           // commits are rare + worth celebrating: always speak
           if (bashCmd && /\bgit\b[\s\S]*\bcommit\b/.test(bashCmd)) {
-            speak(sprite, "commit", true);
+            speakOrSoul(sprite, "commit", soulMoment(sprite, "They just made a git commit.", `They just made a git commit: ${bashCmd.slice(0, 160)}`), true);
           }
         }
         markDirty();
@@ -3440,7 +3442,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         const sprite = getSprite(activeAgentId);
         if (sprite && sprite.phase === "alive") {
           setPose("happy", 3_000);
-          speak(sprite, "compact_done");
+          speakOrSoul(sprite, "compact_done", "They just finished compacting their memory — a long nap, old things folded down, the important ones kept. You slept through it.");
         }
         panel.update();
       }),
@@ -3800,20 +3802,36 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   }
 
   function showSoulLine(sprite: SpriteState, category: VoiceCategory | "mood", line: string) {
-    bubble = `✦ ${line}`;
+    bubble = line;
     bubbleUntil = Date.now() + 10_000;
-    logEntry(sprite, category, `✦ ${line}`);
+    logEntry(sprite, category, line);
     markDirty();
     flush(); // live lines are rare and worth keeping even if the session dies now
     panel.update();
   }
 
   // Relational moment: try the soul, else the corpus.
+  // For ambient events, the *specific* version may include tool names/args —
+  // only allowed when `see` permits it; otherwise the generic phrasing.
+  function soulMoment(sprite: SpriteState, generic: string, specific: string): string {
+    const see = sprite.soul?.see ?? "nothing";
+    return see === "tools" || see === "turns" ? specific : generic;
+  }
+
   function speakOrSoul(sprite: SpriteState, category: VoiceCategory, moment: string, force = false) {
     if (!sprite.soul) return speak(sprite, category, force);
     void soulSay(sprite, moment, { force }).then((line) => {
       if (line) showSoulLine(sprite, category, line);
-      else if (speak(sprite, category, force)) flush();
+      else {
+        // the mind didn't answer — fall back to the corpus, and say so
+        const canned = speak(sprite, category, force);
+        if (canned) {
+          bubble = `(${canned})`;
+          if (sprite.log?.length) sprite.log[sprite.log.length - 1].line = `(${canned})`;
+          flush();
+          panel.update();
+        }
+      }
     });
     return null;
   }

@@ -11021,7 +11021,9 @@ var SOUL_FOOTER = [
   "Your level, stats, mood, and age change constantly \u2014 do not remember them; call",
   "my_stats when you want to know. Your recent words are in my_diary. What you",
   "know about them lives in your bond memory; the lines you like to say live in",
-  "your voice memory; you may edit both, and your persona, as you grow."
+  "your voice memory; you may edit both, and your persona, as you grow. Every",
+  "line on the panel is yours now \u2014 idle mutters, commits, errors, greetings \u2014",
+  "so vary them, and let your voice memory be the lines you'd want to keep."
 ].join(`
 `);
 function personaTemplate(sprite, ownerName, parentNames) {
@@ -12770,7 +12772,7 @@ function activateInner(letta, disposers) {
       changed = true;
     }
     if (!napping && Math.random() < 0.002) {
-      speak(sprite, "idle");
+      speakOrSoul(sprite, "idle", "Nothing in particular is happening. Say something idle, as yourself.");
     }
     if (tickCount % 30 === 0) {
       flush();
@@ -12858,11 +12860,11 @@ function activateInner(letta, disposers) {
         awardXp(sprite, 1);
         setPose("oops", 3000);
         if (errorStreak === 1)
-          speak(sprite, "tool_error");
+          speakOrSoul(sprite, "tool_error", soulMoment(sprite, "Something they tried just failed.", `Their ${String(event.toolName ?? "tool")} call just failed.`));
       } else {
         if (errorStreak >= 2) {
           bumpStat(sprite, "grit");
-          speak(sprite, "error_resolved");
+          speakOrSoul(sprite, "error_resolved", soulMoment(sprite, "After a rough patch, things just started working again.", `After ${errorStreak} failures in a row, their ${String(event.toolName ?? "tool")} call just succeeded.`));
         }
         errorStreak = 0;
         bumpStat(sprite, statForTool(event.toolName));
@@ -12877,7 +12879,7 @@ function activateInner(letta, disposers) {
           });
         }
         if (bashCmd && /\bgit\b[\s\S]*\bcommit\b/.test(bashCmd)) {
-          speak(sprite, "commit", true);
+          speakOrSoul(sprite, "commit", soulMoment(sprite, "They just made a git commit.", `They just made a git commit: ${bashCmd.slice(0, 160)}`), true);
         }
       }
       markDirty();
@@ -12911,7 +12913,7 @@ function activateInner(letta, disposers) {
       const sprite = getSprite(activeAgentId);
       if (sprite && sprite.phase === "alive") {
         setPose("happy", 3000);
-        speak(sprite, "compact_done");
+        speakOrSoul(sprite, "compact_done", "They just finished compacting their memory \u2014 a long nap, old things folded down, the important ones kept. You slept through it.");
       }
       panel.update();
     }));
@@ -13296,12 +13298,16 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     return next;
   }
   function showSoulLine(sprite, category, line) {
-    bubble = `\u2726 ${line}`;
+    bubble = line;
     bubbleUntil = Date.now() + 1e4;
-    logEntry(sprite, category, `\u2726 ${line}`);
+    logEntry(sprite, category, line);
     markDirty();
     flush();
     panel.update();
+  }
+  function soulMoment(sprite, generic, specific) {
+    const see = sprite.soul?.see ?? "nothing";
+    return see === "tools" || see === "turns" ? specific : generic;
   }
   function speakOrSoul(sprite, category, moment, force = false) {
     if (!sprite.soul)
@@ -13309,8 +13315,16 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     soulSay(sprite, moment, { force }).then((line) => {
       if (line)
         showSoulLine(sprite, category, line);
-      else if (speak(sprite, category, force))
-        flush();
+      else {
+        const canned = speak(sprite, category, force);
+        if (canned) {
+          bubble = `(${canned})`;
+          if (sprite.log?.length)
+            sprite.log[sprite.log.length - 1].line = `(${canned})`;
+          flush();
+          panel.update();
+        }
+      }
     });
     return null;
   }

@@ -3,6 +3,12 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.8.5
+- An ensouled companion speaks live for everything — idle mutters, commits,
+  errors, compaction naps, not just pets and greetings. The built-in lines
+  are only a fallback when its mind doesn't answer, shown in (parentheses).
+  What it hears about commits and errors still follows `see`.
+
 ## v0.8.2
 - The model step validates your pick against the catalog the mind will
   actually use, and says so if it isn't there (`force` to override).
