@@ -3,6 +3,16 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.8.2
+- The model step validates your pick against the catalog the mind will
+  actually use, and says so if it isn't there (`force` to override).
+- Local souls run on the same Letta Code as your session, so they see the
+  same providers and models you do (the SDK's own copy could lag behind).
+- After creation, the first line is the real test: if the mind doesn't
+  answer, you're told which model to change.
+- `/sprite soul model` applies the change the way the session does, then
+  asks for a line to prove it works.
+
 ## v0.8.0 — ensoulment
 - `/sprite ensoul`: give a companion a mind of its own — its own Letta agent,
   with memory it keeps and dreams about. A short guided flow asks where it

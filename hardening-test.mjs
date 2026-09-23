@@ -920,7 +920,8 @@ function mockSoulClient() {
         async delete(id) { calls.push(["delete", id]); if (!agents.delete(id)) throw new Error("no such agent"); },
         async update(id, body) { calls.push(["update", id, body]); },
       },
-      models: { async list() { return { models: [{ handle: "zai/glm-5.3-flash" }, { handle: "letta/auto-fast" }, { handle: "anthropic/claude-sonnet-5" }] }; } },
+      resumeSession(id) { return { async updateModel(m) { calls.push(["updateModel", id, m]); if (!agents.has(id)) throw new Error("no such agent"); return { modelHandle: m }; }, close() {} }; },
+      models: { async list() { return { entries: [{ handle: "zai/glm-5.3-flash", free: true }, { handle: "letta/auto-fast", free: true }, { handle: "anthropic/claude-sonnet-5" }, { handle: "anthropic/claude-sonnet-5" }] }; } },
     },
   };
 }
@@ -937,6 +938,9 @@ await check("soul: the wizard walks every step, only the user drives it, persona
   assert.match(await host.command("ensoul"), /Where does its mind live/);
   assert.match(await host.command("ensoul 1"), /Which model/);
   assert.match(await host.command("ensoul 2"), /What can it see/);
+  assert.match(await host.command("ensoul back"), /Which model/);
+  assert.match(await host.command("ensoul zai/glm-9.9-nope"), /isn't in the catalog/);
+  assert.match(await host.command("ensoul sonnet"), /What can it see/); // unique substring → picked
   assert.match(await host.command("ensoul back"), /Which model/);
   assert.match(await host.command("ensoul glm"), /What can it see/);
   assert.match(await host.command("ensoul 1"), /Who writes its persona/); // nothing → skips comment step
@@ -1008,6 +1012,8 @@ await check("soul: talk gate stops a chatty agent; user talk is ungated; both si
   assert.ok(log.some((l) => l.startsWith("you → ")), "user side not in diary");
   assert.ok(log.some((l) => l.startsWith("✦ heard:")), "reply not in diary");
   assert.match(await host.command("soul gate off"), /gate → off/);
+  assert.match(await host.command("soul model letta/auto-fast"), /model → letta\/auto-fast/);
+  assert.ok(mock.calls.some((c) => c[0] === "updateModel" && c[2] === "letta/auto-fast"), "model change must go through session.updateModel");
   assert.match(String(await talk.run({ agent, args: { text: "hi 7" } })), /heard: hi 7/);
   dispose();
 });

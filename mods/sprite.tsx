@@ -1066,6 +1066,7 @@ const DEFAULT_SOUL_MODEL = "letta/auto-fast"; // free on both backends
 
 interface SoulClient {
   createAgent(options: Record<string, unknown>): Promise<string>;
+  resumeSession(agentId: string, options?: Record<string, unknown>): any;
   prompt(message: string, agentId: string, options?: Record<string, unknown>): Promise<{ result?: string; success?: boolean }>;
   agents: {
     retrieve(agentId: string): Promise<any>;
@@ -1076,9 +1077,23 @@ interface SoulClient {
 }
 
 // Swappable so tests run without a backend (see hardening-test.mjs).
+// The SDK spawns a Letta Code app-server for local souls. Left alone it uses
+// the letta-code version bundled *with the SDK*, which can lag the host and
+// miss providers/models the host knows. Point it at the host's own entrypoint
+// so a soul sees exactly the catalog /model sees.
+function hostCliPath(): string | null {
+  const explicit = process.env.LETTA_CLI_PATH;
+  if (explicit && existsSync(explicit)) return explicit;
+  for (const candidate of [process.argv[1], process.env._]) {
+    if (typeof candidate === "string" && /letta-code[\\/].*\.(js|mjs|ts)$|[\\/]letta(\.js)?$/.test(candidate) && existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 let soulClientFactory: (backend: SoulBackend) => Promise<SoulClient> = async (backend) => {
   const mod: any = await import("@letta-ai/letta-agent-sdk");
-  return new mod.LettaAgentClient({ backend }) as SoulClient;
+  const cli = backend === "local" ? hostCliPath() : null;
+  return new mod.LettaAgentClient(cli ? { backend, appServer: { cliPath: cli } } : { backend }) as SoulClient;
 };
 export function __setSoulClientFactory(f: typeof soulClientFactory) {
   soulClientFactory = f;
@@ -4032,16 +4047,25 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         if (!word) return { output: wizardStepText(w) };
         const models = w.models ?? [];
         let pick: string | null = null;
-        if (lower === "default") pick = DEFAULT_SOUL_MODEL;
+        const forced = lower === "force" && rest[0];
+        if (forced) pick = rest[0];
+        else if (lower === "default") pick = DEFAULT_SOUL_MODEL;
         else if (/^\d+$/.test(lower)) pick = models[Number(lower) - 1] ?? null;
         else if (models.includes(args)) pick = args;
         else {
           const hits = models.filter((m) => m.toLowerCase().includes(lower));
           if (hits.length === 1) pick = hits[0];
-          else if (hits.length === 0 && args.includes("/")) pick = args; // unknown handle, but handle-shaped: trust the user
-          else { w.modelFilter = lower; return { output: wizardStepText(w) }; } // filter and show again
+          else if (hits.length > 1) { w.modelFilter = lower; return { output: wizardStepText(w) }; }
+          else if (args.includes("/")) {
+            return {
+              output: `"${args}" isn't in the catalog this mind will use (${models.length} models on ${w.backend}) — it may be a provider this runtime can't see, or a typo. Pick from the list, filter with part of a name, or, if you're sure it works:  /sprite ensoul force ${args}`,
+            };
+          } else { w.modelFilter = lower; return { output: wizardStepText(w) }; }
         }
         if (!pick) return { output: "no such number — pick from the list or type part of a handle." };
+        if (!forced && models.length && !models.includes(pick)) {
+          return { output: `"${pick}" isn't in the catalog for ${w.backend}. /sprite ensoul force ${pick} to use it anyway.` };
+        }
         w.model = pick;
         w.step = "see";
         refreshWizardPanel();
@@ -4173,7 +4197,10 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           setPose("happy", 6_000);
           const first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
           if (first) showSoulLine(sprite, "greeting", first);
-          return { output: `${sprite.name} has a mind of its own now. (${w.backend} · ${soulAgentId} · ${w.model})${first ? `\n${sprite.name}: ${first}` : ""}\n\ntalk to it: /sprite talk <text> · inspect: /sprite soul` };
+          const verdict = first
+            ? `\n${sprite.name}: ${first}`
+            : `\n⚠ its mind was created but didn't answer with ${w.model}. try another model:  /sprite soul model <handle>`;
+          return { output: `${sprite.name} has a mind of its own now. (${w.backend} · ${soulAgentId} · ${w.model})${verdict}\n\ntalk to it: /sprite talk <text> · inspect: /sprite soul` };
         } catch (error: any) {
           return { output: `couldn't create ${sprite.name}'s mind: ${String(error?.message ?? error).slice(0, 200)}\nnothing was changed. (/sprite ensoul back to adjust, or cancel)` };
         }
@@ -4234,9 +4261,19 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         if (!value) return "model <handle>";
         try {
           const client = await soulClient(soul.backend);
-          await client.agents.update(soul.agentId, { model: value });
+          const session: any = client.resumeSession(soul.agentId);
+          try {
+            await session.updateModel(value);
+          } finally {
+            session.close?.();
+          }
         } catch (e: any) { return `couldn't change its model: ${String(e?.message ?? e).slice(0, 120)}`; }
-        soul.model = value; break;
+        soul.model = value;
+        markDirty();
+        flush();
+        const line = await soulSay(sprite, `Your mind now runs on a different model (${value}). Say one line.`, { force: true });
+        if (line) showSoulLine(sprite, "mood", line);
+        return `${sprite.name}'s model → ${value}${line ? `\n${sprite.name}: ${line}` : `\n⚠ set, but it didn't answer — that model may not be available here.`}`;
       }
       default:
         return "see /sprite soul for the keys.";

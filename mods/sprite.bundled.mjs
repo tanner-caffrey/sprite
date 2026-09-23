@@ -10937,9 +10937,20 @@ function formatChangelog(sections, heading) {
 var SOUL_TALK_WINDOW_MS = 5 * 60000;
 var SOUL_LINE_MAX = 80;
 var DEFAULT_SOUL_MODEL = "letta/auto-fast";
+function hostCliPath() {
+  const explicit = process.env.LETTA_CLI_PATH;
+  if (explicit && existsSync4(explicit))
+    return explicit;
+  for (const candidate of [process.argv[1], process.env._]) {
+    if (typeof candidate === "string" && /letta-code[\\/].*\.(js|mjs|ts)$|[\\/]letta(\.js)?$/.test(candidate) && existsSync4(candidate))
+      return candidate;
+  }
+  return null;
+}
 var soulClientFactory = async (backend) => {
   const mod = await Promise.resolve().then(() => (init_dist(), exports_dist));
-  return new mod.LettaAgentClient({ backend });
+  const cli = backend === "local" ? hostCliPath() : null;
+  return new mod.LettaAgentClient(cli ? { backend, appServer: { cliPath: cli } } : { backend });
 };
 function __setSoulClientFactory(f) {
   soulClientFactory = f;
@@ -13551,7 +13562,10 @@ Reply in one line.`, { force: true });
           return { output: wizardStepText(w) };
         const models2 = w.models ?? [];
         let pick = null;
-        if (lower === "default")
+        const forced = lower === "force" && rest[0];
+        if (forced)
+          pick = rest[0];
+        else if (lower === "default")
           pick = DEFAULT_SOUL_MODEL;
         else if (/^\d+$/.test(lower))
           pick = models2[Number(lower) - 1] ?? null;
@@ -13561,15 +13575,23 @@ Reply in one line.`, { force: true });
           const hits = models2.filter((m) => m.toLowerCase().includes(lower));
           if (hits.length === 1)
             pick = hits[0];
-          else if (hits.length === 0 && args.includes("/"))
-            pick = args;
-          else {
+          else if (hits.length > 1) {
+            w.modelFilter = lower;
+            return { output: wizardStepText(w) };
+          } else if (args.includes("/")) {
+            return {
+              output: `"${args}" isn't in the catalog this mind will use (${models2.length} models on ${w.backend}) \u2014 it may be a provider this runtime can't see, or a typo. Pick from the list, filter with part of a name, or, if you're sure it works:  /sprite ensoul force ${args}`
+            };
+          } else {
             w.modelFilter = lower;
             return { output: wizardStepText(w) };
           }
         }
         if (!pick)
           return { output: "no such number \u2014 pick from the list or type part of a handle." };
+        if (!forced && models2.length && !models2.includes(pick)) {
+          return { output: `"${pick}" isn't in the catalog for ${w.backend}. /sprite ensoul force ${pick} to use it anyway.` };
+        }
         w.model = pick;
         w.step = "see";
         refreshWizardPanel();
@@ -13742,8 +13764,10 @@ ${pickLines(sprite, c).map((l) => `- ${l}`).join(`
           const first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
           if (first)
             showSoulLine(sprite, "greeting", first);
-          return { output: `${sprite.name} has a mind of its own now. (${w.backend} \xB7 ${soulAgentId} \xB7 ${w.model})${first ? `
-${sprite.name}: ${first}` : ""}
+          const verdict = first ? `
+${sprite.name}: ${first}` : `
+\u26A0 its mind was created but didn't answer with ${w.model}. try another model:  /sprite soul model <handle>`;
+          return { output: `${sprite.name} has a mind of its own now. (${w.backend} \xB7 ${soulAgentId} \xB7 ${w.model})${verdict}
 
 talk to it: /sprite talk <text> \xB7 inspect: /sprite soul` };
         } catch (error) {
@@ -13837,12 +13861,24 @@ nothing was changed. (/sprite ensoul back to adjust, or cancel)` };
           return "model <handle>";
         try {
           const client = await soulClient(soul.backend);
-          await client.agents.update(soul.agentId, { model: value });
+          const session = client.resumeSession(soul.agentId);
+          try {
+            await session.updateModel(value);
+          } finally {
+            session.close?.();
+          }
         } catch (e) {
           return `couldn't change its model: ${String(e?.message ?? e).slice(0, 120)}`;
         }
         soul.model = value;
-        break;
+        markDirty();
+        flush();
+        const line = await soulSay(sprite, `Your mind now runs on a different model (${value}). Say one line.`, { force: true });
+        if (line)
+          showSoulLine(sprite, "mood", line);
+        return `${sprite.name}'s model \u2192 ${value}${line ? `
+${sprite.name}: ${line}` : `
+\u26A0 set, but it didn't answer \u2014 that model may not be available here.`}`;
       }
       default:
         return "see /sprite soul for the keys.";
