@@ -788,4 +788,63 @@ check("breed: a hybrid child renders + speaks with its own body and voice", () =
   d2();
 });
 
+// ---------------------------------------------------------------------------
+await check("breed: the mod's genetics are bit-identical to breeding/genetics.mjs", async () => {
+  const ref = await import("./breeding/genetics.mjs");
+  const mod = (await import("./mods/sprite.tsx")).__genetics;
+  const species = ["cat", "duck", "slime", "fox", "crab", "moth", "fairy", "ghost", "dragon", "phoenix", "hauntcrab", "chimera"];
+  const temps = ["gentle", "wry", "bold", "sleepy", "odd"];
+  let n = 0;
+  for (let i = 0; i < 600; i += 1) {
+    const a = { id: `a${i}`, seed: `seed-a-${i}`, species: species[i % species.length], shiny: i % 7 === 0, temperament: temps[i % 5], generation: i % 3 };
+    const b = { id: `b${i}`, seed: `seed-b-${(i * 7) % 13}`, species: species[(i * 5) % species.length], shiny: i % 11 === 0, temperament: temps[(i * 3) % 5], generation: (i * 2) % 4 };
+    const nonce = `n${i}`;
+    const r = ref.breed(a, b, nonce);
+    const m = mod.breedSprites(a, b, nonce);
+    assert.equal(m.seed, r.seed);
+    assert.equal(m.species, r.species, `species drift at ${i}: mod ${m.species} ref ${r.species} (${a.species}×${b.species})`);
+    assert.equal(m.speciesKind, r.speciesKind);
+    assert.equal(m.shiny, r.shiny);
+    assert.equal(m.temperament, r.temperament);
+    assert.equal(m.generation, r.generation);
+    n += 1;
+  }
+  assert.equal(n, 600);
+  // hybrids breed at the legendary tier in both
+  assert.equal(mod.rarityIdx("hauntcrab"), 3);
+  assert.equal(mod.rarityIdx("chimera"), 3);
+});
+
+// ---------------------------------------------------------------------------
+check("breed: gates are transactional across windows; tool keeps its a/b boundary", () => {
+  const agent = { id: "agent-breedrace", name: "Race" };
+  const { host, dispose } = hatchFor(agent, null); host.command("name Red"); dispose();
+  const st = readState(); const c = st.collections[agent.id]; const red = c.sprites[c.activeSpriteId];
+  red.level = 12;
+  const mk = (id, name, seed) => (c.sprites[id] = { ...red, id, name, founder: undefined, seed, level: 12 });
+  mk("sprite_foxblue0000000000000000000", "Fox Blue", "fb");
+  mk("sprite_redfox00000000000000000000", "Red Fox", "rf");
+  mk("sprite_blue000000000000000000000", "Blue", "bl");
+  writeFileSync(statePath, JSON.stringify(st));
+  // structured tool args must not re-split
+  const t = makeLetta(agent, null); const dt = activate(t.letta); t.fire("conversation_open", { agentId: agent.id });
+  const out = String(t.tools.get("sprite_breed").run({ agent, args: { a: "Red Fox", b: "Blue" } }));
+  assert.match(out, /^Red Fox and Blue nuzzle/, out);
+  dt();
+  // free text with two valid readings must ask, not guess
+  const st2 = readState(); for (const sp of Object.values(st2.collections[agent.id].sprites)) { delete sp.lastBredAt; if (sp.parents) delete st2.collections[agent.id].sprites[sp.id]; }
+  st2.collections[agent.id].activeSpriteId = red.id; writeFileSync(statePath, JSON.stringify(st2));
+  const u = makeLetta(agent, null); const du = activate(u.letta); u.fire("conversation_open", { agentId: agent.id });
+  assert.match(u.command("breed Red Fox Blue"), /could mean/, u.command("breed Red Fox Blue"));
+  du();
+  // two stale windows, same parents: only one egg, one cooldown stamp
+  const a = makeLetta(agent, null); const da = activate(a.letta); a.fire("conversation_open", { agentId: agent.id });
+  const b = makeLetta(agent, null); const db = activate(b.letta); b.fire("conversation_open", { agentId: agent.id });
+  assert.match(a.command("breed 1 4"), /nuzzle/);
+  assert.match(b.command("breed 1 4"), /already waiting|already an egg|bred recently/);
+  da(); db();
+  const eggs = Object.values(readState().collections[agent.id].sprites).filter((sp) => sp.parents);
+  assert.equal(eggs.length, 1);
+});
+
 console.log(`\nSprite hardening test passed (${passed} checks).`);

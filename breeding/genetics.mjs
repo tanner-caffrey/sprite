@@ -64,9 +64,11 @@ function roll01(seed, prefix) {
   return (hashString(`${prefix}:${seed}`) % 100000) / 100000;
 }
 
+// hybrids ("special") breed at the legendary tier: rarest odds, rarest mutations
 function rarityIdx(species) {
-  const r = SPECIES_BY_ID[species]?.rarity ?? "common";
-  return RARITY_ORDER.indexOf(r);
+  const r = SPECIES_BY_ID[species]?.rarity ?? HYBRID_SPECIES[species]?.rarity ?? "common";
+  if (r === "special") return RARITY_ORDER.length - 1;
+  return Math.max(0, RARITY_ORDER.indexOf(r));
 }
 
 // rarity of ANY species id (base or hybrid); hybrids/chimera = "special"

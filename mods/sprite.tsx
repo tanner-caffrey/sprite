@@ -2083,13 +2083,16 @@ const RARITY_ORDER: Rarity[] = ["common", "uncommon", "rare", "legendary"];
 const BREED_MIN_LEVEL = 10;
 const BREED_COOLDOWN_MS = 7 * 24 * 3_600_000;
 
+// MUST match breeding/genetics.mjs exactly — recorded breedNonces replay there.
 function roll01(seed: string, salt: string): number {
-  return hashString(`${salt}:${seed}`) / 4294967296;
+  return (hashString(`${salt}:${seed}`) % 100000) / 100000;
 }
 
+// Hybrids ("special") breed at the legendary tier: rarest odds, rarest mutations.
 function rarityIdx(species: string): number {
-  const i = RARITY_ORDER.indexOf(SPECIES.find((s) => s.id === species)?.rarity ?? "common");
-  return i < 0 ? 0 : i;
+  const rarity = SPECIES.find((s) => s.id === species)?.rarity ?? "common";
+  if (rarity === "special") return RARITY_ORDER.length - 1;
+  return Math.max(0, RARITY_ORDER.indexOf(rarity));
 }
 
 // order-independent + length-prefixed so ("a","b|c") and ("a|b","c") can't collide
@@ -2351,6 +2354,10 @@ function statForTool(name: string): (typeof STAT_KEYS)[number] {
 // Keyed on the host (not the process) so genuinely separate hosts — tests, or
 // a runtime that spins several — still each get their own sprite.
 const ACTIVE_HOSTS: WeakSet<object> = ((globalThis as any)[Symbol.for("@faye/sprite:hosts")] ??= new WeakSet());
+
+// Test-only handle on the genetics so equivalence with breeding/genetics.mjs
+// can be asserted. Not part of the mod API.
+export const __genetics = { breedSprites, childFateSeed, rollSpecies, rollShiny, rollTemperament, rarityIdx };
 
 export default function activate(letta: any) {
   const guardable = Boolean(letta && typeof letta === "object");
@@ -3287,78 +3294,119 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return null;
   }
 
-  function resolveOne(collection: AgentCollectionState, query: string): SpriteState | string {
-    const found = findSprite(collection, query);
-    if (!found) return `no companion called "${query}". see /sprite list.`;
-    if ("ambiguous" in found) return describeAmbiguity(collection, found.ambiguous);
-    return found;
+  // Split a free-text "a b" into two companion queries. Every split point is
+  // tried; if more than one split resolves to a valid, distinct pair, that's
+  // ambiguous and we ask rather than guess.
+  function splitPair(collection: AgentCollectionState, argstr: string): [string, string] | string {
+    const parts = argstr.split(/\s+/).filter(Boolean);
+    if (parts.length < 2) return "usage: /sprite breed <companion> <companion>   (see /sprite list — companions from lv." + BREED_MIN_LEVEL + ")";
+    const valid: Array<[string, string, string]> = []; // [queryA, queryB, key]
+    let lastErr = "";
+    for (let cut = 1; cut < parts.length; cut += 1) {
+      const qa = parts.slice(0, cut).join(" ");
+      const qb = parts.slice(cut).join(" ");
+      const ra = findSprite(collection, qa);
+      const rb = findSprite(collection, qb);
+      if (!ra || !rb) { lastErr = `no companion called "${!ra ? qa : qb}". see /sprite list.`; continue; }
+      if ("ambiguous" in ra) { lastErr = describeAmbiguity(collection, ra.ambiguous); continue; }
+      if ("ambiguous" in rb) { lastErr = describeAmbiguity(collection, rb.ambiguous); continue; }
+      if (ra.id === rb.id) { lastErr = `${ra.name} can't breed with itself. pick two.`; continue; }
+      const key = [ra.id, rb.id].sort().join("|");
+      if (!valid.some((v) => v[2] === key)) valid.push([qa, qb, key]);
+    }
+    if (valid.length === 1) return [valid[0][0], valid[0][1]];
+    if (valid.length > 1) {
+      return `that could mean ${valid.map(([qa, qb]) => `"${qa}" + "${qb}"`).join(" or ")} — use roster numbers: /sprite breed <#> <#>`;
+    }
+    return lastErr || "couldn't tell which two companions you meant.";
+  }
+
+  // Everything is decided under the state lock against fresh disk state, so
+  // two windows can't both breed the same parents, skip a cooldown, or push
+  // past the cap — and a parent released elsewhere is seen as gone.
+  function doBreedPair(agentId: string | null, queryA: string, queryB: string): string {
+    if (!agentId) return "i can't tell which agent this is.";
+    let outcome = "";
+    let bred = false;
+    const ok = withLocalStateLock(() => {
+      const loadedNow = loadState();
+      if (loadedNow.corrupt) return false;
+      const latest = loadedNow.state;
+      const collection = latest.collections[agentId];
+      if (!collection) { outcome = "no companions yet — /sprite hatch to begin."; return true; }
+      const ra = findSprite(collection, queryA);
+      const rb = findSprite(collection, queryB);
+      if (!ra || !rb) { outcome = `no companion called "${!ra ? queryA : queryB}". see /sprite list.`; return true; }
+      if ("ambiguous" in ra) { outcome = describeAmbiguity(collection, ra.ambiguous); return true; }
+      if ("ambiguous" in rb) { outcome = describeAmbiguity(collection, rb.ambiguous); return true; }
+      const a = ra;
+      const b = rb;
+      if (a.id === b.id) { outcome = `${a.name} can't breed with itself. pick two.`; return true; }
+      const current = collection.activeSpriteId ? collection.sprites[collection.activeSpriteId] : null;
+      if (current?.phase === "egg") { outcome = "there's already an egg on the panel — let it hatch first."; return true; }
+      if (Object.values(collection.sprites).some((sp) => sp.phase === "egg")) {
+        outcome = "an egg is already waiting in the nest — let it hatch first."; return true;
+      }
+      for (const sp of [a, b]) {
+        const why = breedBlocker(sp);
+        if (why) { outcome = why; return true; }
+      }
+      if (Object.keys(collection.sprites).length >= MAX_SPRITES_PER_COLLECTION) {
+        outcome = `the nest is full (${MAX_SPRITES_PER_COLLECTION}) — release someone before breeding.`; return true;
+      }
+      let child = breedSprites(a, b);
+      let spriteId = stableId("sprite", child.seed);
+      while (collection.sprites[spriteId] || collection.released?.[spriteId]) {
+        child = breedSprites(a, b);
+        spriteId = stableId("sprite", child.seed);
+      }
+      const now = Date.now();
+      collection.sprites[spriteId] = {
+        id: spriteId,
+        seed: child.seed,
+        bornToAgentId: agentId,
+        phase: "egg",
+        parents: child.parents,
+        generation: Math.min(1000, child.generation),
+        breedNonce: child.breedNonce,
+        eggStartedAt: now,
+        pendingSpecies: child.species,
+        species: child.species,
+        shiny: child.shiny,
+        temperament: child.temperament,
+        name: `${a.name} × ${b.name}`.slice(0, 24),
+        named: false,
+        xp: 0,
+        level: 1,
+        stats: { craft: 0, wander: 0, grit: 0, lore: 0, spark: 0 },
+        settings: {},
+      };
+      a.lastBredAt = now;
+      b.lastBredAt = now;
+      collection.activeSpriteId = spriteId;
+      if (!saveState(latest)) return false;
+      reconcileInPlace(state, latest);
+      baseState = cloneState(latest);
+      bred = true;
+      outcome = `${a.name} and ${b.name} nuzzle close… an egg appears under the statusline. it's warm, and it's *new*. (gen ${child.generation})`;
+      return true;
+    });
+    if (!ok) return "couldn't reach the nest right now (state file busy or unreadable) — try again in a moment.";
+    if (bred) {
+      dirty = false;
+      queueCheckpoint(agentId, "bred");
+      setPose("happy", 4_000);
+      panel.update();
+    }
+    return outcome;
   }
 
   function doBreed(agentId: string | null, argstr: string): string {
-    if (!agentId) return "i can't tell which agent this is.";
-    const parts = argstr.split(/\s+/).filter(Boolean);
     const collection = getCollection(agentId);
-    if (!collection) return "no companions yet — /sprite hatch to begin.";
-    if (parts.length < 2) return "usage: /sprite breed <companion> <companion>   (see /sprite list — companions from lv.10)";
-    // allow multi-word names: try every split point, prefer the one that resolves both
-    let a: SpriteState | null = null;
-    let b: SpriteState | null = null;
-    let lastErr = "";
-    for (let cut = 1; cut < parts.length && !(a && b); cut += 1) {
-      const ra = resolveOne(collection, parts.slice(0, cut).join(" "));
-      const rb = resolveOne(collection, parts.slice(cut).join(" "));
-      if (typeof ra === "string") { lastErr = ra; continue; }
-      if (typeof rb === "string") { lastErr = rb; continue; }
-      a = ra; b = rb;
-    }
-    if (!a || !b) return lastErr || "couldn't tell which two companions you meant.";
-    if (a.id === b.id) return `${a.name} can't breed with itself. pick two.`;
-    const current = getSprite(agentId);
-    if (current?.phase === "egg") return "there's already an egg on the panel — let it hatch first.";
-    for (const sp of [a, b]) {
-      const why = breedBlocker(sp);
-      if (why) return why;
-    }
-    if (Object.keys(collection.sprites).length >= MAX_SPRITES_PER_COLLECTION) {
-      return `the nest is full (${MAX_SPRITES_PER_COLLECTION}) — release someone before breeding.`;
-    }
-    const child = breedSprites(a, b);
-    let spriteId = stableId("sprite", child.seed);
-    while (collection.sprites[spriteId] || collection.released?.[spriteId]) {
-      const again = breedSprites(a, b);
-      Object.assign(child, again);
-      spriteId = stableId("sprite", child.seed);
-    }
-    const egg: SpriteState = {
-      id: spriteId,
-      seed: child.seed,
-      bornToAgentId: agentId,
-      phase: "egg",
-      parents: child.parents,
-      generation: child.generation,
-      breedNonce: child.breedNonce,
-      eggStartedAt: Date.now(),
-      pendingSpecies: child.species,
-      species: child.species,
-      shiny: child.shiny,
-      temperament: child.temperament,
-      name: `${a.name} × ${b.name}`.slice(0, 24),
-      named: false,
-      xp: 0,
-      level: 1,
-      stats: { craft: 0, wander: 0, grit: 0, lore: 0, spark: 0 },
-      settings: {},
-    };
-    collection.sprites[spriteId] = egg;
-    a.lastBredAt = Date.now();
-    b.lastBredAt = Date.now();
-    collection.activeSpriteId = spriteId;
-    markDirty();
-    flush();
-    queueCheckpoint(agentId, "bred");
-    setPose("happy", 4_000);
-    panel.update();
-    return `${a.name} and ${b.name} nuzzle close… an egg appears under the statusline. it's warm, and it's *new*. (gen ${child.generation})`;
+    if (!agentId || !collection) return "no companions yet — /sprite hatch to begin.";
+    const pair = splitPair(collection, argstr);
+    if (typeof pair === "string") return pair;
+    return doBreedPair(agentId, pair[0], pair[1]);
   }
 
   function lineageLine(sprite: SpriteState, collection: AgentCollectionState | null): string {
@@ -3848,7 +3896,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         requiresApproval: false,
         parallelSafe: false,
         run(ctx: any) {
-          return doBreed(toolAgent(ctx), `${String(ctx.args?.a ?? "")} ${String(ctx.args?.b ?? "")}`);
+          return doBreedPair(toolAgent(ctx), String(ctx.args?.a ?? ""), String(ctx.args?.b ?? ""));
         },
       }),
     );
