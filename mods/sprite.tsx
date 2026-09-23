@@ -26,7 +26,7 @@
  * believes even the pets should persist. Remove: delete this file + /reload.
  */
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
@@ -818,6 +818,7 @@ interface StateLoadResult {
   // The file exists but couldn't be read/parsed. Callers must NOT save over it:
   // a truncated file is a recoverable sprite, an overwritten one is gone.
   corrupt?: boolean;
+  corruptText?: string;
 }
 
 const DEFAULT_SETTINGS: Record<string, unknown> = {
@@ -852,9 +853,11 @@ const PORTABLE_MAX_BYTES = 1_000_000;
 const PORTABLE_MAX_SPRITES = 64;
 // Hard ceilings so a checksum-valid (but hostile) backup can't feed the
 // level-up loops a number they'd spin on for the rest of the session.
-const MAX_LEVEL = 10_000;
-const MAX_STAT = 10_000_000;
 const MAX_TOTAL_XP = 1_000_000_000;
+// The highest level reachable with MAX_TOTAL_XP (so a stored level can never
+// sit above what the XP math would produce for it).
+const MAX_LEVEL = 6_324;
+const MAX_STAT = 10_000_000;
 
 function boundedNonnegative(value: unknown, max: number, fallback = 0): number {
   return Math.min(max, finiteNonnegative(value, fallback));
@@ -1028,10 +1031,11 @@ function loadState(): StateLoadResult {
     if (result.migrated) preserveLegacyState(text);
     return result;
   } catch {
-    // Malformed JSON: move the original aside so nothing can overwrite it,
-    // then report "absent" — the quarantined copy is the recoverable one.
-    if (quarantineCorruptState(text)) return { state: emptyState(), migrated: false };
-    return { state: emptyState(), migrated: false, corrupt: true };
+    // Malformed JSON. Report it; never touch the file here — loadState runs
+    // outside the lock, and the "corrupt" bytes may be another process's
+    // half-finished (or freshly completed) write. Quarantine happens under
+    // the lock in flush(), after re-reading and confirming the same bytes.
+    return { state: emptyState(), migrated: false, corrupt: true, corruptText: text };
   }
 }
 
@@ -1046,11 +1050,14 @@ function preserveLegacyState(text: string) {
   }
 }
 
-function quarantineCorruptState(text: string): boolean {
-  const path = `${STATE_PATH}.corrupt.${Date.now().toString(36)}.json`;
+// Call ONLY while holding the local state lock. Re-reads the live file and
+// moves it aside only if it still holds exactly the malformed bytes we saw.
+function quarantineCorruptState(expectedText: string): boolean {
   try {
-    writeFileSync(path, text, { flag: "wx" });
-    rmSync(STATE_PATH, { force: true }); // live path is now genuinely absent
+    const current = readFileSync(STATE_PATH, "utf-8");
+    if (current !== expectedText) return false; // someone replaced it; leave it
+    const path = `${STATE_PATH}.corrupt.${Date.now().toString(36)}.${randomBytes(3).toString("hex")}.json`;
+    renameSync(STATE_PATH, path); // atomic: the bytes move, never copied-then-deleted
     return true;
   } catch {
     return false;
@@ -1134,7 +1141,7 @@ function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: 
     }
     applyTotalXp(merged, Math.max(totalXp(local), totalXp(remote)));
     for (const key of ["craft", "wander", "grit", "lore", "spark"] as const) {
-      merged.stats[key] = Math.max(local.stats[key], remote.stats[key]);
+      merged.stats[key] = Math.min(MAX_STAT, Math.max(local.stats[key], remote.stats[key]));
     }
     merged.settings = { ...cloneState(remote.settings), ...cloneState(local.settings) };
     merged.voice = { ...cloneState(remote.voice ?? {}), ...cloneState(local.voice ?? {}) };
@@ -1167,7 +1174,7 @@ function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: 
   const localXpDelta = totalXp(local) - totalXp(base);
   applyTotalXp(merged, totalXp(remote) + localXpDelta);
   for (const key of ["craft", "wander", "grit", "lore", "spark"] as const) {
-    merged.stats[key] = Math.max(0, remote.stats[key] + (local.stats[key] - base.stats[key]));
+    merged.stats[key] = Math.min(MAX_STAT, Math.max(0, remote.stats[key] + (local.stats[key] - base.stats[key])));
   }
 
   merged.settings = mergeRecord(base.settings, local.settings, remote.settings);
@@ -1210,7 +1217,12 @@ function mergeCollection(
   remote: AgentCollectionState | undefined,
 ): AgentCollectionState {
   if (!remote) return cloneState(local);
+  const remoteGen = remote.generation ?? 0;
   if (!base) {
+    // We never saw this collection. If the remote carries a restore generation,
+    // it is authoritative: a force-restore happened while we were building our
+    // own view, and our sprites belong to a soul that was deliberately replaced.
+    if (remoteGen > 0) return cloneState(remote);
     const sprites = cloneState(remote.sprites);
     for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
       sprites[spriteId] = mergeSprite(undefined, localSprite, remote.sprites[spriteId]);
@@ -1223,7 +1235,6 @@ function mergeCollection(
       backup: mergeBackup(undefined, local.backup, remote.backup),
     };
   }
-  const remoteGen = remote.generation ?? 0;
   if (remoteGen > (base.generation ?? 0)) {
     // Remote was force-restored since we loaded. Our local view is of a soul
     // that no longer exists there — don't carry it back. Keep only XP/stat
@@ -1305,52 +1316,100 @@ function reconcileInPlace(target: any, source: any) {
   }
 }
 
-function writeLockOwner(lockPath: string) {
-  try {
-    writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }));
-  } catch {
-    // The lock directory itself remains authoritative even if metadata fails.
-  }
-}
-
 const LOCK_MAX_AGE_MS = 10 * 60_000;
 
-// true = a live owner holds it; false = owner is dead; null = unknown owner.
-// A live-looking PID is only trusted while the lock is younger than
-// LOCK_MAX_AGE_MS — PIDs get reused, and no sprite critical section takes
-// ten minutes.
-function lockOwnerIsAlive(lockPath: string): boolean | null {
+interface LockOwner {
+  pid: number;
+  acquiredAt: number;
+  token: string;
+}
+
+function readLockOwner(lockPath: string): LockOwner | null {
   try {
     const owner = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf-8"));
     if (!Number.isInteger(owner?.pid) || owner.pid <= 0) return null;
-    if (Number.isFinite(owner?.acquiredAt) && Date.now() - owner.acquiredAt > LOCK_MAX_AGE_MS) return false;
-    try {
-      process.kill(owner.pid, 0);
-      return true;
-    } catch (error: any) {
-      return error?.code === "EPERM" ? true : false;
-    }
+    // Older lock files (pre-token) still identify themselves by pid+acquiredAt.
+    const token = typeof owner?.token === "string" ? owner.token : `legacy:${owner.pid}:${owner.acquiredAt}`;
+    return { pid: owner.pid, acquiredAt: Number(owner.acquiredAt) || 0, token };
   } catch {
     return null;
   }
 }
 
-// Reclaim atomically: rename the stale lock dir to a unique name first. Only
-// the process whose rename succeeds removes it; a second reclaimer's rename
-// fails (ENOENT) and it goes back to retrying — it can never delete a lock
-// someone else has just acquired.
-function clearStaleLock(lockPath: string, maxAgeMs = LOCK_MAX_AGE_MS): boolean {
+// true = a live owner holds it; false = owner is dead or expired; null = unknown.
+// A live-looking PID is only trusted while the lock is younger than
+// LOCK_MAX_AGE_MS — PIDs get reused, and no sprite critical section takes
+// ten minutes.
+function lockOwnerIsAlive(owner: LockOwner | null): boolean | null {
+  if (!owner) return null;
+  if (Date.now() - owner.acquiredAt > LOCK_MAX_AGE_MS) return false;
   try {
-    const ownerAlive = lockOwnerIsAlive(lockPath);
-    if (ownerAlive === true) return false;
-    if (ownerAlive === null && Date.now() - statSync(lockPath).mtimeMs <= maxAgeMs) return false;
-    const graveyard = `${lockPath}.stale.${process.pid}.${Date.now().toString(36)}`;
+    process.kill(owner.pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code === "EPERM" ? true : false;
+  }
+}
+
+// Reclaim without ever touching a lock we did not inspect: rename the dir
+// aside, then confirm the moved dir still carries the exact owner token we
+// judged stale. If it doesn't, we just moved someone's fresh lock — put it back.
+function clearStaleLock(lockPath: string, maxAgeMs = LOCK_MAX_AGE_MS): boolean {
+  let graveyard: string | null = null;
+  try {
+    const owner = readLockOwner(lockPath);
+    const alive = lockOwnerIsAlive(owner);
+    if (alive === true) return false;
+    if (alive === null && Date.now() - statSync(lockPath).mtimeMs <= maxAgeMs) return false;
+    graveyard = `${lockPath}.stale.${process.pid}.${Date.now().toString(36)}.${randomBytes(4).toString("hex")}`;
     renameSync(lockPath, graveyard);
+    const moved = readLockOwner(graveyard);
+    const sameLock = owner === null ? moved === null : moved?.token === owner.token;
+    if (!sameLock) {
+      // A fresh lock replaced the stale one between inspect and rename.
+      try {
+        renameSync(graveyard, lockPath);
+      } catch {
+        rmSync(graveyard, { recursive: true, force: true });
+      }
+      return false;
+    }
     rmSync(graveyard, { recursive: true, force: true });
     return true;
   } catch {
+    if (graveyard) rmSync(graveyard, { recursive: true, force: true });
     return false;
   }
+}
+
+// mkdir-based lock with a per-acquisition token. Release only removes the lock
+// if it still carries our token, so a reclaimer that (wrongly) took it and a
+// successor that re-acquired it are never clobbered by our cleanup.
+function withDirLock<T>(lockPath: string, fn: () => T): T | null {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const token = randomBytes(8).toString("hex");
+    try {
+      mkdirSync(lockPath);
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") return null;
+      if (clearStaleLock(lockPath)) continue;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      continue;
+    }
+    try {
+      writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: process.pid, acquiredAt: Date.now(), token }));
+    } catch {
+      // The lock directory itself remains authoritative even if metadata fails.
+    }
+    try {
+      return fn();
+    } finally {
+      if (readLockOwner(lockPath)?.token === token || readLockOwner(lockPath) === null) {
+        rmSync(lockPath, { recursive: true, force: true });
+      }
+    }
+  }
+  return null;
 }
 
 function withLocalStateLock<T>(fn: () => T): T | null {
@@ -1359,22 +1418,7 @@ function withLocalStateLock<T>(fn: () => T): T | null {
   } catch {
     return null; // unwritable parent — persistence is best-effort, never throw into the session
   }
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    try {
-      mkdirSync(LOCAL_STATE_LOCK_PATH);
-      writeLockOwner(LOCAL_STATE_LOCK_PATH);
-      try {
-        return fn();
-      } finally {
-        rmSync(LOCAL_STATE_LOCK_PATH, { recursive: true, force: true });
-      }
-    } catch (error: any) {
-      if (error?.code !== "EEXIST") return null;
-      if (clearStaleLock(LOCAL_STATE_LOCK_PATH)) continue;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-    }
-  }
-  return null;
+  return withDirLock(LOCAL_STATE_LOCK_PATH, fn);
 }
 
 interface PortableCollectionV1 {
@@ -1478,18 +1522,22 @@ function parsePortableCollection(raw: string): PortableCollectionV1 | null {
   }
 }
 
-// Git env vars that can redirect the operation to a different repo/index or
-// inject config. Everything else from the parent env is dropped too; only a
-// minimal, explicit environment reaches git.
-const GIT_ENV_PASSTHROUGH = ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "SSH_AUTH_SOCK", "XDG_CONFIG_HOME"];
+// Git reads a lot of env. The dangerous class is anything that *redirects*
+// the operation (GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / GIT_OBJECT_DIRECTORY
+// / GIT_CONFIG_*) or injects config (GIT_CONFIG_COUNT/KEY/VALUE) — those are
+// dropped. Auth/transport env (SSH agent, GIT_SSH_COMMAND, askpass, proxies)
+// is passed through: this is the user's own MemFS remote and it must keep
+// working exactly as it does for the host's own pushes.
+const GIT_ENV_BLOCKLIST = /^(GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE|GIT_OBJECT_DIRECTORY|GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_NAMESPACE|GIT_CEILING_DIRECTORIES|GIT_DISCOVERY_ACROSS_FILESYSTEM|GIT_CONFIG|GIT_CONFIG_GLOBAL|GIT_CONFIG_SYSTEM|GIT_CONFIG_NOSYSTEM|GIT_CONFIG_PARAMETERS|GIT_CONFIG_COUNT|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+|GIT_EXTERNAL_DIFF|GIT_DIFF_OPTS|GIT_EDITOR|GIT_SEQUENCE_EDITOR|GIT_PAGER|GIT_EXEC_PATH|GIT_TEMPLATE_DIR)$/;
 
 function gitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
-  for (const key of GIT_ENV_PASSTHROUGH) if (process.env[key] !== undefined) env[key] = process.env[key];
-  // Refuse any repo-level config that could run a program. Not exhaustive by
-  // nature (git keeps growing), but covers the documented executable knobs.
-  env.GIT_CONFIG_COUNT = "0";
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined || GIT_ENV_BLOCKLIST.test(key)) continue;
+    env[key] = value;
+  }
   env.GIT_TERMINAL_PROMPT = "0";
+  env.GIT_PAGER = "cat";
   return env;
 }
 
@@ -1515,23 +1563,18 @@ function runGit(memoryDir: string, args: string[]): string {
       "-C", memoryDir,
       "-c", `core.hooksPath=${hooks}`,
       "-c", "core.fsmonitor=false",
-      "-c", "core.sshCommand=ssh",
-      "-c", "credential.helper=",
+      // Things a checkpoint never needs and that would otherwise run a program.
+      // Auth (credential helpers, ssh command, askpass) is deliberately left to
+      // the user's own config — this is their remote.
       "-c", "commit.gpgSign=false",
       "-c", "tag.gpgSign=false",
       "-c", "push.gpgSign=false",
       "-c", "diff.external=",
-      "-c", "gpg.program=",
       "-c", "filter.lfs.clean=",
       "-c", "filter.lfs.smudge=",
       "-c", "filter.lfs.process=",
       "-c", "filter.lfs.required=false",
-      "-c", "protocol.allow=never",
-      "-c", "protocol.https.allow=always",
-      "-c", "protocol.ssh.allow=always",
-      "-c", "protocol.file.allow=always",
-      "-c", "protocol.git.allow=always",
-      "-c", "uploadpack.allowFilter=false",
+      "-c", "protocol.http.allow=never",
       ...args,
     ],
     {
@@ -1622,23 +1665,7 @@ function portablePath(memoryDir: string): string | null {
 }
 
 function withMemfsLock<T>(memoryDir: string, fn: () => T): T | null {
-  const lockPath = join(memoryDir, ".git", "sprite-backup.lock");
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    try {
-      mkdirSync(lockPath);
-      writeLockOwner(lockPath);
-      try {
-        return fn();
-      } finally {
-        rmSync(lockPath, { recursive: true, force: true });
-      }
-    } catch (error: any) {
-      if (error?.code !== "EEXIST") return null;
-      if (clearStaleLock(lockPath)) continue;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-    }
-  }
-  return null;
+  return withDirLock(join(memoryDir, ".git", "sprite-backup.lock"), fn);
 }
 
 function checkpointPortableCollection(
@@ -1651,7 +1678,10 @@ function checkpointPortableCollection(
     return { ok: false, status: "portable backup unavailable — MemFS is not a git repository" };
   }
   const result = withMemfsLock(memoryDir, () => {
-    const dirty = runGit(memoryDir, ["status", "--porcelain"]);
+    const dirty = tryGit(memoryDir, ["status", "--porcelain"]);
+    if (dirty === null) {
+      return { ok: false, status: "portable backup blocked — MemFS git is unusable (hooks dir not empty?)" } satisfies BackupResult;
+    }
     if (dirty) {
       return { ok: false, status: "portable backup pending — MemFS has uncommitted work" } satisfies BackupResult;
     }
@@ -1913,12 +1943,8 @@ function statForTool(name: string): (typeof STAT_KEYS)[number] {
 const ACTIVE_HOSTS: WeakSet<object> = ((globalThis as any)[Symbol.for("@faye/sprite:hosts")] ??= new WeakSet());
 
 export default function activate(letta: any) {
-  // Sprites are Tamagotchi-like companions for agents, not for a specific UI.
-  // Keep tools/events available in headless channel listeners even when there is
-  // no statusline panel to render.
-  const hasPanels = Boolean(letta.capabilities.ui.panels);
-
-  if (letta && typeof letta === "object") {
+  const guardable = Boolean(letta && typeof letta === "object");
+  if (guardable) {
     if (ACTIVE_HOSTS.has(letta)) {
       try {
         letta.log?.warn?.("sprite: already active on this host — skipping duplicate activation");
@@ -1932,8 +1958,30 @@ export default function activate(letta: any) {
 
   const disposers: Array<() => void> = [];
   disposers.push(() => {
-    if (letta && typeof letta === "object") ACTIVE_HOSTS.delete(letta);
+    if (guardable) ACTIVE_HOSTS.delete(letta);
   });
+
+  try {
+    return activateInner(letta, disposers);
+  } catch (error) {
+    // Partial initialization: undo whatever registered before the throw and
+    // release the host guard so a repaired host can activate again.
+    for (const dispose of disposers.reverse()) {
+      try {
+        dispose();
+      } catch {
+        // keep unwinding
+      }
+    }
+    throw error;
+  }
+}
+
+function activateInner(letta: any, disposers: Array<() => void>) {
+  // Sprites are Tamagotchi-like companions for agents, not for a specific UI.
+  // Keep tools/events available in headless channel listeners even when there is
+  // no statusline panel to render.
+  const hasPanels = Boolean(letta.capabilities.ui.panels);
   const loaded = loadState();
   const state = loaded.state;
   let baseState = cloneState(state);
@@ -1955,8 +2003,12 @@ export default function activate(letta: any) {
   const flush = (evenIfClean = false) => {
     if (!dirty && !evenIfClean) return;
     const flushed = withLocalStateLock(() => {
-      const loadedNow = loadState();
-      // Never merge over a file we couldn't read — it's quarantined for a human.
+      let loadedNow = loadState();
+      if (loadedNow.corrupt && loadedNow.corruptText !== undefined) {
+        // Malformed JSON, seen under the lock: move it aside for a human, then
+        // proceed as if absent. Anything else unreadable (EISDIR, EACCES) stays.
+        if (quarantineCorruptState(loadedNow.corruptText)) loadedNow = loadState();
+      }
       if (loadedNow.corrupt) return false;
       const remote = loadedNow.state;
       const merged = mergeState(baseState, state, remote);
@@ -1979,7 +2031,10 @@ export default function activate(letta: any) {
   ): true | false | "exists" => {
     flush();
     const replaced = withLocalStateLock<true | false | "exists">(() => {
-      const loadedNow = loadState();
+      let loadedNow = loadState();
+      if (loadedNow.corrupt && loadedNow.corruptText !== undefined) {
+        if (quarantineCorruptState(loadedNow.corruptText)) loadedNow = loadState();
+      }
       if (loadedNow.corrupt) return false;
       const latest = loadedNow.state;
       if (!force && latest.collections[agentId]) {
@@ -2206,6 +2261,7 @@ export default function activate(letta: any) {
       activeAgentId = ctx.agent.id;
       activeAgentName = ctx.agent.name ?? activeAgentName;
       rememberMemfs(activeAgentId, ctx);
+      refreshIfUnknown(activeAgentId);
       maybeAutoRestore(activeAgentId);
     }
     return ctx?.agent?.id ?? activeAgentId;
@@ -2498,7 +2554,18 @@ export default function activate(letta: any) {
     if (id) activeAgentId = id;
     if (name) activeAgentName = name;
     rememberMemfs(id, ctx);
+    refreshIfUnknown(id);
     maybeAutoRestore(id);
+  }
+
+  // If we have no collection for this agent, another window may have created
+  // one since we loaded — re-read disk (under the lock) before treating the
+  // agent as sprite-less. Cheap, and only when we'd otherwise say "no companion".
+  const refreshedFor = new Set<string>();
+  function refreshIfUnknown(agentId: string | null) {
+    if (!agentId || getCollection(agentId) || refreshedFor.has(agentId)) return;
+    refreshedFor.add(agentId);
+    flush(true);
   }
 
   if (letta.capabilities.events.lifecycle) {
