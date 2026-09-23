@@ -2190,19 +2190,30 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   }
 
   function contextSnapshot(ctx?: any): any | null {
+    // The host hands command/tool handlers the full mod context directly (with
+    // `agent` + `memfs` on it); getContext() may return a narrower object. Take
+    // the first candidate that actually carries a memfs block, else the first
+    // one with an agent, else anything object-shaped.
     const candidates: any[] = [];
+    if (ctx && typeof ctx === "object") candidates.push(ctx);
+    if (ctx?.context) candidates.push(ctx.context);
     try {
       if (typeof ctx?.getContext === "function") candidates.push(ctx.getContext());
     } catch {
       // fall through to other scoped context sources
     }
-    if (ctx?.context) candidates.push(ctx.context);
     try {
       if (typeof letta.getContext === "function") candidates.push(letta.getContext());
     } catch {
       // older hosts do not expose dynamic context
     }
-    return candidates.find((candidate) => candidate && typeof candidate === "object") ?? null;
+    const objects = candidates.filter((c) => c && typeof c === "object");
+    return (
+      objects.find((c) => c.memfs && typeof c.memfs === "object" && c.agent?.id) ??
+      objects.find((c) => c.agent?.id) ??
+      objects[0] ??
+      null
+    );
   }
 
   function rememberMemfs(agentId: string | null, ctx?: any) {
