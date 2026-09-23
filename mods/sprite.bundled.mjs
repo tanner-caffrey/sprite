@@ -13643,7 +13643,8 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
   const soulTurnCounter = new Map;
   const soulToolCounter = new Map;
   const soulQueue = new Map;
-  function soulSessionOptions(sprite) {
+  let confinementUnavailable = false;
+  function soulSessionOptions(sprite, confined = true) {
     const soul = sprite.soul;
     return {
       tools: soulTools(sprite),
@@ -13652,7 +13653,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
       skillSources: [],
       permissionMode: "strict",
       canUseTool: async (name) => ({ behavior: ["my_stats", "my_diary", "memory"].includes(name) ? "allow" : "deny", message: "sprites only get their own memory" }),
-      ...soul.backend === "local" ? { filesystemConfinement: "memory" } : {}
+      ...soul.backend === "local" && confined && !confinementUnavailable ? { filesystemConfinement: "memory" } : {}
     };
   }
   const soulVerifiedIds = new Set;
@@ -13712,11 +13713,25 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
         const client = await soulClient(soul.backend);
         if (!await soulVerified(sprite))
           return null;
-        const session = client.resumeSession(soul.agentId, soulSessionOptions(sprite));
+        let session = client.resumeSession(soul.agentId, soulSessionOptions(sprite));
         let text = "";
         let timer;
         try {
-          await session.send(fenced(moment));
+          try {
+            await session.send(fenced(moment));
+          } catch (e) {
+            const msg = String(e?.message ?? e);
+            if (!confinementUnavailable && /confinement is unavailable/i.test(msg)) {
+              confinementUnavailable = true;
+              logEntry(sprite, "mood", "(memory sandbox unavailable on this machine \u2014 running its mind with the tool fence only)");
+              try {
+                session.close?.();
+              } catch {}
+              session = client.resumeSession(soul.agentId, soulSessionOptions(sprite, false));
+              await session.send(fenced(moment));
+            } else
+              throw e;
+          }
           const timeout = new Promise((_, reject) => {
             timer = setTimeout(() => {
               session.abort?.().catch(() => {});

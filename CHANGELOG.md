@@ -3,6 +3,12 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.9.5
+- On machines where the kernel memory sandbox isn't available, an ensouled
+  companion still speaks: its session keeps the tool fence (only its own
+  tools and memory) and notes once in the diary that the sandbox is off.
+  0.9.1–0.9.4 had gone silent there, falling back to built-in lines.
+
 ## v0.9.4
 - Cloud minds work with your existing Letta Code login. Choosing `cloud`
   runs the companion's mind through your own Letta Code against Letta

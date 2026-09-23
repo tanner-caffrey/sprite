@@ -4128,7 +4128,12 @@ function activateInner(letta: any, disposers: Array<() => void>) {
 
   // The sprite's session gets ONLY its two client tools + memory editing:
   // no harness toolset, no skills, memory-confined filesystem on local.
-  function soulSessionOptions(sprite: SpriteState): Record<string, unknown> {
+  // Kernel-level memory confinement (bwrap + user namespaces) isn't available
+  // everywhere; when it fails closed we still run the session — the tool fence
+  // (allowedTools + toolset none + canUseTool deny) is what keeps the sprite out
+  // of the filesystem, the sandbox is a second layer. Remembered per process.
+  let confinementUnavailable = false;
+  function soulSessionOptions(sprite: SpriteState, confined = true): Record<string, unknown> {
     const soul = sprite.soul!;
     return {
       tools: soulTools(sprite),
@@ -4137,7 +4142,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       skillSources: [],
       permissionMode: "strict",
       canUseTool: async (name: string) => ({ behavior: ["my_stats", "my_diary", "memory"].includes(name) ? "allow" : "deny", message: "sprites only get their own memory" }),
-      ...(soul.backend === "local" ? { filesystemConfinement: "memory" } : {}),
+      ...(soul.backend === "local" && confined && !confinementUnavailable ? { filesystemConfinement: "memory" } : {}),
     };
   }
 
@@ -4208,11 +4213,22 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         if (!(await soulVerified(sprite))) return null;
         // A session, not prompt(): so the turn can be ABORTED on timeout
         // (prompt() would keep running tools after we stopped listening).
-        const session: any = client.resumeSession(soul.agentId, soulSessionOptions(sprite));
+        let session: any = client.resumeSession(soul.agentId, soulSessionOptions(sprite));
         let text = "";
         let timer: any;
         try {
-          await session.send(fenced(moment));
+          try {
+            await session.send(fenced(moment));
+          } catch (e: any) {
+            const msg = String(e?.message ?? e);
+            if (!confinementUnavailable && /confinement is unavailable/i.test(msg)) {
+              confinementUnavailable = true;
+              logEntry(sprite, "mood", "(memory sandbox unavailable on this machine — running its mind with the tool fence only)");
+              try { session.close?.(); } catch { /* ignore */ }
+              session = client.resumeSession(soul.agentId, soulSessionOptions(sprite, false));
+              await session.send(fenced(moment));
+            } else throw e;
+          }
           const timeout = new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
               void session.abort?.().catch(() => {});
