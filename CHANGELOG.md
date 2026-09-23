@@ -3,6 +3,15 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.9.2 — a proper guide
+- `/sprite help <command>` (or `/sprite <command> help`) explains one command
+  in full: every form, every option, what you'll see. `/sprite help` is now a
+  grouped overview.
+- `GUIDE.md` in the repository: the same help, written out simply for anyone,
+  in the order you'll want it — plus how stat bars and laps work, what a
+  companion can and can't see, and the tools your agent has. It is generated
+  from the same table as the in-mod help, so the two can't disagree.
+
 ## v0.9.1 — ensoulment, hardened
 - A companion's mind runs in a confined session: only its own two tools and
   its memory, no harness tools, no skills, memory-only filesystem on local.

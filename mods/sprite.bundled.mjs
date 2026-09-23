@@ -10868,6 +10868,277 @@ var TEMPERAMENT_CORPUS = {
     pet: ["oh! contact! the good kind! the spoons are jealous.", "again. it makes the quiet taste sweeter.", "*happy hum in a key that doesn't exist*", "warm! like a number that decided to be nice!", "you touched the me-shaped part. it liked that."]
   }
 };
+var HELP = [
+  {
+    cmd: "status",
+    aliases: ["card"],
+    group: "info",
+    summary: "Show the companion on the panel: species, level, stats, mood, and the last few things it said.",
+    usage: ["/sprite", "/sprite status"],
+    details: ["This is what you get when you type /sprite alone. Stat bars wrap: when one fills it starts over and the lap count rises (see settings for how that's drawn). If the companion has a mind of its own, a `mind:` line shows where it lives and what it's cost so far."]
+  },
+  {
+    cmd: "hatch",
+    group: "start",
+    summary: "Summon an egg. It hatches after a few seconds while its agent is active.",
+    usage: ["/sprite hatch", "/sprite hatch <species>", "/sprite hatch another", "/sprite hatch another <species>"],
+    options: [
+      ["<species>", "cat, duck, slime, fox, crab, moth, fairy, ghost, dragon, phoenix. Leave it out and fate rolls one from your agent's id."],
+      ["another", "Summon one more egg when you already have a companion (up to 12). Fate rolls fresh for each."]
+    ],
+    details: [
+      "Your first companion is the founder: fate-rolled from your agent's id, and it can never be released. Every companion has a rarity (common, uncommon, rare, legendary) and a 1% chance of being shiny (\u2726).",
+      "The egg only grows while its agent is the active one, so it waits for you."
+    ],
+    examples: [["/sprite hatch ghost", "an egg appears under the statusline. it's warm. (hatching soon~)"]]
+  },
+  {
+    cmd: "name",
+    group: "care",
+    summary: "Give your companion a name.",
+    usage: ["/sprite name <name>"],
+    options: [["<name>", "Up to 24 characters. Numbers alone aren't allowed (they're used for roster positions)."]],
+    examples: [["/sprite name Poof", "Poof it is."]]
+  },
+  {
+    cmd: "pet",
+    group: "care",
+    summary: "Pet it. It always answers, even when its voice is rate-limited.",
+    usage: ["/sprite pet"],
+    details: ["If it has a mind of its own, the reply comes from the mind (the command waits for it, briefly). A built-in line in (parentheses) means the mind didn't answer in time."]
+  },
+  {
+    cmd: "molt",
+    group: "care",
+    summary: "Change its body but keep its soul: name, level, stats, voice, diary, and mind all carry over.",
+    usage: ["/sprite molt", "/sprite molt <species>"],
+    options: [["<species>", "One of the ten hatchable species. Leave it out for a random one. Hybrids (from breeding) can't be molted into."]]
+  },
+  {
+    cmd: "diary",
+    group: "info",
+    summary: "Read the last 40 things it said, oldest first, with markers for how long you were away.",
+    usage: ["/sprite diary"],
+    details: ["Lines in (parentheses) are built-in fallbacks or bookkeeping. Lines like `you \u2192 Poof: \u2026` are things said to it."]
+  },
+  {
+    cmd: "list",
+    aliases: ["roster"],
+    group: "more",
+    summary: "Show every companion you have. \u25B6 marks who's on the panel.",
+    usage: ["/sprite list"],
+    details: ["Each line shows its number, name, species, level, and tags: founder, gen N (bred), hybrid, \u2726shiny, \u2726soul (has a mind), egg."]
+  },
+  {
+    cmd: "switch",
+    aliases: ["use"],
+    group: "more",
+    summary: "Put a different companion on the panel. Only the one on the panel earns experience and speaks; the rest rest.",
+    usage: ["/sprite switch <name>", "/sprite switch <#>"],
+    options: [["<name> or <#>", "A name (or the start of one, if it's unambiguous) or the roster number from /sprite list."]],
+    details: ["You can't switch away from an egg until it hatches."]
+  },
+  {
+    cmd: "breed",
+    group: "more",
+    summary: "Two companions make an egg. The child mostly takes after a parent, sometimes mutates, rarely becomes a hybrid.",
+    usage: ["/sprite breed <a> <b>"],
+    options: [["<a> <b>", "Two different companions, by name or roster number. Each must be level 10 or more and not have bred in the last 7 days."]],
+    details: [
+      "The child's species: usually one parent's; 8% a mutation toward the rarer parent's tier; 2\u201311% a hybrid (rarer parents make it likelier). Hybrids are species that can't hatch any other way \u2014 crab \xD7 ghost gives a hauntcrab; a pairing nobody has named yet gives a chimera.",
+      "Shiny parents make shiny children likelier (8% with one, 25% with two). Temperament comes from a parent, with a 10% chance of something new. Stats start fresh. The card shows lineage (gen N, child of A and B).",
+      "The egg takes the panel. There can only be one egg at a time."
+    ],
+    examples: [["/sprite breed Poof Clawson", "Poof and Clawson nuzzle close\u2026 an egg appears under the statusline. it's warm, and it's *new*. (gen 1)"]]
+  },
+  {
+    cmd: "release",
+    group: "more",
+    summary: "Let a companion go for good.",
+    usage: ["/sprite release <name>", "/sprite release confirm:<id>", "/sprite release confirm:<id> delete-agent"],
+    options: [
+      ["<name> or <#>", "First run: shows what would be released and prints the exact confirm command, bound to that one companion."],
+      ["confirm:<id>", "Actually releases it. The id comes from the first run, so a name clash or roster shift can't release the wrong one."],
+      ["delete-agent", "If it has a mind of its own: also delete that agent. Without this, the agent is left for you to keep or remove yourself, and its id is printed."]
+    ],
+    details: ["The founder can never be released. Once released, a companion can't come back through another window or an old backup."]
+  },
+  {
+    cmd: "ensoul",
+    group: "mind",
+    summary: "Give a companion a mind of its own: its own Letta agent, with memory it keeps and dreams about.",
+    usage: ["/sprite ensoul", "/sprite ensoul <name>"],
+    details: [
+      "This hands your agent a walkthrough. It asks you, one question at a time: where the mind lives (local or cloud), which model (from the real catalog; the free letta/auto-fast is the default), what it may see of your work, when it comments, and who writes its persona (a template, your agent, or you). It shows a summary and creates the agent only after you confirm \u2014 and the creation itself asks for your approval.",
+      "Once ensouled, every line on the panel is live: greetings, pets, idle mutters, commits, errors. Built-in lines only appear in (parentheses) when the mind doesn't answer.",
+      "Its persona holds permanent facts only. Its level and stats change, so it asks for those with its own tools instead of remembering them. It never sees your agent's memory or system prompt \u2014 only what `see` allows."
+    ],
+    options: [
+      ["see nothing", "It only hears the moments you send it: pets, check-ins, level-ups, hatches. Nothing about your work. (default)"],
+      ["see events", "Tool names and whether they succeeded, how many in a row, when your agent speaks. No content, no file names."],
+      ["see tools", "Events, plus the first line of each tool's arguments (file paths, commands). None of your agent's words."],
+      ["see turns", "Everything above, plus the text of what your agent says each turn. Never its memory or system prompt."]
+    ]
+  },
+  {
+    cmd: "soul",
+    group: "mind",
+    summary: "Inspect or change an ensouled companion's mind.",
+    usage: ["/sprite soul", "/sprite soul <key> <value>", "/sprite soul persona"],
+    options: [
+      ["(no arguments)", "Where its mind lives, model, what it sees, when it comments, talk gate, dreaming, persona source, live lines so far, and a rough token cost."],
+      ["model <handle>", "Change its model. It says a line afterwards to prove the model works."],
+      ["see nothing|events|tools|turns", "What it may see of your agent's work. Applies immediately, even to lines already waiting to be sent."],
+      ["comment turn", "Comment after every turn your agent takes (default)."],
+      ["comment turns <n>", "Comment every N turns."],
+      ["comment tools <n>", "Comment every N tool calls."],
+      ["rate <minutes>", "At most one comment per N minutes. 0 = no limit (default)."],
+      ["gate <n>", "How many messages your agent may send it per 5 minutes (default 5). Stops a chatty agent from talking to it forever."],
+      ["gate off", "No limit on agent messages."],
+      ["dreaming off|step-count|compaction-event", "When its own memory consolidates."],
+      ["persona", "Rewrite its persona. Your agent walks you through it (template, agent-written, or yours) and applies it after you confirm. Its voice, diary, and bond memory are untouched."]
+    ],
+    details: ["Every change is checked against the agent's tags first: the mod only ever touches an agent that is really this companion's."]
+  },
+  {
+    cmd: "talk",
+    group: "mind",
+    summary: "Say something to an ensouled companion and hear what it says back.",
+    usage: ["/sprite talk <text>"],
+    details: ["You can always talk to it. Your agent can too (the sprite_talk tool), a limited number of times per 5 minutes (see `soul gate`), and only if `see` isn't `nothing`. Both sides show on the panel and in the diary."],
+    examples: [["/sprite talk are you there?", "Poof: still here. always am."]]
+  },
+  {
+    cmd: "backup",
+    group: "keep",
+    summary: "Save your companions into your agent's memory repository so they survive a move to a new machine.",
+    usage: ["/sprite backup", "/sprite backup on", "/sprite backup off", "/sprite backup now", "/sprite backup push safe|never", "/sprite backup restore", "/sprite backup restore force"],
+    options: [
+      ["(no arguments)", "Show whether backup is on and when it last saved."],
+      ["on", "Save a checkpoint at milestones: hatch, name, molt, level-up, voice changes, ensoul, breed, and clean shutdown. Off by default; nothing is written until you turn it on."],
+      ["off", "Stop saving checkpoints. Existing ones stay."],
+      ["now", "Save a checkpoint right now."],
+      ["push safe", "Push checkpoints to your memory's remote only when nothing unrelated is waiting to be pushed \u2014 a checkpoint never carries your agent's other memory with it. (default)"],
+      ["push never", "Commit locally only; your agent pushes whenever it normally would."],
+      ["restore", "On a fresh installation with no local companions, bring them back from the backup."],
+      ["restore force", "Replace the current companions with the backup. Deliberate and irreversible."]
+    ],
+    details: ["The checkpoint is one JSON file under `data/mods/letta-ai-sprite/` in the memory repository; it's excluded from your agent's prompt. An ensouled companion's mind is its own agent and isn't inside the checkpoint \u2014 only a pointer to it."]
+  },
+  {
+    cmd: "settings",
+    group: "tune",
+    summary: "Show or change how the companion behaves and looks.",
+    usage: ["/sprite settings", "/sprite settings <key> <value>", "/sprite settings global <key> <value>"],
+    options: [
+      ["voice on|off", "Whether it speaks at all. Off also silences a mind of its own."],
+      ["voiceRateMin <minutes>", "At most one built-in line per N minutes (default 10). Petting ignores this."],
+      ["visible on|off", "Show or hide the panel row."],
+      ["laps count|odometer|belt|pips", "How a wrapped stat bar shows its lap count: \xD73 after the bar; \u27E83\u27E9 before it; each lap a heavier glyph; one dot per lap."],
+      ["hue on|off", "Colour stat bars by age: grey \u2192 white \u2192 gold \u2192 rose \u2192 violet \u2192 teal \u2192 shimmer."],
+      ["bars on|off", "Also show a compact stat strip on the panel row when it isn't speaking."]
+    ],
+    details: ["A setting for this companion overrides the global default. Use `global` to change the default for all of them."]
+  },
+  {
+    cmd: "changelog",
+    aliases: ["whatsnew", "version"],
+    group: "info",
+    summary: "What changed since the version you last ran.",
+    usage: ["/sprite changelog", "/sprite changelog all"],
+    options: [["all", "The whole history."]],
+    details: ["After an update, your companion notes it once in its diary and the card nudges until you've read this."]
+  },
+  {
+    cmd: "help",
+    group: "info",
+    summary: "This overview, or the details of one subcommand.",
+    usage: ["/sprite help", "/sprite help <subcommand>", "/sprite <subcommand> help"]
+  }
+];
+var HELP_GROUPS = [
+  ["start", "Getting a companion"],
+  ["care", "Caring for it"],
+  ["info", "Looking at it"],
+  ["more", "More than one"],
+  ["mind", "A mind of its own"],
+  ["keep", "Keeping it safe"],
+  ["tune", "Settings"]
+];
+function wrapText(text, width) {
+  const words = text.split(/\s+/);
+  const lines = [];
+  let cur = "";
+  for (const w of words) {
+    if (cur && cur.length + 1 + w.length > width) {
+      lines.push(cur);
+      cur = w;
+    } else
+      cur = cur ? `${cur} ${w}` : w;
+  }
+  if (cur)
+    lines.push(cur);
+  return lines;
+}
+function helpFor(name) {
+  const n = name.toLowerCase();
+  return HELP.find((h) => h.cmd === n || h.aliases?.includes(n));
+}
+function renderHelpEntry(h) {
+  const out = [];
+  out.push(`/sprite ${h.cmd}${h.aliases?.length ? `  (also: ${h.aliases.join(", ")})` : ""}`);
+  out.push(`  ${h.summary}`);
+  out.push("", "  usage:");
+  for (const u of h.usage)
+    out.push(`    ${u}`);
+  if (h.options?.length) {
+    out.push("", "  options:");
+    const w = Math.max(...h.options.map(([o]) => o.length)) + 2;
+    for (const [o, d] of h.options) {
+      const lines = wrapText(d, Math.max(30, 96 - w - 4));
+      out.push(`    ${o.padEnd(w)}${lines[0]}`);
+      for (const l of lines.slice(1))
+        out.push(`    ${" ".repeat(w)}${l}`);
+    }
+  }
+  if (h.details?.length) {
+    for (const d of h.details) {
+      out.push("");
+      for (const l of wrapText(d, 92))
+        out.push(`  ${l}`);
+    }
+  }
+  if (h.examples?.length) {
+    out.push("", "  example:");
+    for (const [c, r] of h.examples)
+      out.push(`    > ${c}`, `    ${r}`);
+  }
+  return out.join(`
+`);
+}
+function renderHelpOverview() {
+  const out = ["/sprite \u2014 a tiny companion that lives with your agent", ""];
+  const w = Math.max(...HELP.map((h) => h.cmd.length)) + 2;
+  for (const [g, title] of HELP_GROUPS) {
+    const entries = HELP.filter((h) => h.group === g);
+    if (!entries.length)
+      continue;
+    out.push(`${title}`);
+    for (const h of entries)
+      out.push(`  /sprite ${h.cmd.padEnd(w)}${h.summary}`);
+    out.push("");
+  }
+  out.push("Details for any of them:  /sprite help <subcommand>   (or /sprite <subcommand> help)");
+  out.push("");
+  out.push("Your agent can also care for its companions with tools: sprite_hatch, sprite_list,");
+  out.push("sprite_switch, sprite_breed, sprite_name, sprite_molt, sprite_pet, sprite_status,");
+  out.push("sprite_set_voice, sprite_talk, sprite_models, sprite_ensoul, sprite_soul_persona.");
+  out.push("");
+  out.push("Experience comes from real work \u2014 tool calls, turns, and conversations \u2014 and");
+  out.push("costs no tokens. A companion with a mind of its own does use tokens; /sprite soul shows how many.");
+  return out.join(`
+`);
+}
 var DEFAULT_SETTINGS = {
   voice: "on",
   voiceRateMin: 10,
@@ -14226,102 +14497,12 @@ ${recent.join(`
     }
     return "usage: /sprite backup [status|on|off|now|push safe|push never|restore|restore force]";
   }
-  function doHelp() {
-    return [
-      "/sprite \u2014 a tiny companion that lives with your agent",
-      "",
-      "  /sprite                        Show the status card: species, level, stats, mood,",
-      "                                 and the last few things it said.",
-      "  /sprite status | card          Same as /sprite.",
-      "",
-      "  /sprite hatch [species]        Summon your first egg. Fate picks the species from",
-      "                                 your agent ID unless you name one yourself.",
-      "                                 Species: " + SPECIES_IDS.join(", ") + ".",
-      "                                 The egg only grows while its agent is active.",
-      "                                 Your first companion is the founder: fate-rolled",
-      "                                 from you, and it can never be released.",
-      "  /sprite hatch another [species]",
-      "                                 Summon one more egg (up to " + MAX_SPRITES_PER_COLLECTION + " companions).",
-      "                                 Fate rolls fresh for each one.",
-      "  /sprite list                   Show every companion. \u25B6 marks who's on the panel.",
-      "  /sprite switch <name|#>        Put a different companion on the panel. Only the",
-      "                                 one on the panel earns experience and speaks;",
-      "                                 the others rest, and remember everything.",
-      "  /sprite breed <a> <b>          Two companions (each lv." + BREED_MIN_LEVEL + "+, once a week) make an",
-      "                                 egg. The child mostly takes after one parent,",
-      "                                 sometimes mutates, and rarely becomes a hybrid \u2014",
-      "                                 a species that can't hatch any other way.",
-      "                                 Shiny parents make shiny children likelier.",
-      "  /sprite release <name|#>       Let a companion go for good. Prints a confirm",
-      "                                 command bound to that exact companion. Founders",
-      "                                 can't be released.",
-      "  /sprite name <name>            Give your companion a name (up to 24 characters).",
-      "  /sprite molt [species]         Change its body but keep its soul: name, level,",
-      "                                 stats, voice, and diary all carry over. Picks a",
-      "                                 random species if you don't name one.",
-      "  /sprite pet                    Pet it. It always replies, even when its voice is",
-      "                                 otherwise rate-limited.",
-      "  /sprite diary                  Read the last 40 things it said, oldest first, with",
-      "                                 markers showing how long you were away.",
-      "",
-      "  /sprite settings               Show the current settings. A setting made for this",
-      "                                 sprite overrides the global default.",
-      "  /sprite settings <key> <value> Change a setting for this sprite.",
-      "  /sprite settings global <key> <value>",
-      "                                 Change the default for every sprite.",
-      "                                 Keys: voice on|off, voiceRateMin <minutes>,",
-      "                                 visible on|off, laps count|odometer|belt|pips,",
-      "                                 hue on|off, bars on|off.",
-      "",
-      "  Stat bars wrap: when a bar fills it starts over and the lap count goes up.",
-      "  `laps` picks how that count is drawn \u2014 count (\xD73 after the bar), odometer",
-      "  (\u27E83\u27E9 before it), belt (each lap fills with a heavier glyph), or pips (one",
-      "  dot per lap). `hue` colours bars by age (grey \u2192 white \u2192 gold \u2192 rose \u2192 violet",
-      "  \u2192 teal \u2192 shimmer). `bars` also shows a compact stat strip on the panel row.",
-      "",
-      "  /sprite backup                 Show the portable backup status. Backup is off",
-      "                                 by default and never runs until you turn it on.",
-      "  /sprite backup on|off          Turn portable backup on or off. When on, the",
-      "                                 companion is saved into this agent's memory",
-      "                                 repository at milestones (hatch, name, molt,",
-      "                                 level-up, voice changes, clean shutdown).",
-      "  /sprite backup now             Save a checkpoint right now.",
-      "  /sprite backup push safe|never Choose how checkpoints reach the remote:",
-      "                                 safe  \u2014 push only when no unrelated memory",
-      "                                         changes are waiting (the default).",
-      "                                 never \u2014 commit locally only; the host pushes",
-      "                                         whenever it normally would.",
-      "  /sprite backup restore         Bring a companion back from its backup on a fresh",
-      "                                 installation. Only works when no local companion",
-      "                                 exists yet.",
-      "  /sprite backup restore force   Replace the current companion with the backup.",
-      "                                 Deliberate and irreversible.",
-      "",
-      "  /sprite ensoul [name]          Give a companion a mind of its own: its own Letta",
-      "                                 agent, with memory and dreaming. Your agent walks",
-      "                                 you through it \u2014 where it lives (local or cloud),",
-      "                                 which model, what it may see of your work (nothing,",
-      "                                 by default), when it comments, and who writes its",
-      "                                 persona (a template, your agent, or you).",
-      "  /sprite soul [key value]       Inspect or change an ensouled companion's settings,",
-      "                                 including a rough token cost. `/sprite soul persona`",
-      "                                 rewrites its persona (template, your agent, or you).",
-      "  /sprite talk <text>            Say something to it and hear what it says back.",
-      "                                 Your agent can too (sprite_talk), a few times per",
-      "                                 five minutes.",
-      "  /sprite changelog [all]        What changed since the version you last ran",
-      "                                 (or the whole history with `all`).",
-      "  /sprite help                   Show this message.",
-      "",
-      "Your agent can also care for its companion directly with these tools:",
-      "  sprite_hatch, sprite_list, sprite_switch, sprite_breed, sprite_talk, sprite_ensoul, sprite_soul_persona,",
-      "  sprite_models, sprite_name, sprite_molt, sprite_pet,",
-      "  sprite_status, sprite_set_voice.",
-      "",
-      "Experience comes from real work \u2014 tool calls, turns, and conversations \u2014 and",
-      "costs no tokens."
-    ].join(`
-`);
+  function doHelp(topic) {
+    if (topic) {
+      const h = helpFor(topic);
+      return h ? renderHelpEntry(h) : `no help for "${topic}". subcommands: ${HELP.map((x2) => x2.cmd).join(", ")}`;
+    }
+    return renderHelpOverview();
   }
   if (letta.capabilities.commands) {
     disposers.push(letta.commands.register({
@@ -14337,6 +14518,9 @@ ${recent.join(`
         if (agentId)
           activeAgentId = agentId;
         let output;
+        if (rest[0] && /^(help|-h|--help|\?)$/i.test(rest[0]) && sub && helpFor(sub)) {
+          return { type: "output", output: doHelp(sub) };
+        }
         switch ((sub ?? "").toLowerCase()) {
           case "":
           case "status":
@@ -14428,7 +14612,7 @@ ${recent.join(`
           case "-h":
           case "--help":
           case "?":
-            output = doHelp();
+            output = doHelp(rest[0]);
             break;
           default:
             output = `Unknown subcommand "${sub}". Run /sprite help to see what is available.`;
@@ -14729,7 +14913,10 @@ ${list.slice(0, 80).join(`
   };
 }
 export {
+  renderHelpOverview,
+  renderHelpEntry,
   activate as default,
   __setSoulClientFactory,
-  __genetics
+  __genetics,
+  HELP
 };

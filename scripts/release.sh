@@ -10,6 +10,7 @@ version="${1:?version, e.g. 0.8.7}"
 msg="${2:?commit message (text, or a path to a file)}"
 install=1; [[ "${3:-}" == "--no-install" ]] && install=0
 
+bun run guide >/dev/null
 bun run build >/dev/null
 bun run test >/tmp/sprite-release-test.log 2>&1 || { echo "TESTS FAILED — not releasing:"; tail -20 /tmp/sprite-release-test.log; exit 1; }
 grep -E "passed|ALL PASS" /tmp/sprite-release-test.log

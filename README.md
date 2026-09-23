@@ -22,6 +22,8 @@ something small.
 It costs **zero tokens**. Everything is derived passively from lifecycle
 events — no tool calls, no extra turns.
 
+**New here?** Read [the guide](GUIDE.md) — every command explained simply — or type `/sprite help`.
+
 ## Install
 
 ```

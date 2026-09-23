@@ -1303,4 +1303,27 @@ await check("soul: sprite_ensoul and sprite_soul_persona require approval; soul 
   dispose();
 });
 
+// ---------------------------------------------------------------------------
+await check("help: every subcommand has an entry, `<sub> help` works, GUIDE.md is generated from the same table", async () => {
+  const { HELP } = await import("./mods/sprite.tsx");
+  const src = readFileSync(join(import.meta.dirname, "mods", "sprite.tsx"), "utf-8");
+  const dispatched = new Set([...src.matchAll(/^\s{12}case "([a-z-]+)":/gm)].map((m) => m[1]).filter((c) => !["-h", "--help"].includes(c)));
+  const helped = new Set(HELP.flatMap((h) => [h.cmd, ...(h.aliases ?? [])]));
+  for (const c of dispatched) if (!helped.has(c) && c !== "?") assert.fail(`dispatched subcommand "${c}" has no help entry`);
+  for (const c of helped) if (!dispatched.has(c)) assert.fail(`help entry "${c}" is not dispatched`);
+  const agent = { id: "agent-help", name: "Help" };
+  seedAlive(agent.id);
+  const host = makeLetta(agent, null); const d = activate(host.letta);
+  assert.match(host.command("help"), /Getting a companion[\s\S]*A mind of its own/);
+  assert.match(host.command("soul help"), /^\/sprite soul\n/);
+  assert.match(host.command("help backup"), /push safe/);
+  assert.match(host.command("backup --help"), /restore force/);
+  assert.match(host.command("help nope"), /no help for "nope"/);
+  d();
+  const guide = readFileSync(join(import.meta.dirname, "GUIDE.md"), "utf-8");
+  for (const h of HELP) assert.ok(guide.includes(`### /sprite ${h.cmd}`), `GUIDE.md missing ${h.cmd} — run bun run guide`);
+  const { statSync } = await import("node:fs");
+  assert.ok(statSync(join(import.meta.dirname, "GUIDE.md")).mtimeMs >= statSync(join(import.meta.dirname, "mods", "sprite.tsx")).mtimeMs - 5_000, "GUIDE.md is older than the help table — run bun run guide");
+});
+
 console.log(`\nSprite hardening test passed (${passed} checks).`);
