@@ -1375,34 +1375,17 @@ interface SoulClient {
 // CLI login is used, and no LETTA_API_KEY has to be set anywhere. The SDK's
 // native `backend: "cloud"` client only reads LETTA_API_KEY, which is why we
 // don't use it.
-// The CLI keeps the Letta Cloud login in the OS keyring, and on Linux it only
-// opens the keyring when DBUS_SESSION_BUS_ADDRESS is set. A TUI launched from
-// a service or a bare shell often lacks it, and the spawned app-server
-// inherits that — so `createAgent` on cloud fails with "Missing
-// LETTA_API_KEY" while a logged-in user watches. Find the session bus.
-function ensureSessionBus(): void {
-  if (process.platform !== "linux" || process.env.DBUS_SESSION_BUS_ADDRESS?.trim()) return;
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  const candidates = [
-    process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, "bus") : null,
-    uid !== null ? `/run/user/${uid}/bus` : null,
-  ].filter((p): p is string => Boolean(p));
-  for (const bus of candidates) {
-    if (existsSync(bus)) {
-      process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${bus}`;
-      soulSetBus = true;
-      return;
-    }
-  }
-}
-let soulSetBus = false;
-
+// The CLI keeps the Letta Cloud login in the OS keyring. On Linux it only
+// opens the keyring when DBUS_SESSION_BUS_ADDRESS is set, so a Letta Code
+// started from a service or a bare shell can't create cloud agents. The mod
+// does NOT go looking for the session bus itself — if someone runs without
+// one, that may be deliberate. It explains what to do instead (see the
+// createAgent error hint).
 let soulClientFactory: (backend: SoulBackend) => Promise<SoulClient> = async (backend) => {
   if (!process.env.LETTA_CLI_PATH) {
     const bin = process.env.LETTA_CODE_BIN;
     if (bin && existsSync(bin)) { process.env.LETTA_CLI_PATH = bin; soulSetCliPath = true; }
   }
-  if (backend === "cloud") ensureSessionBus();
   const mod: any = await import("@letta-ai/letta-agent-sdk");
   return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: backend === "cloud" ? "api" : "local" } }) as SoulClient;
 };
@@ -1422,7 +1405,7 @@ async function closeSoulClients() {
   }
   soulClients.clear();
   if (soulSetCliPath) { delete process.env.LETTA_CLI_PATH; soulSetCliPath = false; }
-  if (soulSetBus) { delete process.env.DBUS_SESSION_BUS_ADDRESS; soulSetBus = false; }
+
 }
 function soulClient(backend: SoulBackend): Promise<SoulClient> {
   let c = soulClients.get(backend);
@@ -4604,7 +4587,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       unreserve();
       const msg = String(error?.message ?? error).slice(0, 200);
       const hint = /Missing LETTA_API_KEY/.test(msg) && backend === "cloud"
-        ? "\nThis Letta Code can't reach the login keyring from here (no session bus). Start Letta Code from a desktop session, or set LETTA_API_KEY in its environment."
+        ? (process.platform === "linux" && !process.env.DBUS_SESSION_BUS_ADDRESS
+          ? "\nThis Letta Code was started without access to the login keyring (no D-Bus session bus). Start it from a desktop session, or launch it with  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus  — or set LETTA_API_KEY in its environment. Nothing was created."
+          : "\nThis machine isn't logged in to Letta Cloud from here. Run `letta --backend cloud agents list` to check, or set LETTA_API_KEY. Nothing was created.")
         : "";
       return `couldn't create ${sprite.name}'s mind: ${msg}${hint}\nnothing was changed.`;
     }

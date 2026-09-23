@@ -11234,23 +11234,6 @@ function quoteObs(text) {
 }
 var SOUL_LINE_MAX = 80;
 var DEFAULT_SOUL_MODEL = "letta/auto-fast";
-function ensureSessionBus() {
-  if (process.platform !== "linux" || process.env.DBUS_SESSION_BUS_ADDRESS?.trim())
-    return;
-  const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  const candidates = [
-    process.env.XDG_RUNTIME_DIR ? join6(process.env.XDG_RUNTIME_DIR, "bus") : null,
-    uid !== null ? `/run/user/${uid}/bus` : null
-  ].filter((p) => Boolean(p));
-  for (const bus of candidates) {
-    if (existsSync4(bus)) {
-      process.env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${bus}`;
-      soulSetBus = true;
-      return;
-    }
-  }
-}
-var soulSetBus = false;
 var soulClientFactory = async (backend) => {
   if (!process.env.LETTA_CLI_PATH) {
     const bin = process.env.LETTA_CODE_BIN;
@@ -11259,8 +11242,6 @@ var soulClientFactory = async (backend) => {
       soulSetCliPath = true;
     }
   }
-  if (backend === "cloud")
-    ensureSessionBus();
   const mod = await Promise.resolve().then(() => (init_dist(), exports_dist));
   return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: backend === "cloud" ? "api" : "local" } });
 };
@@ -11282,10 +11263,6 @@ async function closeSoulClients() {
   if (soulSetCliPath) {
     delete process.env.LETTA_CLI_PATH;
     soulSetCliPath = false;
-  }
-  if (soulSetBus) {
-    delete process.env.DBUS_SESSION_BUS_ADDRESS;
-    soulSetBus = false;
   }
 }
 function soulClient(backend) {
@@ -14139,8 +14116,8 @@ talk to it: /sprite talk <text> \xB7 inspect: /sprite soul`;
     } catch (error) {
       unreserve();
       const msg = String(error?.message ?? error).slice(0, 200);
-      const hint = /Missing LETTA_API_KEY/.test(msg) && backend === "cloud" ? `
-This Letta Code can't reach the login keyring from here (no session bus). Start Letta Code from a desktop session, or set LETTA_API_KEY in its environment.` : "";
+      const hint = /Missing LETTA_API_KEY/.test(msg) && backend === "cloud" ? process.platform === "linux" && !process.env.DBUS_SESSION_BUS_ADDRESS ? `
+This Letta Code was started without access to the login keyring (no D-Bus session bus). Start it from a desktop session, or launch it with  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus  \u2014 or set LETTA_API_KEY in its environment. Nothing was created.` : "\nThis machine isn't logged in to Letta Cloud from here. Run `letta --backend cloud agents list` to check, or set LETTA_API_KEY. Nothing was created." : "";
       return `couldn't create ${sprite.name}'s mind: ${msg}${hint}
 nothing was changed.`;
     }
