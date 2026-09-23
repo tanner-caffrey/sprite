@@ -13654,7 +13654,7 @@ Reply in one line.`, { force: true });
             personaTemplate(sprite, owner, wizardParentNames(sprite, collection)),
             "```",
             "",
-            "After you reply, the user will run /sprite ensoul persona-done."
+            "After you reply, the user will run /sprite ensoul persona-done to continue."
           ].join(`
 `);
           return { output: wizardStepText(w), prompt: prompt2 };
@@ -14242,7 +14242,7 @@ ${recent.join(`
           case "release":
             return doRelease(agentId, restStr).then((o) => ({ type: "output", output: o }));
           case "ensoul":
-            return doEnsoul(agentId, agentName, restStr, ctx).then((r) => r.prompt ? { type: "prompt", prompt: r.prompt, output: r.output } : { type: "output", output: r.output });
+            return doEnsoul(agentId, agentName, restStr, ctx).then((r) => r.prompt ? { type: "prompt", content: r.prompt } : { type: "output", output: r.output });
           case "soul":
             return doSoul(agentId, restStr).then((o) => ({ type: "output", output: o }));
           case "talk": {

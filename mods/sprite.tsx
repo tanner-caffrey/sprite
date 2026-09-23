@@ -4103,7 +4103,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
             `- temperament: ${TEMPERAMENT_CARDS[sprite.temperament ?? "odd"]}`,
             "", "Things it has said recently:", diary,
             "", "For reference, the template persona it would otherwise get:", "```", personaTemplate(sprite, owner, wizardParentNames(sprite, collection)), "```",
-            "", "After you reply, the user will run /sprite ensoul persona-done.",
+            "", "After you reply, the user will run /sprite ensoul persona-done to continue.",
           ].join("\n");
           return { output: wizardStepText(w), prompt };
         }
@@ -4651,7 +4651,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
               return doRelease(agentId, restStr).then((o) => ({ type: "output", output: o }));
             case "ensoul":
               return doEnsoul(agentId, agentName, restStr, ctx).then((r) =>
-                r.prompt ? { type: "prompt", prompt: r.prompt, output: r.output } : { type: "output", output: r.output },
+                r.prompt ? { type: "prompt", content: r.prompt } : { type: "output", output: r.output },
               );
             case "soul":
               return doSoul(agentId, restStr).then((o) => ({ type: "output", output: o }));

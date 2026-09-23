@@ -1100,10 +1100,10 @@ await check("soul: agent-written persona prompts the owner agent, then persona-d
   for (const step of ["", "1", "default", "nothing"]) await host.command(`ensoul ${step}`.trim());
   const raw = await host.raw("ensoul agent");
   assert.equal(raw.type, "prompt");
-  assert.match(raw.prompt, /write the persona for your companion sprite \*\*Poof\*\*/);
-  assert.match(raw.prompt, /permanent facts only/i);
-  assert.match(raw.prompt, /they\/them/);
-  assert.match(raw.output, /Waiting for your agent/);
+  assert.equal(typeof raw.content, "string", "prompt results carry `content`");
+  assert.match(raw.content, /write the persona for your companion sprite \*\*Poof\*\*/);
+  assert.match(raw.content, /permanent facts only/i);
+  assert.match(raw.content, /they\/them/);
   host.history.push({ role: "assistant", content: "You are Poof, a ghost who announces their agent's wakings and felt the page turn." });
   assert.match(await host.command("ensoul persona-done"), /announces their agent's wakings/);
   const done = await host.command("ensoul confirm");
