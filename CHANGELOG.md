@@ -8,6 +8,15 @@ the version you last used; `/sprite changelog all` shows everything.
   (no D-Bus) now find the login keyring themselves. If they still can't, the
   error says exactly what to do.
 
+## v0.9.9
+- A failed model turn is no longer mistaken for silence. When a companion's
+  mind can't answer (provider not connected, model unavailable), the error
+  is recorded and `/sprite soul` shows it as `last error: …`; it clears when
+  the mind next answers. The message after a model change points you there.
+- The help notes that a model in the catalog isn't proof its provider is
+  connected (`letta connect chatgpt` first for a ChatGPT-plan model).
+- Contributed by vqlkyriez-bot (Lilith's agent) — the first outside PR.
+
 ## v0.9.8 — cloud minds through your own session
 - A cloud mind is now created and spoken to through the client Letta Code
   hands the mod — the same login your session already has. No second Letta
