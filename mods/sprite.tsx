@@ -1369,13 +1369,19 @@ interface SoulClient {
 // it would run the letta-code version bundled *with the SDK*, which can lag
 // the host and miss providers; the host exports LETTA_CODE_BIN, and the SDK's
 // resolver honors LETTA_CLI_PATH first — so hand one to the other.
+// Both backends go through the host's own Letta Code app-server (spawned by
+// the SDK). "local" runs it against the in-process local backend; "cloud"
+// runs it against Letta Cloud (harnessBackend "api") — so the user's existing
+// CLI login is used, and no LETTA_API_KEY has to be set anywhere. The SDK's
+// native `backend: "cloud"` client only reads LETTA_API_KEY, which is why we
+// don't use it.
 let soulClientFactory: (backend: SoulBackend) => Promise<SoulClient> = async (backend) => {
-  if (backend === "local" && !process.env.LETTA_CLI_PATH) {
+  if (!process.env.LETTA_CLI_PATH) {
     const bin = process.env.LETTA_CODE_BIN;
     if (bin && existsSync(bin)) { process.env.LETTA_CLI_PATH = bin; soulSetCliPath = true; }
   }
   const mod: any = await import("@letta-ai/letta-agent-sdk");
-  return new mod.LettaAgentClient({ backend }) as SoulClient;
+  return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: backend === "cloud" ? "api" : "local" } }) as SoulClient;
 };
 export function __setSoulClientFactory(f: typeof soulClientFactory) {
   soulClientFactory = f;
@@ -4365,7 +4371,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   ];
 
   // Deduped handles, featured/free first, then the rest alphabetically.
+  let lastCatalogError = "";
   async function listSoulModels(backend: SoulBackend): Promise<string[]> {
+    lastCatalogError = "";
     try {
       const client = await soulClient(backend);
       const res: any = await client.models.list();
@@ -4380,7 +4388,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       const rank = (m: any) => (m.isFeatured || m.free ? 0 : 1);
       uniq.sort((a, b) => rank(a) - rank(b) || String(a.handle ?? a.id).localeCompare(String(b.handle ?? b.id)));
       return uniq.map((m) => String(m.handle ?? m.id));
-    } catch {
+    } catch (e: any) {
+      lastCatalogError = String(e?.message ?? e).slice(0, 200);
       return [];
     }
   }
@@ -4453,7 +4462,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     const model = (args.model ?? DEFAULT_SOUL_MODEL).trim();
     const catalog = await listSoulModels(backend);
     if (!catalog.length) {
-      return `couldn't read the ${backend} model catalog${backend === "cloud" ? " — are you logged in to Letta Cloud?" : ""}. not creating anything.`;
+      return `couldn't read the ${backend} model catalog${backend === "cloud" ? " — is this machine logged in to Letta Cloud? (run \`letta --backend cloud agents list\` to check)" : ""}. not creating anything.`;
     }
     if (!catalog.includes(model)) {
       return `"${model}" isn't in the ${backend} catalog (${catalog.length} models). call sprite_models to see it, and pick one of those.`;
@@ -5124,7 +5133,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           const all = await listSoulModels(backend);
           const f = String(ctx.args?.filter ?? "").toLowerCase();
           const list = f ? all.filter((m) => m.toLowerCase().includes(f)) : all;
-          if (!list.length) return all.length ? `no ${backend} models match "${f}" (${all.length} available)` : `couldn't list ${backend} models (is the backend reachable / are you logged in?)`;
+          if (!list.length) return all.length ? `no ${backend} models match "${f}" (${all.length} available)` : `couldn't list ${backend} models${backend === "cloud" ? " — is this machine logged in to Letta Cloud? (`letta --backend cloud agents list` to check)" : ""}${lastCatalogError ? `\n(${lastCatalogError})` : ""}`;
           return `${list.length} ${backend} model${list.length === 1 ? "" : "s"}${f ? ` matching "${f}"` : ""} (featured/free first). default: ${DEFAULT_SOUL_MODEL}\n${list.slice(0, 80).join("\n")}${list.length > 80 ? `\n… ${list.length - 80} more — narrow with filter` : ""}`;
         },
       }),

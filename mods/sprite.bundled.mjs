@@ -11235,7 +11235,7 @@ function quoteObs(text) {
 var SOUL_LINE_MAX = 80;
 var DEFAULT_SOUL_MODEL = "letta/auto-fast";
 var soulClientFactory = async (backend) => {
-  if (backend === "local" && !process.env.LETTA_CLI_PATH) {
+  if (!process.env.LETTA_CLI_PATH) {
     const bin = process.env.LETTA_CODE_BIN;
     if (bin && existsSync4(bin)) {
       process.env.LETTA_CLI_PATH = bin;
@@ -11243,7 +11243,7 @@ var soulClientFactory = async (backend) => {
     }
   }
   const mod = await Promise.resolve().then(() => (init_dist(), exports_dist));
-  return new mod.LettaAgentClient({ backend });
+  return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: backend === "cloud" ? "api" : "local" } });
 };
 function __setSoulClientFactory(f) {
   soulClientFactory = f;
@@ -13880,7 +13880,9 @@ Reply in one line.`, { force: true });
     ["tools", "Events, plus the first line of each tool's arguments (file paths, commands). None of your agent's words."],
     ["turns", "Everything above, plus the text of what your agent says each turn. Never its memory or system prompt."]
   ];
+  let lastCatalogError = "";
   async function listSoulModels(backend) {
+    lastCatalogError = "";
     try {
       const client = await soulClient(backend);
       const res = await client.models.list();
@@ -13896,7 +13898,8 @@ Reply in one line.`, { force: true });
       const rank = (m) => m.isFeatured || m.free ? 0 : 1;
       uniq.sort((a, b) => rank(a) - rank(b) || String(a.handle ?? a.id).localeCompare(String(b.handle ?? b.id)));
       return uniq.map((m) => String(m.handle ?? m.id));
-    } catch {
+    } catch (e) {
+      lastCatalogError = String(e?.message ?? e).slice(0, 200);
       return [];
     }
   }
@@ -13972,7 +13975,7 @@ Reply in one line.`, { force: true });
     const model = (args.model ?? DEFAULT_SOUL_MODEL).trim();
     const catalog = await listSoulModels(backend);
     if (!catalog.length) {
-      return `couldn't read the ${backend} model catalog${backend === "cloud" ? " \u2014 are you logged in to Letta Cloud?" : ""}. not creating anything.`;
+      return `couldn't read the ${backend} model catalog${backend === "cloud" ? " \u2014 is this machine logged in to Letta Cloud? (run `letta --backend cloud agents list` to check)" : ""}. not creating anything.`;
     }
     if (!catalog.includes(model)) {
       return `"${model}" isn't in the ${backend} catalog (${catalog.length} models). call sprite_models to see it, and pick one of those.`;
@@ -14700,7 +14703,8 @@ ${recent.join(`
         const f = String(ctx.args?.filter ?? "").toLowerCase();
         const list = f ? all.filter((m) => m.toLowerCase().includes(f)) : all;
         if (!list.length)
-          return all.length ? `no ${backend} models match "${f}" (${all.length} available)` : `couldn't list ${backend} models (is the backend reachable / are you logged in?)`;
+          return all.length ? `no ${backend} models match "${f}" (${all.length} available)` : `couldn't list ${backend} models${backend === "cloud" ? " \u2014 is this machine logged in to Letta Cloud? (`letta --backend cloud agents list` to check)" : ""}${lastCatalogError ? `
+(${lastCatalogError})` : ""}`;
         return `${list.length} ${backend} model${list.length === 1 ? "" : "s"}${f ? ` matching "${f}"` : ""} (featured/free first). default: ${DEFAULT_SOUL_MODEL}
 ${list.slice(0, 80).join(`
 `)}${list.length > 80 ? `

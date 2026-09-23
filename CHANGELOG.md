@@ -3,6 +3,12 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.9.4
+- Cloud minds work with your existing Letta Code login. Choosing `cloud`
+  runs the companion's mind through your own Letta Code against Letta
+  Cloud — a real cloud agent, no `LETTA_API_KEY` to set. Model-catalog
+  errors now say what actually went wrong.
+
 ## v0.9.3
 - `/sprite whatsnew` — the release notes: everything new since the
   mod-challenge version, as a story. Companions from that version get a
