@@ -4343,15 +4343,22 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           });
           const collect = (async () => {
             let fromResult = "";
+            let sawResult = false;
             for await (const msg of session.stream()) {
               if (msg?.type === "assistant") {
                 if (typeof msg.content === "string") text += msg.content;
                 else if (Array.isArray(msg.content)) text += msg.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("");
               } else if (msg?.type === "result") {
+                sawResult = true;
+                if (msg.success === false) {
+                  const detail = String(msg.errorDetail ?? msg.error ?? msg.errorCode ?? "model request failed").slice(0, 200);
+                  throw new Error(`mind turn failed: ${detail}`);
+                }
                 if (typeof msg.result === "string") fromResult = msg.result;
                 break;
               }
             }
+            if (!sawResult) throw new Error("mind turn ended without a result");
             // some backends deliver the reply only on the result event
             if (!text.trim() && fromResult) text = fromResult;
           })();
@@ -4362,6 +4369,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         }
         const line = oneLine(text);
         if (!line) return null;
+        soulLastError = "";
         soulLastLineAt.set(soul.agentId, Date.now());
         soul.lineCount += 1;
         markDirty();
@@ -4804,7 +4812,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         flush();
         const line = await soulSay(sprite, `Your mind now runs on a different model (${value}). Say one line.`, { force: true });
         if (line) showSoulLine(sprite, "mood", line);
-        return `${sprite.name}'s model → ${value}${line ? `\n${sprite.name}: ${line}` : `\n⚠ set, but it didn't answer — that model may not be available here.`}`;
+        return `${sprite.name}'s model → ${value}${line ? `\n${sprite.name}: ${line}` : `\n⚠ set, but it didn't answer — check /sprite soul for the last error.`}`;
       }
       default:
         return "see /sprite soul for the keys.";

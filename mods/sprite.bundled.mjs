@@ -1,16 +1,12 @@
 // @bun
 var __defProp = Object.defineProperty;
-var __returnValue = (v) => v;
-function __exportSetter(name, newValue) {
-  this[name] = __returnValue.bind(null, newValue);
-}
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: __exportSetter.bind(all, name)
+      set: (newValue) => all[name] = () => newValue
     });
 };
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
@@ -13852,6 +13848,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
           });
           const collect = (async () => {
             let fromResult = "";
+            let sawResult = false;
             for await (const msg of session.stream()) {
               if (msg?.type === "assistant") {
                 if (typeof msg.content === "string")
@@ -13859,11 +13856,18 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
                 else if (Array.isArray(msg.content))
                   text += msg.content.map((c) => typeof c?.text === "string" ? c.text : "").join("");
               } else if (msg?.type === "result") {
+                sawResult = true;
+                if (msg.success === false) {
+                  const detail = String(msg.errorDetail ?? msg.error ?? msg.errorCode ?? "model request failed").slice(0, 200);
+                  throw new Error(`mind turn failed: ${detail}`);
+                }
                 if (typeof msg.result === "string")
                   fromResult = msg.result;
                 break;
               }
             }
+            if (!sawResult)
+              throw new Error("mind turn ended without a result");
             if (!text.trim() && fromResult)
               text = fromResult;
           })();
@@ -13877,6 +13881,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
         const line = oneLine(text);
         if (!line)
           return null;
+        soulLastError = "";
         soulLastLineAt.set(soul.agentId, Date.now());
         soul.lineCount += 1;
         markDirty();
@@ -14394,7 +14399,7 @@ ${sprite.name}: ${line}` : ""}`;
           showSoulLine(sprite, "mood", line);
         return `${sprite.name}'s model \u2192 ${value}${line ? `
 ${sprite.name}: ${line}` : `
-\u26A0 set, but it didn't answer \u2014 that model may not be available here.`}`;
+\u26A0 set, but it didn't answer \u2014 check /sprite soul for the last error.`}`;
       }
       default:
         return "see /sprite soul for the keys.";

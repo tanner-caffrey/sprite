@@ -929,6 +929,10 @@ function mockSoulClient(opts = {}) {
           async send(text) { calls.push(["prompt", agentId, text, sessionOpts]); if (!agents.has(agentId)) throw new Error("no such agent"); session._msg = text; },
           async *stream() {
             if (opts.hang?.(session._msg)) { await new Promise((r) => { session._resolveHang = r; }); if (session.aborted) return; }
+            if (opts.fail?.(session._msg)) {
+              yield { type: "result", success: false, errorCode: "llm_api_error", errorDetail: "local provider not connected" };
+              return;
+            }
             if (opts.resultOnly) { yield { type: "result", success: true, result: reply(session._msg) }; return; }
             yield { type: "assistant", content: reply(session._msg) };
             yield { type: "result", success: true };
@@ -1072,6 +1076,19 @@ await check("soul: talk gate stops a chatty agent; user talk is ungated; both si
   assert.match(String(await talk.run({ agent, args: { text: "hi 7" } })), /heard: hi 7/);
   assert.match(await host.command("soul model letta/auto-fast"), /model → letta\/auto-fast/);
   assert.ok(mock.calls.some((c) => c[0] === "updateModel" && c[2] === "letta/auto-fast"), "model change must go through session.updateModel");
+  dispose();
+});
+
+await check("soul: failed model turns report the SDK error instead of silently treating the mind as unavailable", async () => {
+  const mock = mockSoulClient({ fail: (msg) => msg.includes("different model") || msg.includes("says to you") });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul-error", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent);
+  assert.match(await host.command("soul model chatgpt-plus-pro/gpt-5.6-luna"), /check \/sprite soul for the last error/);
+  assert.match(await host.command("soul"), /last error: mind turn failed: local provider not connected/);
+  assert.match(await host.command("talk hello"), /mind didn't answer/);
+  assert.match(await host.command("soul"), /last error: mind turn failed: local provider not connected/);
   dispose();
 });
 
