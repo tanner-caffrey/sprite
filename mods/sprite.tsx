@@ -1077,23 +1077,19 @@ interface SoulClient {
 }
 
 // Swappable so tests run without a backend (see hardening-test.mjs).
-// The SDK spawns a Letta Code app-server for local souls. Left alone it uses
-// the letta-code version bundled *with the SDK*, which can lag the host and
-// miss providers/models the host knows. Point it at the host's own entrypoint
-// so a soul sees exactly the catalog /model sees.
-function hostCliPath(): string | null {
-  const explicit = process.env.LETTA_CLI_PATH;
-  if (explicit && existsSync(explicit)) return explicit;
-  for (const candidate of [process.argv[1], process.env._]) {
-    if (typeof candidate === "string" && /letta-code[\\/].*\.(js|mjs|ts)$|[\\/]letta(\.js)?$/.test(candidate) && existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
+// The SDK spawns its own Letta Code app-server for local souls (the TUI has
+// none to attach to). It shares this machine's local backend store, so the
+// agents it makes are the same agents `letta agents list` shows. Left alone
+// it would run the letta-code version bundled *with the SDK*, which can lag
+// the host and miss providers; the host exports LETTA_CODE_BIN, and the SDK's
+// resolver honors LETTA_CLI_PATH first — so hand one to the other.
 let soulClientFactory: (backend: SoulBackend) => Promise<SoulClient> = async (backend) => {
+  if (backend === "local" && !process.env.LETTA_CLI_PATH) {
+    const bin = process.env.LETTA_CODE_BIN;
+    if (bin && existsSync(bin)) process.env.LETTA_CLI_PATH = bin;
+  }
   const mod: any = await import("@letta-ai/letta-agent-sdk");
-  const cli = backend === "local" ? hostCliPath() : null;
-  return new mod.LettaAgentClient(cli ? { backend, appServer: { cliPath: cli } } : { backend }) as SoulClient;
+  return new mod.LettaAgentClient({ backend }) as SoulClient;
 };
 export function __setSoulClientFactory(f: typeof soulClientFactory) {
   soulClientFactory = f;

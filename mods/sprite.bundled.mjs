@@ -10937,20 +10937,14 @@ function formatChangelog(sections, heading) {
 var SOUL_TALK_WINDOW_MS = 5 * 60000;
 var SOUL_LINE_MAX = 80;
 var DEFAULT_SOUL_MODEL = "letta/auto-fast";
-function hostCliPath() {
-  const explicit = process.env.LETTA_CLI_PATH;
-  if (explicit && existsSync4(explicit))
-    return explicit;
-  for (const candidate of [process.argv[1], process.env._]) {
-    if (typeof candidate === "string" && /letta-code[\\/].*\.(js|mjs|ts)$|[\\/]letta(\.js)?$/.test(candidate) && existsSync4(candidate))
-      return candidate;
-  }
-  return null;
-}
 var soulClientFactory = async (backend) => {
+  if (backend === "local" && !process.env.LETTA_CLI_PATH) {
+    const bin = process.env.LETTA_CODE_BIN;
+    if (bin && existsSync4(bin))
+      process.env.LETTA_CLI_PATH = bin;
+  }
   const mod = await Promise.resolve().then(() => (init_dist(), exports_dist));
-  const cli = backend === "local" ? hostCliPath() : null;
-  return new mod.LettaAgentClient(cli ? { backend, appServer: { cliPath: cli } } : { backend });
+  return new mod.LettaAgentClient({ backend });
 };
 function __setSoulClientFactory(f) {
   soulClientFactory = f;
