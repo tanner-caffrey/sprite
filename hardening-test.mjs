@@ -591,4 +591,46 @@ await check("bars: lap math is monotonic, wraps cleanly, and every lap style ren
   dispose();
 });
 
+// ---------------------------------------------------------------------------
+check("multi: founder is protected, hatch another rolls fresh, switch/release work, panel-only xp", () => {
+  const agent = { id: "agent-multi", name: "Multi" };
+  const { host, dispose } = hatchFor(agent, null);
+  host.command("name Founder");
+  assert.match(host.command("hatch"), /already here/);
+  assert.match(host.command("hatch another"), /new egg appears/);
+  const c1 = readState().collections[agent.id];
+  const ids = Object.keys(c1.sprites);
+  assert.equal(ids.length, 2);
+  const founder = Object.values(c1.sprites).find((sp) => sp.founder);
+  const egg = Object.values(c1.sprites).find((sp) => !sp.founder);
+  assert.equal(founder.name, "Founder");
+  assert.equal(egg.phase, "egg");
+  assert.notEqual(egg.seed, founder.seed);
+  assert.equal(c1.activeSpriteId, egg.id, "new egg should be active");
+  assert.match(host.command("switch Founder"), /still hatching/);
+  assert.match(host.command("release Founder confirm"), /can't be released/);
+  // xp while the egg is active must not reach the resting founder
+  const before = founder.stats.craft;
+  host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" });
+  dispose();
+  const c2 = readState().collections[agent.id];
+  assert.equal(c2.sprites[founder.id].stats.craft, before, "resting sprite earned xp");
+  // hatch the egg by hand (skip the 12s timer) and switch back
+  c2.sprites[egg.id].phase = "alive";
+  c2.sprites[egg.id].name = "Second";
+  c2.sprites[egg.id].named = true;
+  writeFileSync(statePath, JSON.stringify(c2 && readState()).replace(/"phase":"egg"/, '"phase":"alive"'));
+  const st = readState(); st.collections[agent.id] = c2; writeFileSync(statePath, JSON.stringify(st));
+  const h2 = makeLetta(agent, null);
+  const d2 = activate(h2.letta);
+  h2.fire("conversation_open", { agentId: agent.id });
+  assert.match(h2.command("list"), /▶ +2\. .*Second/, h2.command("list"));
+  assert.match(h2.command("switch 1"), /Founder steps onto the panel/);
+  assert.match(h2.command("release Second"), /can't be undone/);
+  assert.match(h2.command("release Second confirm"), /drifts off/);
+  assert.match(h2.command("release Founder confirm"), /can't be released/);
+  d2();
+  assert.deepEqual(Object.keys(readState().collections[agent.id].sprites), [founder.id]);
+});
+
 console.log(`\nSprite hardening test passed (${passed} checks).`);

@@ -767,6 +767,9 @@ interface SpriteState {
   seed: string;
   bornToAgentId: string;
   phase: "egg" | "alive";
+  // The fate-rolled soul-sprite born from the agent-id itself. Protected: it
+  // can't be released. Bred/summoned sprites are the menagerie.
+  founder?: boolean;
   eggStartedAt?: number;
   pendingSpecies?: string; // chosen (or fate-rolled) species revealed at hatch
   species: string;
@@ -804,6 +807,9 @@ interface AgentCollectionState {
   // base treats remote as authoritative: sprites the restore removed stay
   // removed instead of being resurrected by a stale writer's local copy.
   generation?: number;
+  // Soul ids deliberately released. A merge never resurrects these from a
+  // stale writer, and they're pruned once no writer could still hold them.
+  released?: Record<string, number>; // id → released-at ms
 }
 
 interface ModState {
@@ -854,6 +860,7 @@ function spriteIdForLegacyAgent(agentId: string, sprite: Partial<SpriteState>): 
 const UNSAFE_RECORD_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 const PORTABLE_MAX_BYTES = 1_000_000;
 const PORTABLE_MAX_SPRITES = 64;
+const MAX_SPRITES_PER_COLLECTION = 12;
 // Hard ceilings so a checksum-valid (but hostile) backup can't feed the
 // level-up loops a number they'd spin on for the rest of the session.
 const MAX_TOTAL_XP = 1_000_000_000;
@@ -934,6 +941,7 @@ function normalizeSprite(agentId: string, input: Partial<SpriteState>): SpriteSt
     bornToAgentId:
       typeof input.bornToAgentId === "string" && input.bornToAgentId ? input.bornToAgentId : agentId,
     phase: input.phase === "egg" ? "egg" : "alive",
+    ...(input.founder === true ? { founder: true } : {}),
     ...(typeof input.eggStartedAt === "number" ? { eggStartedAt: input.eggStartedAt } : {}),
     ...(typeof input.pendingSpecies === "string" ? { pendingSpecies: input.pendingSpecies } : {}),
     species: typeof input.species === "string" && SPECIES_IDS.includes(input.species) ? input.species : "cat",
@@ -980,7 +988,21 @@ function normalizeCollection(agentId: string, input: Partial<AgentCollectionStat
     ...(Number.isInteger(input.generation) && (input.generation as number) > 0
       ? { generation: input.generation }
       : {}),
+    ...(input.released && typeof input.released === "object" && !Array.isArray(input.released)
+      ? { released: cleanReleased(input.released as Record<string, unknown>) }
+      : {}),
   };
+}
+
+const RELEASED_TTL_MS = 30 * 24 * 3_600_000;
+function cleanReleased(value: Record<string, unknown>): Record<string, number> {
+  const out: Record<string, number> = Object.create(null);
+  const cutoff = Date.now() - RELEASED_TTL_MS;
+  for (const [id, at] of Object.entries(value).slice(0, 256)) {
+    const t = Number(at);
+    if (safeIdentifier(id, "") === id && Number.isFinite(t) && t > cutoff) out[id] = t;
+  }
+  return out;
 }
 
 function emptyState(): ModState {
@@ -1006,6 +1028,7 @@ function parseState(raw: unknown): StateLoadResult {
     for (const [agentId, rawSprite] of Object.entries(value.sprites as Record<string, unknown>)) {
       if (!rawSprite || typeof rawSprite !== "object") continue;
       const sprite = normalizeSprite(agentId, rawSprite as Partial<SpriteState>);
+      sprite.founder = true;
       collections[agentId] = {
         id: collectionIdForLegacyAgent(agentId),
         ownerAgentId: agentId,
@@ -1131,6 +1154,7 @@ function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: 
       "seed",
       "bornToAgentId",
       "phase",
+      "founder",
       "eggStartedAt",
       "pendingSpecies",
       "species",
@@ -1161,6 +1185,7 @@ function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: 
     "seed",
     "bornToAgentId",
     "phase",
+    "founder",
     "eggStartedAt",
     "pendingSpecies",
     "species",
@@ -1226,16 +1251,19 @@ function mergeCollection(
     // it is authoritative: a force-restore happened while we were building our
     // own view, and our sprites belong to a soul that was deliberately replaced.
     if (remoteGen > 0) return cloneState(remote);
+    const released = cleanReleased({ ...(remote.released ?? {}), ...(local.released ?? {}) });
     const sprites = cloneState(remote.sprites);
     for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
       sprites[spriteId] = mergeSprite(undefined, localSprite, remote.sprites[spriteId]);
     }
+    for (const id of Object.keys(released)) delete sprites[id];
     return {
       id: remote.id || local.id,
       ownerAgentId: local.ownerAgentId,
       activeSpriteId: local.activeSpriteId && sprites[local.activeSpriteId] ? local.activeSpriteId : remote.activeSpriteId,
       sprites,
       backup: mergeBackup(undefined, local.backup, remote.backup),
+      ...(Object.keys(released).length > 0 ? { released } : {}),
     };
   }
   if (remoteGen > (base.generation ?? 0)) {
@@ -1249,17 +1277,24 @@ function mergeCollection(
     }
     return { ...cloneState(remote), sprites, ownerAgentId: local.ownerAgentId };
   }
+  const released = cleanReleased({ ...(remote.released ?? {}), ...(local.released ?? {}) });
   const sprites = cloneState(remote.sprites);
   for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
     sprites[spriteId] = mergeSprite(base.sprites[spriteId], localSprite, remote.sprites[spriteId]);
   }
+  for (const id of Object.keys(released)) delete sprites[id];
+  let activeSpriteId = mergeValue(base.activeSpriteId, local.activeSpriteId, remote.activeSpriteId);
+  if (activeSpriteId && !sprites[activeSpriteId]) {
+    activeSpriteId = Object.values(sprites).find((sp) => sp.founder)?.id ?? Object.keys(sprites)[0] ?? null;
+  }
   return {
     id: mergeValue(base.id, local.id, remote.id),
     ownerAgentId: local.ownerAgentId,
-    activeSpriteId: mergeValue(base.activeSpriteId, local.activeSpriteId, remote.activeSpriteId),
+    activeSpriteId,
     sprites,
     backup: mergeBackup(base.backup, local.backup, remote.backup),
     ...(remoteGen > 0 ? { generation: remoteGen } : {}),
+    ...(Object.keys(released).length > 0 ? { released } : {}),
   };
 }
 
@@ -2084,9 +2119,17 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   let baseState = cloneState(state);
   let dirty = loaded.migrated;
 
-  // backfill temperament for sprites hatched before natures existed
+  // backfill temperament for sprites hatched before natures existed, and mark
+  // the founder for collections that predate multi-sprite (the lone sprite is
+  // the one fate rolled from the agent-id).
   for (const collection of Object.values(state.collections)) {
-    for (const sp of Object.values(collection.sprites)) {
+    const roster = Object.values(collection.sprites);
+    if (roster.length > 0 && !roster.some((sp) => sp.founder)) {
+      const born = roster.find((sp) => sp.seed === collection.ownerAgentId) ?? roster[0];
+      born.founder = true;
+      dirty = true;
+    }
+    for (const sp of roster) {
       if (sp.phase === "alive" && !sp.temperament) {
         sp.temperament = temperamentOf(sp.seed);
         dirty = true;
@@ -2489,14 +2532,14 @@ function activateInner(letta: any, disposers: Array<() => void>) {
 
   // -- hatching -------------------------------------------------------------
 
-  function beginHatch(agentId: string | null, agentName: string | null, pick?: string): string {
+  function beginHatch(
+    agentId: string | null,
+    agentName: string | null,
+    pick?: string,
+    another = false,
+  ): string {
     if (!agentId) return "i can't tell which agent this is — try again from an active conversation.";
-    const fate = fateRoll(agentId);
-    const species = pick && SPECIES_IDS.includes(pick) ? pick : fate.species;
     const existing = getSprite(agentId);
-    if (existing && existing.phase === "alive") {
-      return `${existing.name} is already here. (/sprite molt to re-form, or /sprite for the card)`;
-    }
     if (existing && existing.phase === "egg") {
       return "the egg is already here. it's warm.";
     }
@@ -2508,12 +2551,26 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         activeSpriteId: null,
         sprites: {},
       });
-    const spriteId = stableId("sprite", `${agentId}:founder`);
+    const hasFounder = Object.values(collection.sprites).some((sp) => sp.founder);
+    if (existing && existing.phase === "alive" && !another) {
+      return `${existing.name} is already here. (/sprite hatch another to summon a second egg, /sprite molt to re-form, or /sprite for the card)`;
+    }
+    if (Object.keys(collection.sprites).length >= MAX_SPRITES_PER_COLLECTION) {
+      return `you already have ${MAX_SPRITES_PER_COLLECTION} companions — that's the most this nest can hold.`;
+    }
+    // The first sprite is fate-rolled from the agent-id itself and becomes the
+    // protected founder. Every later one gets its own seed so fate rolls fresh.
+    const founder = !hasFounder;
+    const seed = founder ? agentId : `${agentId}:${randomBytes(6).toString("hex")}`;
+    const fate = fateRoll(seed);
+    const species = pick && SPECIES_IDS.includes(pick) ? pick : fate.species;
+    const spriteId = founder ? stableId("sprite", `${agentId}:founder`) : stableId("sprite", seed);
     collection.sprites[spriteId] = {
       id: spriteId,
-      seed: agentId,
+      seed,
       bornToAgentId: agentId,
       phase: "egg",
+      ...(founder ? { founder: true } : {}),
       eggStartedAt: Date.now(),
       pendingSpecies: species,
       species,
@@ -2530,7 +2587,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     flush();
     queueCheckpoint(agentId, "hatch-started");
     panel.update();
-    return "an egg appears under the statusline. it's warm. (hatching soon~)";
+    return founder
+      ? "an egg appears under the statusline. it's warm. (hatching soon~)"
+      : `${existing?.name ?? "your companion"} steps aside; a new egg appears under the statusline. it's warm.`;
   }
 
   function completeHatch(agentId: string, sprite: SpriteState) {
@@ -2800,6 +2859,92 @@ function activateInner(letta: any, disposers: Array<() => void>) {
 
   // -- shared command/tool actions -------------------------------------------
 
+  function findSprite(collection: AgentCollectionState, query: string): SpriteState | null {
+    const q = query.trim().toLowerCase();
+    if (!q) return null;
+    const roster = Object.values(collection.sprites);
+    const byIndex = /^#?(\d+)$/.exec(q);
+    if (byIndex) return roster[Number(byIndex[1]) - 1] ?? null;
+    return (
+      roster.find((sp) => sp.name.toLowerCase() === q) ??
+      roster.find((sp) => sp.id === q) ??
+      roster.find((sp) => sp.name.toLowerCase().startsWith(q)) ??
+      null
+    );
+  }
+
+  function rosterLine(collection: AgentCollectionState, sp: SpriteState, index: number): string {
+    const species = speciesOf(sp);
+    const active = collection.activeSpriteId === sp.id ? "▶" : " ";
+    const face = sp.phase === "egg" ? "( ● )" : species.poses.idle;
+    const tags = [sp.founder ? "founder" : null, sp.shiny ? "✦shiny" : null, sp.phase === "egg" ? "egg" : null]
+      .filter(Boolean)
+      .join(" · ");
+    return `${active} ${String(index + 1).padStart(2)}. ${face}  ${sp.name.padEnd(24)} ${
+      sp.phase === "egg" ? "" : `${species.id} · lv.${sp.level}`
+    }${tags ? `  [${tags}]` : ""}`;
+  }
+
+  function doList(agentId: string | null): string {
+    const collection = getCollection(agentId);
+    if (!collection || Object.keys(collection.sprites).length === 0) {
+      return "no companions yet — /sprite hatch to begin.";
+    }
+    const roster = Object.values(collection.sprites);
+    return [
+      `your companions (${roster.length}/${MAX_SPRITES_PER_COLLECTION}) — ▶ marks who's on the panel:`,
+      ...roster.map((sp, i) => rosterLine(collection, sp, i)),
+      "",
+      "switch: /sprite switch <name|#>    another egg: /sprite hatch another [species]",
+    ].join("\n");
+  }
+
+  function doSwitch(agentId: string | null, query: string): string {
+    const collection = getCollection(agentId);
+    if (!agentId || !collection) return "no companions yet — /sprite hatch to begin.";
+    if (!query.trim()) return "usage: /sprite switch <name|#>  (see /sprite list)";
+    const current = getSprite(agentId);
+    if (current?.phase === "egg") return "the egg is still hatching — let it finish before switching.";
+    const next = findSprite(collection, query);
+    if (!next) return `no companion called "${query}". see /sprite list.`;
+    if (next.id === collection.activeSpriteId) return `${next.name} is already on the panel.`;
+    collection.activeSpriteId = next.id;
+    noteActivity(next);
+    markDirty();
+    flush();
+    queueCheckpoint(agentId, "switched");
+    setPose("happy", 3_000);
+    speak(next, "greeting", true);
+    panel.update();
+    return `${next.name} steps onto the panel${current ? `; ${current.name} curls up to rest` : ""}.`;
+  }
+
+  function doRelease(agentId: string | null, argstr: string): string {
+    const collection = getCollection(agentId);
+    if (!agentId || !collection) return "no companions yet.";
+    const parts = argstr.split(/\s+/).filter(Boolean);
+    const confirm = parts[parts.length - 1] === "confirm";
+    const query = (confirm ? parts.slice(0, -1) : parts).join(" ");
+    if (!query) return "usage: /sprite release <name|#> confirm";
+    const target = findSprite(collection, query);
+    if (!target) return `no companion called "${query}". see /sprite list.`;
+    if (target.founder) return `${target.name} is your founder — the one fate rolled from you. founders can't be released.`;
+    if (!confirm) {
+      return `release ${target.name} (${speciesOf(target).id}, lv.${target.level})? this can't be undone. run: /sprite release ${target.name} confirm`;
+    }
+    delete collection.sprites[target.id];
+    collection.released = { ...(collection.released ?? {}), [target.id]: Date.now() };
+    if (collection.activeSpriteId === target.id) {
+      const founder = Object.values(collection.sprites).find((sp) => sp.founder);
+      collection.activeSpriteId = founder?.id ?? Object.keys(collection.sprites)[0] ?? null;
+    }
+    markDirty();
+    flush();
+    queueCheckpoint(agentId, "released");
+    panel.update();
+    return `${target.name} drifts off. the nest is quieter.`;
+  }
+
   function requireSprite(agentId: string | null): SpriteState | { error: string } {
     const sprite = getSprite(agentId);
     if (!sprite) return { error: "no companion yet — /sprite hatch to begin." };
@@ -2932,6 +3077,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         ? `backup: ${getCollection(agentId)?.backup?.lastStatus ?? "on · no checkpoint yet"}`
         : "backup: off",
       sprite.named ? "" : `(name it: /sprite name <name>)`,
+      Object.keys(getCollection(agentId)?.sprites ?? {}).length > 1
+        ? `companions: ${Object.keys(getCollection(agentId)!.sprites).length} (/sprite list · /sprite switch <name>)`
+        : "",
     ].filter(Boolean);
     return lines.join("\n");
   }
@@ -3062,10 +3210,21 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       "                                 and the last few things it said.",
       "  /sprite status | card          Same as /sprite.",
       "",
-      "  /sprite hatch [species]        Summon an egg. Fate picks the species from your",
-      "                                 agent ID unless you name one yourself.",
+      "  /sprite hatch [species]        Summon your first egg. Fate picks the species from",
+      "                                 your agent ID unless you name one yourself.",
       "                                 Species: " + SPECIES_IDS.join(", ") + ".",
       "                                 The egg only grows while its agent is active.",
+      "                                 Your first companion is the founder: fate-rolled",
+      "                                 from you, and it can never be released.",
+      "  /sprite hatch another [species]",
+      "                                 Summon one more egg (up to " + MAX_SPRITES_PER_COLLECTION + " companions).",
+      "                                 Fate rolls fresh for each one.",
+      "  /sprite list                   Show every companion. ▶ marks who's on the panel.",
+      "  /sprite switch <name|#>        Put a different companion on the panel. Only the",
+      "                                 one on the panel earns experience and speaks;",
+      "                                 the others rest, and remember everything.",
+      "  /sprite release <name> confirm Let a companion go for good. Founders can't be",
+      "                                 released.",
       "  /sprite name <name>            Give your companion a name (up to 24 characters).",
       "  /sprite molt [species]         Change its body but keep its soul: name, level,",
       "                                 stats, voice, and diary all carry over. Picks a",
@@ -3111,7 +3270,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       "  /sprite help                   Show this message.",
       "",
       "Your agent can also care for its companion directly with these tools:",
-      "  sprite_hatch, sprite_name, sprite_molt, sprite_pet, sprite_status, sprite_set_voice.",
+      "  sprite_hatch, sprite_list, sprite_switch, sprite_name, sprite_molt, sprite_pet,",
+      "  sprite_status, sprite_set_voice.",
       "",
       "Experience comes from real work — tool calls, turns, and conversations — and",
       "costs no tokens.",
@@ -3122,8 +3282,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     disposers.push(
       letta.commands.register({
         id: "sprite",
-        description: "Your agent's tiny companion — status, hatch, name, molt, pet, diary, settings, backup, help",
-        args: "[status|hatch|name|molt|pet|diary|settings|backup|help] [...]",
+        description: "Your agent's tiny companions — status, hatch, list, switch, name, molt, pet, diary, release, settings, backup, help",
+        args: "[status|hatch|list|switch|name|molt|pet|diary|release|settings|backup|help] [...]",
         run(ctx: any) {
           const argstr = String(ctx.args ?? "").trim();
           const [sub, ...rest] = argstr.split(/\s+/).filter(Boolean);
@@ -3140,14 +3300,26 @@ function activateInner(letta: any, disposers: Array<() => void>) {
               output = card(agentId, agentName);
               break;
             case "hatch": {
-              const pick = rest[0]?.toLowerCase();
+              const another = rest[0]?.toLowerCase() === "another";
+              const pick = (another ? rest[1] : rest[0])?.toLowerCase();
               if (pick && !SPECIES_IDS.includes(pick)) {
                 output = `unknown species "${pick}". roster: ${SPECIES_IDS.join(", ")}`;
               } else {
-                output = beginHatch(agentId, agentName, pick);
+                output = beginHatch(agentId, agentName, pick, another);
               }
               break;
             }
+            case "list":
+            case "roster":
+              output = doList(agentId);
+              break;
+            case "switch":
+            case "use":
+              output = doSwitch(agentId, restStr);
+              break;
+            case "release":
+              output = doRelease(agentId, restStr);
+              break;
             case "name":
               output = doName(agentId, restStr);
               break;
@@ -3196,6 +3368,10 @@ function activateInner(letta: any, disposers: Array<() => void>) {
               type: "string",
               description: `Optional species pick. One of: ${SPECIES_IDS.join(", ")}`,
             },
+            another: {
+              type: "boolean",
+              description: "Set true to hatch an additional companion when you already have one.",
+            },
           },
           additionalProperties: false,
         },
@@ -3206,7 +3382,36 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           if (pick && !SPECIES_IDS.includes(pick)) {
             return { status: "error", content: `unknown species. roster: ${SPECIES_IDS.join(", ")}` };
           }
-          return beginHatch(toolAgent(ctx), ctx.agent?.name ?? activeAgentName, pick);
+          return beginHatch(toolAgent(ctx), ctx.agent?.name ?? activeAgentName, pick, ctx.args?.another === true);
+        },
+      }),
+    );
+    disposers.push(
+      letta.tools.register({
+        name: "sprite_list",
+        description: "List all of your companion sprites and which one is currently on the panel.",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+        requiresApproval: false,
+        parallelSafe: true,
+        run(ctx: any) {
+          return doList(toolAgent(ctx));
+        },
+      }),
+    );
+    disposers.push(
+      letta.tools.register({
+        name: "sprite_switch",
+        description: "Put a different companion sprite on the panel (by name or roster number). Only the active one earns experience and speaks.",
+        parameters: {
+          type: "object",
+          properties: { who: { type: "string", description: "Name or roster number of the companion." } },
+          required: ["who"],
+          additionalProperties: false,
+        },
+        requiresApproval: false,
+        parallelSafe: false,
+        run(ctx: any) {
+          return doSwitch(toolAgent(ctx), String(ctx.args?.who ?? ""));
         },
       }),
     );

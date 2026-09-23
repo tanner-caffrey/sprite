@@ -133,6 +133,10 @@ check on or pet its sprite just like a CLI conversation can.
 | --- | --- |
 | `/sprite` | Status card |
 | `/sprite hatch [species]` | Summon the egg |
+| `/sprite hatch another [species]` | Summon one more egg (up to 12; fate rolls fresh) |
+| `/sprite list` | Every companion; ▶ marks who is on the panel |
+| `/sprite switch <name\|#>` | Put another companion on the panel (only the active one earns XP and speaks) |
+| `/sprite release <name> confirm` | Let a companion go. The founder can never be released |
 | `/sprite name <name>` | Name it |
 | `/sprite molt [species]` | New body, same soul |
 | `/sprite pet` | Pet it (always gets a response) |
