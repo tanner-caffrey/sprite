@@ -143,6 +143,7 @@ check on or pet its sprite just like a CLI conversation can.
 | `/sprite backup on\|off\|now` | Enable, disable, or checkpoint now |
 | `/sprite backup push safe\|never` | Configure conservative Git sync |
 | `/sprite backup restore [force]` | Restore from agent MemFS (`force` replaces local state) |
+| `/sprite help` | Explain every subcommand |
 
 Settings keys: `voice on|off` · `voiceRateMin <minutes>` · `visible on|off`
 

@@ -70,6 +70,7 @@ companion from Signal, Telegram, Discord, or CLI turns.
 | `/sprite backup [status\|on\|off\|now]` | Inspect or control portable checkpoints |
 | `/sprite backup push safe\|never` | Configure direct MemFS Git sync |
 | `/sprite backup restore [force]` | Restore a portable soul-backup |
+| `/sprite help` | Explain every subcommand |
 
 Settings keys: `voice on|off`, `voiceRateMin <minutes>`, `visible on|off`.
 

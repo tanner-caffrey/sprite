@@ -2933,12 +2933,45 @@ function activateInner(letta: any, disposers: Array<() => void>) {
 
   // -- commands ---------------------------------------------------------------
 
+  function doHelp(): string {
+    return [
+      "/sprite — your agent's tiny companion",
+      "",
+      "  /sprite                     show the card (species, level, stats, mood, recent lines)",
+      "  /sprite status | card       same as above",
+      "  /sprite hatch [species]     summon an egg. fate rolls species from your agent-id",
+      "                              unless you pick one: " + SPECIES_IDS.join(", "),
+      "                              the egg only advances while its agent is active",
+      "  /sprite name <name>         name it (≤24 chars). named sprites feel more like theirs",
+      "  /sprite molt [species]      new body, same soul — keeps level, stats, voice, diary",
+      "                              (random species if none given)",
+      "  /sprite pet                 pet it. it always answers, even when voice is rate-limited",
+      "  /sprite diary               the last 40 things it said, oldest first, with away-gaps",
+      "  /sprite settings            show settings (per-sprite overrides beat global)",
+      "  /sprite settings <k> <v>    set for this sprite · add 'global' before <k> for all",
+      "                              keys: voice on|off · voiceRateMin <n> · visible on|off",
+      "  /sprite backup              portable soul-backup status (off by default)",
+      "  /sprite backup on|off       checkpoint into this agent's MemFS at milestones",
+      "  /sprite backup now          checkpoint right now",
+      "  /sprite backup push safe|never",
+      "                              safe = push only when nothing unrelated is waiting",
+      "                              never = commit locally, let the host push",
+      "  /sprite backup restore [force]",
+      "                              bring a soul back on a fresh install. force replaces",
+      "                              a live sprite (deliberate — bumps the collection generation)",
+      "  /sprite help                this",
+      "",
+      "agent tools: sprite_hatch · sprite_name · sprite_molt · sprite_pet · sprite_status · sprite_set_voice",
+      "xp comes from real work (tools, turns, conversations) at zero token cost.",
+    ].join("\n");
+  }
+
   if (letta.capabilities.commands) {
     disposers.push(
       letta.commands.register({
         id: "sprite",
-        description: "Your agent's tiny companion — status, hatch, name, molt, pet, diary, settings, backup",
-        args: "[status|hatch|name|molt|pet|diary|settings|backup] [...]",
+        description: "Your agent's tiny companion — status, hatch, name, molt, pet, diary, settings, backup, help",
+        args: "[status|hatch|name|molt|pet|diary|settings|backup|help] [...]",
         run(ctx: any) {
           const argstr = String(ctx.args ?? "").trim();
           const [sub, ...rest] = argstr.split(/\s+/).filter(Boolean);
@@ -2981,8 +3014,14 @@ function activateInner(letta: any, disposers: Array<() => void>) {
             case "backup":
               output = doBackup(agentId, restStr);
               break;
+            case "help":
+            case "-h":
+            case "--help":
+            case "?":
+              output = doHelp();
+              break;
             default:
-              output = `unknown subcommand "${sub}". try: /sprite status|hatch|name|molt|pet|diary|settings|backup`;
+              output = `unknown subcommand "${sub}". try /sprite help`;
           }
           return { type: "output", output };
         },
