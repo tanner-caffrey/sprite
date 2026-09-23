@@ -599,38 +599,116 @@ check("multi: founder is protected, hatch another rolls fresh, switch/release wo
   assert.match(host.command("hatch"), /already here/);
   assert.match(host.command("hatch another"), /new egg appears/);
   const c1 = readState().collections[agent.id];
-  const ids = Object.keys(c1.sprites);
-  assert.equal(ids.length, 2);
+  assert.equal(Object.keys(c1.sprites).length, 2);
   const founder = Object.values(c1.sprites).find((sp) => sp.founder);
   const egg = Object.values(c1.sprites).find((sp) => !sp.founder);
   assert.equal(founder.name, "Founder");
   assert.equal(egg.phase, "egg");
   assert.notEqual(egg.seed, founder.seed);
-  assert.equal(c1.activeSpriteId, egg.id, "new egg should be active");
+  assert.equal(c1.activeSpriteId, egg.id);
   assert.match(host.command("switch Founder"), /still hatching/);
-  assert.match(host.command("release Founder confirm"), /can't be released/);
-  // xp while the egg is active must not reach the resting founder
+  assert.match(host.command("release Founder"), /can't be released/);
+  assert.match(host.command(`release confirm:${founder.id}`), /can't be released/);
   const before = founder.stats.craft;
   host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" });
   dispose();
   const c2 = readState().collections[agent.id];
   assert.equal(c2.sprites[founder.id].stats.craft, before, "resting sprite earned xp");
-  // hatch the egg by hand (skip the 12s timer) and switch back
-  c2.sprites[egg.id].phase = "alive";
-  c2.sprites[egg.id].name = "Second";
-  c2.sprites[egg.id].named = true;
-  writeFileSync(statePath, JSON.stringify(c2 && readState()).replace(/"phase":"egg"/, '"phase":"alive"'));
+  c2.sprites[egg.id].phase = "alive"; c2.sprites[egg.id].name = "Second"; c2.sprites[egg.id].named = true;
   const st = readState(); st.collections[agent.id] = c2; writeFileSync(statePath, JSON.stringify(st));
   const h2 = makeLetta(agent, null);
   const d2 = activate(h2.letta);
   h2.fire("conversation_open", { agentId: agent.id });
   assert.match(h2.command("list"), /▶ +2\. .*Second/, h2.command("list"));
   assert.match(h2.command("switch 1"), /Founder steps onto the panel/);
-  assert.match(h2.command("release Second"), /can't be undone/);
-  assert.match(h2.command("release Second confirm"), /drifts off/);
-  assert.match(h2.command("release Founder confirm"), /can't be released/);
+  const prompt = h2.command("release Second");
+  const m = /confirm:(\S+)/.exec(prompt);
+  assert.ok(m, prompt);
+  assert.match(h2.command(`release confirm:${m[1]}`), /drifts off/);
   d2();
   assert.deepEqual(Object.keys(readState().collections[agent.id].sprites), [founder.id]);
+});
+
+// ---------------------------------------------------------------------------
+check("multi: ambiguous prefix never guesses; numeric names rejected; control chars stripped", () => {
+  const agent = { id: "agent-ambig", name: "Ambig" };
+  const { host, dispose } = hatchFor(agent, null);
+  host.command("name Poof");
+  const st = readState(); const c = st.collections[agent.id];
+  const f = c.sprites[c.activeSpriteId];
+  for (const name of ["Pip", "Pop"]) {
+    const id = `sprite_${name.toLowerCase()}00000000000000000000`;
+    c.sprites[id] = { ...f, id, name, named: true, founder: undefined, seed: `${agent.id}:${name}` };
+  }
+  writeFileSync(statePath, JSON.stringify(st));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta);
+  h2.fire("conversation_open", { agentId: agent.id });
+  assert.match(h2.command("release P"), /matches 3 companions/);
+  assert.match(h2.command("switch Pi"), /Pip steps onto/);
+  assert.match(h2.command("name 42"), /roster positions/);
+  h2.command("name A\u001b[2JB\nC");
+  assert.equal(readState().collections[agent.id].sprites["sprite_pip00000000000000000000"].name, "A[2JB C");
+  d2(); dispose();
+});
+
+// ---------------------------------------------------------------------------
+check("multi: a window that missed a release doesn't resurrect it, even without a tombstone", () => {
+  const agent = { id: "agent-resurrect", name: "Res" };
+  const { host, dispose } = hatchFor(agent, null);
+  dispose();
+  const st = readState(); const c = st.collections[agent.id];
+  const id = "sprite_second000000000000000000";
+  c.sprites[id] = { ...c.sprites[c.activeSpriteId], id, name: "Second", founder: undefined, seed: "x" };
+  writeFileSync(statePath, JSON.stringify(st));
+  // A loads with both. B releases Second, then the tombstone is wiped (as if expired).
+  const a = makeLetta(agent, null); const da = activate(a.letta); a.fire("conversation_open", { agentId: agent.id });
+  const b = makeLetta(agent, null); const db = activate(b.letta); b.fire("conversation_open", { agentId: agent.id });
+  b.command(`release confirm:${id}`); db();
+  const st2 = readState(); delete st2.collections[agent.id].released; writeFileSync(statePath, JSON.stringify(st2));
+  a.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" }); da();
+  assert.equal(readState().collections[agent.id].sprites[id], undefined, "released sprite came back");
+});
+
+// ---------------------------------------------------------------------------
+check("multi: exactly one founder after restore of a pre-founder backup, and after merging two backfills", () => {
+  const agent = { id: "agent-onefounder", name: "One" };
+  const { memoryDir } = makeRepo("onefounder");
+  const { host, dispose } = hatchFor(agent, memoryDir);
+  dispose();
+  const c = readState().collections[agent.id];
+  const old = JSON.parse(JSON.stringify(c));
+  for (const sp of Object.values(old.sprites)) delete sp.founder;
+  const id2 = "sprite_other0000000000000000000";
+  old.sprites[id2] = { ...Object.values(old.sprites)[0], id: id2, name: "Other", seed: "y", hatchedAt: 5 };
+  writePortable(memoryDir, portableFor(old, agent.id, 3));
+  const h = makeLetta(agent, memoryDir); const d = activate(h.letta); h.fire("conversation_open", { agentId: agent.id });
+  assert.match(h.command("backup restore force"), /restored/);
+  const founders = Object.values(readState().collections[agent.id].sprites).filter((sp) => sp.founder);
+  assert.equal(founders.length, 1);
+  assert.equal(founders[0].seed, agent.id, "founder must be the agent-seeded one");
+  assert.match(h.command(`release confirm:${founders[0].id}`), /can't be released/);
+  assert.match(h.command("hatch another"), /new egg/);
+  assert.equal(Object.values(readState().collections[agent.id].sprites).filter((sp) => sp.founder).length, 1);
+  d();
+});
+
+// ---------------------------------------------------------------------------
+check("multi: concurrent hatch another can't exceed the cap", () => {
+  const agent = { id: "agent-cap", name: "Cap" };
+  const { host, dispose } = hatchFor(agent, null);
+  dispose();
+  const st = readState(); const c = st.collections[agent.id]; const f = c.sprites[c.activeSpriteId];
+  for (let i = 0; i < 10; i += 1) { const id = `sprite_fill${String(i).padStart(24, "0")}`; c.sprites[id] = { ...f, id, founder: undefined, seed: `s${i}`, name: `F${i}` }; }
+  writeFileSync(statePath, JSON.stringify(st));
+  const a = makeLetta(agent, null); const da = activate(a.letta); a.fire("conversation_open", { agentId: agent.id });
+  const b = makeLetta(agent, null); const db = activate(b.letta); b.fire("conversation_open", { agentId: agent.id });
+  assert.match(a.command("hatch another"), /new egg/); // 12th on disk
+  // hatch A's egg by hand so B's stale view meets a full nest with no egg
+  const st2 = readState(); for (const sp of Object.values(st2.collections[agent.id].sprites)) if (sp.phase === "egg") sp.phase = "alive";
+  writeFileSync(statePath, JSON.stringify(st2));
+  assert.match(b.command("hatch another"), /most this nest can hold/); // B still believes 11
+  da(); db();
+  assert.equal(Object.keys(readState().collections[agent.id].sprites).length, 12);
 });
 
 console.log(`\nSprite hardening test passed (${passed} checks).`);

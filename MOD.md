@@ -65,7 +65,7 @@ companion from Signal, Telegram, Discord, or CLI turns.
 | `/sprite hatch another [species]` | Summon one more egg (up to 12; fate rolls fresh) |
 | `/sprite list` | Every companion; ▶ marks who is on the panel |
 | `/sprite switch <name\|#>` | Put another companion on the panel (only the active one earns XP and speaks) |
-| `/sprite release <name> confirm` | Let a companion go. The founder can never be released |
+| `/sprite release <name\|#>` | Let a companion go (prints a confirm command bound to that exact companion). The founder can never be released |
 | `/sprite name <name>` | Name / rename it |
 | `/sprite molt [species]` | New body, same soul — keeps name, level, stats |
 | `/sprite pet` | Pet it |

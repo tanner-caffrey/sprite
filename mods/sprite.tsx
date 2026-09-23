@@ -873,6 +873,16 @@ function boundedNonnegative(value: unknown, max: number, fallback = 0): number {
   return Math.min(max, finiteNonnegative(value, fallback));
 }
 
+// Names go straight to the panel/roster; never let control or escape
+// sequences through (ESC, C0/C1 controls, line breaks, zero-width tricks).
+function cleanName(value: unknown, max = 24): string {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\ufeff]/g, "")
+    .trim()
+    .slice(0, max);
+}
+
 function safeIdentifier(value: unknown, fallback: string): string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(value)
     ? value
@@ -949,7 +959,7 @@ function normalizeSprite(agentId: string, input: Partial<SpriteState>): SpriteSt
     ...(typeof input.temperament === "string" && TEMPERAMENTS.includes(input.temperament)
       ? { temperament: input.temperament }
       : {}),
-    name: typeof input.name === "string" && input.name ? input.name.slice(0, 24) : "Sprite",
+    name: cleanName(input.name) || "Sprite",
     named: input.named === true,
     ...(typeof input.hatchedAt === "number" ? { hatchedAt: input.hatchedAt } : {}),
     xp: boundedNonnegative(input.xp, MAX_TOTAL_XP),
@@ -977,6 +987,7 @@ function normalizeCollection(agentId: string, input: Partial<AgentCollectionStat
       sprites[sprite.id] = sprite;
     }
   }
+  ensureOneFounder(sprites, agentId);
   const requestedActive = typeof input.activeSpriteId === "string" ? input.activeSpriteId : null;
   const activeSpriteId = requestedActive && sprites[requestedActive] ? requestedActive : Object.keys(sprites)[0] ?? null;
   return {
@@ -998,11 +1009,35 @@ const RELEASED_TTL_MS = 30 * 24 * 3_600_000;
 function cleanReleased(value: Record<string, unknown>): Record<string, number> {
   const out: Record<string, number> = Object.create(null);
   const cutoff = Date.now() - RELEASED_TTL_MS;
-  for (const [id, at] of Object.entries(value).slice(0, 256)) {
-    const t = Number(at);
-    if (safeIdentifier(id, "") === id && Number.isFinite(t) && t > cutoff) out[id] = t;
-  }
+  const entries = Object.entries(value)
+    .map(([id, at]) => [id, Number(at)] as const)
+    .filter(([id, t]) => safeIdentifier(id, "") === id && Number.isFinite(t) && t > cutoff)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 256); // keep the NEWEST, never drop a fresh release
+  for (const [id, t] of entries) out[id] = t;
   return out;
+}
+
+// Exactly one founder per non-empty collection, chosen deterministically so
+// two windows normalizing the same roster agree: the sprite whose seed IS the
+// agent-id, else the one with the canonical founder id, else the earliest-born.
+function ensureOneFounder(sprites: Record<string, SpriteState>, agentId: string) {
+  const roster = Object.values(sprites);
+  if (roster.length === 0) return;
+  const canonicalId = stableId("sprite", `${agentId}:founder`);
+  const pick =
+    roster.find((sp) => sp.seed === agentId) ??
+    roster.find((sp) => sp.id === canonicalId) ??
+    roster.filter((sp) => sp.founder).sort(bornOrder)[0] ??
+    [...roster].sort(bornOrder)[0];
+  for (const sp of roster) {
+    if (sp === pick) sp.founder = true;
+    else delete sp.founder;
+  }
+}
+
+function bornOrder(a: SpriteState, b: SpriteState): number {
+  return (a.hatchedAt ?? a.eggStartedAt ?? 0) - (b.hatchedAt ?? b.eggStartedAt ?? 0) || a.id.localeCompare(b.id);
 }
 
 function emptyState(): ModState {
@@ -1257,6 +1292,7 @@ function mergeCollection(
       sprites[spriteId] = mergeSprite(undefined, localSprite, remote.sprites[spriteId]);
     }
     for (const id of Object.keys(released)) delete sprites[id];
+    ensureOneFounder(sprites, local.ownerAgentId);
     return {
       id: remote.id || local.id,
       ownerAgentId: local.ownerAgentId,
@@ -1280,9 +1316,14 @@ function mergeCollection(
   const released = cleanReleased({ ...(remote.released ?? {}), ...(local.released ?? {}) });
   const sprites = cloneState(remote.sprites);
   for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
+    // Real three-way deletion: if our base had this sprite and the remote no
+    // longer does, the remote released it — don't carry it back, no matter
+    // how old the tombstone is (or whether one exists at all).
+    if (base.sprites[spriteId] && !remote.sprites[spriteId]) continue;
     sprites[spriteId] = mergeSprite(base.sprites[spriteId], localSprite, remote.sprites[spriteId]);
   }
   for (const id of Object.keys(released)) delete sprites[id];
+  ensureOneFounder(sprites, local.ownerAgentId);
   let activeSpriteId = mergeValue(base.activeSpriteId, local.activeSpriteId, remote.activeSpriteId);
   if (activeSpriteId && !sprites[activeSpriteId]) {
     activeSpriteId = Object.values(sprites).find((sp) => sp.founder)?.id ?? Object.keys(sprites)[0] ?? null;
@@ -2124,11 +2165,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   // the one fate rolled from the agent-id).
   for (const collection of Object.values(state.collections)) {
     const roster = Object.values(collection.sprites);
-    if (roster.length > 0 && !roster.some((sp) => sp.founder)) {
-      const born = roster.find((sp) => sp.seed === collection.ownerAgentId) ?? roster[0];
-      born.founder = true;
-      dirty = true;
-    }
+    const beforeFounders = roster.map((sp) => sp.founder === true);
+    ensureOneFounder(collection.sprites, collection.ownerAgentId);
+    if (roster.some((sp, i) => (sp.founder === true) !== beforeFounders[i])) dirty = true;
     for (const sp of roster) {
       if (sp.phase === "alive" && !sp.temperament) {
         sp.temperament = temperamentOf(sp.seed);
@@ -2539,57 +2578,82 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     another = false,
   ): string {
     if (!agentId) return "i can't tell which agent this is — try again from an active conversation.";
-    const existing = getSprite(agentId);
-    if (existing && existing.phase === "egg") {
-      return "the egg is already here. it's warm.";
+    // Decide everything against the freshest disk state, under the lock, so
+    // two windows can't both slip past the cap or both mint a founder.
+    let outcome: string | null = null;
+    let created: SpriteState | null = null;
+    const ok = withLocalStateLock(() => {
+      const loadedNow = loadState();
+      if (loadedNow.corrupt) return false;
+      const latest = loadedNow.state;
+      const collection =
+        latest.collections[agentId] ??
+        (latest.collections[agentId] = {
+          id: collectionIdForLegacyAgent(agentId),
+          ownerAgentId: agentId,
+          activeSpriteId: null,
+          sprites: Object.create(null),
+        });
+      const existing = collection.activeSpriteId ? collection.sprites[collection.activeSpriteId] ?? null : null;
+      if (existing?.phase === "egg") {
+        outcome = "the egg is already here. it's warm.";
+        return true;
+      }
+      if (existing?.phase === "alive" && !another) {
+        outcome = `${existing.name} is already here. (/sprite hatch another to summon a second egg, /sprite molt to re-form, or /sprite for the card)`;
+        return true;
+      }
+      const roster = Object.values(collection.sprites);
+      if (roster.length >= MAX_SPRITES_PER_COLLECTION) {
+        outcome = `you already have ${MAX_SPRITES_PER_COLLECTION} companions — that's the most this nest can hold.`;
+        return true;
+      }
+      const founder = !roster.some((sp) => sp.founder);
+      let seed = founder ? agentId : `${agentId}:${randomBytes(6).toString("hex")}`;
+      let spriteId = founder ? stableId("sprite", `${agentId}:founder`) : stableId("sprite", seed);
+      // Never overwrite a soul that already exists under that id (a restored
+      // pre-founder collection can hold the canonical founder id un-flagged).
+      while (collection.sprites[spriteId] || collection.released?.[spriteId]) {
+        seed = `${agentId}:${randomBytes(6).toString("hex")}`;
+        spriteId = stableId("sprite", seed);
+      }
+      const fate = fateRoll(seed);
+      const species = pick && SPECIES_IDS.includes(pick) ? pick : fate.species;
+      created = {
+        id: spriteId,
+        seed,
+        bornToAgentId: agentId,
+        phase: "egg",
+        ...(founder ? { founder: true } : {}),
+        eggStartedAt: Date.now(),
+        pendingSpecies: species,
+        species,
+        shiny: fate.shiny,
+        name: agentName ? `${agentName}'s egg` : "the egg",
+        named: false,
+        xp: 0,
+        level: 1,
+        stats: { craft: 0, wander: 0, grit: 0, lore: 0, spark: 0 },
+        settings: {},
+      };
+      collection.sprites[spriteId] = created;
+      ensureOneFounder(collection.sprites, agentId);
+      collection.activeSpriteId = spriteId;
+      if (!saveState(latest)) return false;
+      reconcileInPlace(state, latest);
+      baseState = cloneState(latest);
+      outcome = founder
+        ? "an egg appears under the statusline. it's warm. (hatching soon~)"
+        : `${existing?.name ?? "your companion"} steps aside; a new egg appears under the statusline. it's warm.`;
+      return true;
+    });
+    if (!ok) return "couldn't reach the nest right now (state file busy or unreadable) — try again in a moment.";
+    if (created) {
+      dirty = false;
+      queueCheckpoint(agentId, "hatch-started");
+      panel.update();
     }
-    const collection =
-      getCollection(agentId) ??
-      (state.collections[agentId] = {
-        id: collectionIdForLegacyAgent(agentId),
-        ownerAgentId: agentId,
-        activeSpriteId: null,
-        sprites: {},
-      });
-    const hasFounder = Object.values(collection.sprites).some((sp) => sp.founder);
-    if (existing && existing.phase === "alive" && !another) {
-      return `${existing.name} is already here. (/sprite hatch another to summon a second egg, /sprite molt to re-form, or /sprite for the card)`;
-    }
-    if (Object.keys(collection.sprites).length >= MAX_SPRITES_PER_COLLECTION) {
-      return `you already have ${MAX_SPRITES_PER_COLLECTION} companions — that's the most this nest can hold.`;
-    }
-    // The first sprite is fate-rolled from the agent-id itself and becomes the
-    // protected founder. Every later one gets its own seed so fate rolls fresh.
-    const founder = !hasFounder;
-    const seed = founder ? agentId : `${agentId}:${randomBytes(6).toString("hex")}`;
-    const fate = fateRoll(seed);
-    const species = pick && SPECIES_IDS.includes(pick) ? pick : fate.species;
-    const spriteId = founder ? stableId("sprite", `${agentId}:founder`) : stableId("sprite", seed);
-    collection.sprites[spriteId] = {
-      id: spriteId,
-      seed,
-      bornToAgentId: agentId,
-      phase: "egg",
-      ...(founder ? { founder: true } : {}),
-      eggStartedAt: Date.now(),
-      pendingSpecies: species,
-      species,
-      shiny: fate.shiny,
-      name: agentName ? `${agentName}'s egg` : "the egg",
-      named: false,
-      xp: 0,
-      level: 1,
-      stats: { craft: 0, wander: 0, grit: 0, lore: 0, spark: 0 },
-      settings: {},
-    };
-    collection.activeSpriteId = spriteId;
-    markDirty();
-    flush();
-    queueCheckpoint(agentId, "hatch-started");
-    panel.update();
-    return founder
-      ? "an egg appears under the statusline. it's warm. (hatching soon~)"
-      : `${existing?.name ?? "your companion"} steps aside; a new egg appears under the statusline. it's warm.`;
+    return outcome ?? "";
   }
 
   function completeHatch(agentId: string, sprite: SpriteState) {
@@ -2605,8 +2669,10 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     markDirty();
     flush();
     queueCheckpoint(agentId, "hatched");
+    const live = getCollection(agentId)?.sprites[sprite.id];
+    if (!live) return; // released elsewhere while it was hatching
     setPose("happy", 5_000);
-    speak(sprite, "greeting", true);
+    speak(live, "greeting", true);
   }
 
   // -- panel ----------------------------------------------------------------
@@ -2859,18 +2925,33 @@ function activateInner(letta: any, disposers: Array<() => void>) {
 
   // -- shared command/tool actions -------------------------------------------
 
-  function findSprite(collection: AgentCollectionState, query: string): SpriteState | null {
+  // Resolve by roster number, exact id, exact name, then unique name prefix.
+  // Returns "ambiguous" (with candidates) rather than guessing when several match.
+  function findSprite(
+    collection: AgentCollectionState,
+    query: string,
+  ): SpriteState | { ambiguous: SpriteState[] } | null {
     const q = query.trim().toLowerCase();
     if (!q) return null;
     const roster = Object.values(collection.sprites);
     const byIndex = /^#?(\d+)$/.exec(q);
     if (byIndex) return roster[Number(byIndex[1]) - 1] ?? null;
-    return (
-      roster.find((sp) => sp.name.toLowerCase() === q) ??
-      roster.find((sp) => sp.id === q) ??
-      roster.find((sp) => sp.name.toLowerCase().startsWith(q)) ??
-      null
-    );
+    const byId = roster.find((sp) => sp.id === q);
+    if (byId) return byId;
+    const exact = roster.filter((sp) => sp.name.toLowerCase() === q);
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) return { ambiguous: exact };
+    const prefix = roster.filter((sp) => sp.name.toLowerCase().startsWith(q));
+    if (prefix.length === 1) return prefix[0];
+    if (prefix.length > 1) return { ambiguous: prefix };
+    return null;
+  }
+
+  function describeAmbiguity(collection: AgentCollectionState, matches: SpriteState[]): string {
+    const roster = Object.values(collection.sprites);
+    return `that matches ${matches.length} companions — pick one by number: ${matches
+      .map((sp) => `#${roster.indexOf(sp) + 1} ${sp.name}`)
+      .join(", ")}`;
   }
 
   function rosterLine(collection: AgentCollectionState, sp: SpriteState, index: number): string {
@@ -2905,32 +2986,46 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     if (!query.trim()) return "usage: /sprite switch <name|#>  (see /sprite list)";
     const current = getSprite(agentId);
     if (current?.phase === "egg") return "the egg is still hatching — let it finish before switching.";
-    const next = findSprite(collection, query);
-    if (!next) return `no companion called "${query}". see /sprite list.`;
+    const found = findSprite(collection, query);
+    if (!found) return `no companion called "${query}". see /sprite list.`;
+    if ("ambiguous" in found) return describeAmbiguity(collection, found.ambiguous);
+    const next = found;
     if (next.id === collection.activeSpriteId) return `${next.name} is already on the panel.`;
     collection.activeSpriteId = next.id;
     noteActivity(next);
     markDirty();
     flush();
+    // The merge may have learned this sprite was released by another window.
+    const live = getCollection(agentId)?.sprites[next.id];
+    if (!live || getCollection(agentId)?.activeSpriteId !== next.id) {
+      panel.update();
+      return `${next.name} isn't here anymore — it was released from another window. see /sprite list.`;
+    }
     queueCheckpoint(agentId, "switched");
     setPose("happy", 3_000);
-    speak(next, "greeting", true);
+    speak(live, "greeting", true);
     panel.update();
-    return `${next.name} steps onto the panel${current ? `; ${current.name} curls up to rest` : ""}.`;
+    return `${live.name} steps onto the panel${current ? `; ${current.name} curls up to rest` : ""}.`;
   }
 
   function doRelease(agentId: string | null, argstr: string): string {
     const collection = getCollection(agentId);
     if (!agentId || !collection) return "no companions yet.";
     const parts = argstr.split(/\s+/).filter(Boolean);
-    const confirm = parts[parts.length - 1] === "confirm";
-    const query = (confirm ? parts.slice(0, -1) : parts).join(" ");
-    if (!query) return "usage: /sprite release <name|#> confirm";
-    const target = findSprite(collection, query);
-    if (!target) return `no companion called "${query}". see /sprite list.`;
+    // Confirmation is bound to the exact soul id shown in the prompt, so a
+    // roster shift or a new same-named sprite between prompt and confirm can
+    // never redirect the release.
+    const confirmIdx = parts.findIndex((p) => p.startsWith("confirm:"));
+    const confirmId = confirmIdx >= 0 ? parts[confirmIdx].slice("confirm:".length) : null;
+    const query = (confirmIdx >= 0 ? parts.filter((_, i) => i !== confirmIdx) : parts).join(" ");
+    if (!query && !confirmId) return "usage: /sprite release <name|#>  (then confirm with the command it prints)";
+    const found = confirmId ? collection.sprites[confirmId] ?? null : findSprite(collection, query);
+    if (!found) return `no companion called "${query || confirmId}". see /sprite list.`;
+    if ("ambiguous" in found) return describeAmbiguity(collection, found.ambiguous);
+    const target = found;
     if (target.founder) return `${target.name} is your founder — the one fate rolled from you. founders can't be released.`;
-    if (!confirm) {
-      return `release ${target.name} (${speciesOf(target).id}, lv.${target.level})? this can't be undone. run: /sprite release ${target.name} confirm`;
+    if (!confirmId) {
+      return `release ${target.name} (${speciesOf(target).id}, lv.${target.level})? this can't be undone. run: /sprite release confirm:${target.id}`;
     }
     delete collection.sprites[target.id];
     collection.released = { ...(collection.released ?? {}), [target.id]: Date.now() };
@@ -2955,8 +3050,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   function doName(agentId: string | null, name: string): string {
     const res = requireSprite(agentId);
     if ("error" in res) return res.error;
-    const clean = name.trim().slice(0, 24);
+    const clean = cleanName(name);
     if (!clean) return "give it a real name~ (/sprite name <name>)";
+    if (/^#?\d+$/.test(clean)) return "numbers are roster positions — pick a name with a letter in it.";
     res.name = clean;
     res.named = true;
     markDirty();
@@ -3223,8 +3319,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       "  /sprite switch <name|#>        Put a different companion on the panel. Only the",
       "                                 one on the panel earns experience and speaks;",
       "                                 the others rest, and remember everything.",
-      "  /sprite release <name> confirm Let a companion go for good. Founders can't be",
-      "                                 released.",
+      "  /sprite release <name|#>       Let a companion go for good. Prints a confirm",
+      "                                 command bound to that exact companion. Founders",
+      "                                 can't be released.",
       "  /sprite name <name>            Give your companion a name (up to 24 characters).",
       "  /sprite molt [species]         Change its body but keep its soul: name, level,",
       "                                 stats, voice, and diary all carry over. Picks a",
