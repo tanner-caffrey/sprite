@@ -2551,7 +2551,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   if (seenVersion !== MOD_VERSION) {
     state.global.lastSeenVersion = MOD_VERSION;
     if (updatedFrom) state.global.updateNoticeFrom = updatedFrom;
-    dirty = true;
+    // Bookkeeping only: never the reason to write over a file we couldn't read.
+    if (!loaded.corrupt) dirty = true;
   }
 
   if (dirty) flush();

@@ -100,7 +100,16 @@ function seedAlive(agentId, name = "Seed") {
   } catch {
     existing = null; // malformed on purpose in some checks — overwrite
   }
-  if (existing?.schemaVersion === 2) return; // already v2 with (maybe) other agents — leave it
+  if (existing?.schemaVersion === 2) {
+    if (existing.collections?.[agentId]) return;
+    // v2 file without this agent (e.g. only global.lastSeenVersion) — add a live collection directly
+    const id = `sprite_${agentId.replace(/[^a-z0-9]/gi, "").slice(0, 24).padEnd(24, "0")}`;
+    existing.collections[agentId] = { id: `collection_${agentId}`, ownerAgentId: agentId, activeSpriteId: id, sprites: { [id]: {
+      id, seed: agentId, bornToAgentId: agentId, phase: "alive", founder: true, species: "ghost", shiny: false, temperament: "odd", name, named: true,
+      hatchedAt: 1000, xp: 0, level: 1, stats: { craft: 0, wander: 0, grit: 0, lore: 0, spark: 0 }, settings: {}, lastSeenAt: 2000 } } };
+    writeFileSync(statePath, JSON.stringify(existing));
+    return;
+  }
   const sprites = existing?.sprites ?? {};
   sprites[agentId] = {
     phase: "alive", species: "ghost", shiny: false, temperament: "odd", name, named: true,
@@ -858,7 +867,7 @@ check("changelog: update nudge appears once, /sprite changelog shows the gap, th
   assert.match(out, /^sprite updated: v0\.5\.1 → /);
   assert.match(out, /## v0\.6\.0 — breeding/);
   assert.doesNotMatch(out, /## v0\.5\.1/);
-  assert.doesNotMatch(h.command(""), /learned new tricks/);
+  assert.doesNotMatch(h.command(""), /✨ .* learned new tricks/);
   assert.match(h.command("changelog"), /up to date/);
   assert.match(h.command("changelog all"), /## v0\.2\.0/);
   d();

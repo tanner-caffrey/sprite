@@ -3,6 +3,10 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.7.1
+- The version bookkeeping added in 0.7.0 could mark state dirty after an
+  unreadable load; it no longer does.
+
 ## v0.7.0 — what's new, in-mod
 - `/sprite changelog` shows what changed since the version you last ran;
   `/sprite changelog all` shows everything. After an update your companion
