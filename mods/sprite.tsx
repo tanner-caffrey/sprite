@@ -1152,11 +1152,17 @@ export const HELP: HelpEntry[] = [
     details: ["A setting for this companion overrides the global default. Use `global` to change the default for all of them."],
   },
   {
-    cmd: "changelog", aliases: ["whatsnew", "version"], group: "info",
+    cmd: "changelog", aliases: ["version"], group: "info",
     summary: "What changed since the version you last ran.",
     usage: ["/sprite changelog", "/sprite changelog all"],
     options: [["all", "The whole history."]],
     details: ["After an update, your companion notes it once in its diary and the card nudges until you've read this."],
+  },
+  {
+    cmd: "whatsnew", aliases: ["release-notes"], group: "info",
+    summary: "The release notes: everything new since the mod-challenge version (v0.2), written as a story.",
+    usage: ["/sprite whatsnew"],
+    details: ["Read this if you installed sprite from the Letta mod challenge and are updating for the first time."],
   },
   {
     cmd: "help", group: "info",
@@ -1303,6 +1309,15 @@ function readChangelog(): ChangelogSection[] {
     return sections;
   } catch {
     return [];
+  }
+}
+
+function readReleaseNotes(): string {
+  try {
+    if (!MOD_DIR) return "";
+    return readFileSync(join(MOD_DIR, "..", "RELEASE-NOTES.md"), "utf-8").trim();
+  } catch {
+    return "";
   }
 }
 
@@ -3077,7 +3092,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
 
   // Update nudge: remember the last version that ran; if it moved, say so once
   // (on the panel via the active sprite's diary, and in the card).
-  const seenVersion = typeof state.global.lastSeenVersion === "string" ? state.global.lastSeenVersion : null;
+  const hadCompanions = Object.values(state.collections).some((c) => Object.keys(c.sprites).length > 0);
+  const seenVersion = typeof state.global.lastSeenVersion === "string" ? state.global.lastSeenVersion : hadCompanions ? "0.2.0" : null;
   const updatedFrom = seenVersion && semverCompare(MOD_VERSION, seenVersion) > 0 ? seenVersion : null;
   if (seenVersion !== MOD_VERSION) {
     state.global.lastSeenVersion = MOD_VERSION;
@@ -4798,7 +4814,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         ? `companions: ${Object.keys(getCollection(agentId)!.sprites).length} (/sprite list · /sprite switch <name>)`
         : "",
       typeof state.global.updateNoticeFrom === "string"
-        ? `✨ ${sprite.name} learned new tricks (v${state.global.updateNoticeFrom} → v${MOD_VERSION}) — /sprite changelog`
+        ? `✨ ${sprite.name} learned new tricks (v${state.global.updateNoticeFrom} → v${MOD_VERSION}) — ${semverCompare(String(state.global.updateNoticeFrom), "0.3.0") < 0 ? "/sprite whatsnew for the whole story" : "/sprite changelog"}`
         : "",
     ].filter(Boolean);
     return lines.join("\n");
@@ -5021,9 +5037,12 @@ function activateInner(letta: any, disposers: Array<() => void>) {
               output = doBackup(agentId, restStr);
               break;
             case "changelog":
-            case "whatsnew":
             case "version":
               output = doChangelog(restStr);
+              break;
+            case "whatsnew":
+            case "release-notes":
+              output = readReleaseNotes() || "no release notes shipped with this build.";
               break;
             case "help":
             case "-h":

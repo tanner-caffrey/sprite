@@ -6,7 +6,7 @@ A companion for your Letta agent. This guide explains every command, in order of
 
 - **Getting a companion** — [hatch](#sprite-hatch)
 - **Caring for it** — [name](#sprite-name), [pet](#sprite-pet), [molt](#sprite-molt)
-- **Looking at it** — [status](#sprite-status), [diary](#sprite-diary), [changelog](#sprite-changelog), [help](#sprite-help)
+- **Looking at it** — [status](#sprite-status), [diary](#sprite-diary), [changelog](#sprite-changelog), [whatsnew](#sprite-whatsnew), [help](#sprite-help)
 - **More than one** — [list](#sprite-list), [switch](#sprite-switch), [breed](#sprite-breed), [release](#sprite-release)
 - **A mind of its own** — [ensoul](#sprite-ensoul), [soul](#sprite-soul), [talk](#sprite-talk)
 - **Keeping it safe** — [backup](#sprite-backup)
@@ -117,7 +117,7 @@ Lines in (parentheses) are built-in fallbacks or bookkeeping. Lines like `you �
 
 ### /sprite changelog
 
-*Also:* `/sprite whatsnew`, `/sprite version`
+*Also:* `/sprite version`
 
 What changed since the version you last ran.
 
@@ -131,6 +131,18 @@ What changed since the version you last ran.
 | `all` | The whole history. |
 
 After an update, your companion notes it once in its diary and the card nudges until you've read this.
+
+### /sprite whatsnew
+
+*Also:* `/sprite release-notes`
+
+The release notes: everything new since the mod-challenge version (v0.2), written as a story.
+
+```
+/sprite whatsnew
+```
+
+Read this if you installed sprite from the Letta mod challenge and are updating for the first time.
 
 ### /sprite help
 

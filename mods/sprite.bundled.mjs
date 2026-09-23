@@ -11042,12 +11042,20 @@ var HELP = [
   },
   {
     cmd: "changelog",
-    aliases: ["whatsnew", "version"],
+    aliases: ["version"],
     group: "info",
     summary: "What changed since the version you last ran.",
     usage: ["/sprite changelog", "/sprite changelog all"],
     options: [["all", "The whole history."]],
     details: ["After an update, your companion notes it once in its diary and the card nudges until you've read this."]
+  },
+  {
+    cmd: "whatsnew",
+    aliases: ["release-notes"],
+    group: "info",
+    summary: "The release notes: everything new since the mod-challenge version (v0.2), written as a story.",
+    usage: ["/sprite whatsnew"],
+    details: ["Read this if you installed sprite from the Letta mod challenge and are updating for the first time."]
   },
   {
     cmd: "help",
@@ -11191,6 +11199,15 @@ function readChangelog() {
     return sections;
   } catch {
     return [];
+  }
+}
+function readReleaseNotes() {
+  try {
+    if (!MOD_DIR)
+      return "";
+    return readFileSync2(join6(MOD_DIR, "..", "RELEASE-NOTES.md"), "utf-8").trim();
+  } catch {
+    return "";
   }
 }
 function formatChangelog(sections, heading) {
@@ -12660,7 +12677,8 @@ function activateInner(letta, disposers) {
       dirty = false;
     return replaced ?? false;
   };
-  const seenVersion = typeof state.global.lastSeenVersion === "string" ? state.global.lastSeenVersion : null;
+  const hadCompanions = Object.values(state.collections).some((c) => Object.keys(c.sprites).length > 0);
+  const seenVersion = typeof state.global.lastSeenVersion === "string" ? state.global.lastSeenVersion : hadCompanions ? "0.2.0" : null;
   const updatedFrom = seenVersion && semverCompare(MOD_VERSION, seenVersion) > 0 ? seenVersion : null;
   if (seenVersion !== MOD_VERSION) {
     state.global.lastSeenVersion = MOD_VERSION;
@@ -14372,7 +14390,7 @@ ${recent.join(`
       sprite.soul ? `mind: ${sprite.soul.backend} \xB7 ${sprite.soul.model} \xB7 sees ${sprite.soul.see} \xB7 ${sprite.soul.lineCount} live lines (/sprite soul)` : "",
       sprite.named ? "" : `(name it: /sprite name <name>)`,
       Object.keys(getCollection(agentId)?.sprites ?? {}).length > 1 ? `companions: ${Object.keys(getCollection(agentId).sprites).length} (/sprite list \xB7 /sprite switch <name>)` : "",
-      typeof state.global.updateNoticeFrom === "string" ? `\u2728 ${sprite.name} learned new tricks (v${state.global.updateNoticeFrom} \u2192 v${MOD_VERSION}) \u2014 /sprite changelog` : ""
+      typeof state.global.updateNoticeFrom === "string" ? `\u2728 ${sprite.name} learned new tricks (v${state.global.updateNoticeFrom} \u2192 v${MOD_VERSION}) \u2014 ${semverCompare(String(state.global.updateNoticeFrom), "0.3.0") < 0 ? "/sprite whatsnew for the whole story" : "/sprite changelog"}` : ""
     ].filter(Boolean);
     return lines.join(`
 `);
@@ -14604,9 +14622,12 @@ ${recent.join(`
             output = doBackup(agentId, restStr);
             break;
           case "changelog":
-          case "whatsnew":
           case "version":
             output = doChangelog(restStr);
+            break;
+          case "whatsnew":
+          case "release-notes":
+            output = readReleaseNotes() || "no release notes shipped with this build.";
             break;
           case "help":
           case "-h":

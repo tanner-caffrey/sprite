@@ -878,8 +878,14 @@ check("changelog: update nudge appears once, /sprite changelog shows the gap, th
   assert.doesNotMatch(h.command(""), /✨ .* learned new tricks/);
   assert.match(h.command("changelog"), /up to date/);
   assert.match(h.command("changelog all"), /## v0\.2\.0/);
+  assert.match(h.command("whatsnew"), /^# What's new since v0\.2/);
   d();
   assert.equal(readState().global.updateNoticeFrom, undefined);
+  // a mod-challenge install: companions exist, no lastSeenVersion → nudge to whatsnew
+  const st2 = JSON.parse(readFileSync(statePath, "utf-8")); delete st2.global.lastSeenVersion; writeFileSync(statePath, JSON.stringify(st2));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
+  assert.match(h2.command(""), /v0\.2\.0 → v\d+\.\d+\.\d+\) — \/sprite whatsnew/);
+  d2();
 });
 
 // ---------------------------------------------------------------------------
