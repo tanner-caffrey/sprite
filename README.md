@@ -163,6 +163,18 @@ Stat bars wrap: when one fills it starts over and its lap count rises. `laps` pi
 > with its own little memory. Comes with a voice; bring a model and it comes
 > alive.
 
+## Layout
+
+```
+mods/sprite.tsx           the mod (source)
+mods/sprite.bundled.mjs   what Letta Code loads — built from the source with the Agent SDK inside,
+                          because `letta install` clones the repo and does not run a build step.
+                          Regenerate with `bun run build`; never edit by hand.
+breeding/                 the genetics (species, hybrids, inheritance) — also the reference the mod is tested against
+test/                     `bun run test`: smoke, persistence, hardening (48 checks), genetics
+scripts/                  build, guide (GUIDE.md from the help table), changelog, release
+```
+
 ## Notes
 
 - Live state stays in `~/.letta/mods/sprite.state.json` (override with

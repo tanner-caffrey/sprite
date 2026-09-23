@@ -153,7 +153,7 @@ function writePortable(memoryDir, payload) {
   return p;
 }
 
-const { default: activate } = await import("./mods/sprite.tsx");
+const { default: activate } = await import("../mods/sprite.tsx");
 let passed = 0;
 function check(name, fn) {
   rmSync(statePath, { force: true });
@@ -578,8 +578,8 @@ check("#4b stat merge across two windows clamps at MAX_STAT", () => {
 
 // ---------------------------------------------------------------------------
 await check("#14 breeding: seed delimiter can't collide; chimera has poses + a voice", async () => {
-  const g = await import("./breeding/genetics.mjs");
-  const h = await import("./breeding/hybrids.mjs");
+  const g = await import("../breeding/genetics.mjs");
+  const h = await import("../breeding/hybrids.mjs");
   assert.notEqual(g.childFateSeed("a", "b|c", "n"), g.childFateSeed("a|b", "c", "n"));
   assert.notEqual(g.childFateSeed("a", "b", "1|2"), g.childFateSeed("a", "b|1", "2"));
   assert.ok(h.HYBRID_POSES.chimera?.idle && h.HYBRID_CORPUS.chimera?.pet?.length > 0);
@@ -807,8 +807,8 @@ check("breed: a hybrid child renders + speaks with its own body and voice", () =
 
 // ---------------------------------------------------------------------------
 await check("breed: the mod's genetics are bit-identical to breeding/genetics.mjs", async () => {
-  const ref = await import("./breeding/genetics.mjs");
-  const mod = (await import("./mods/sprite.tsx")).__genetics;
+  const ref = await import("../breeding/genetics.mjs");
+  const mod = (await import("../mods/sprite.tsx")).__genetics;
   const species = ["cat", "duck", "slime", "fox", "crab", "moth", "fairy", "ghost", "dragon", "phoenix", "hauntcrab", "chimera"];
   const temps = ["gentle", "wry", "bold", "sleepy", "odd"];
   let n = 0;
@@ -891,10 +891,10 @@ check("changelog: update nudge appears once, /sprite changelog shows the gap, th
 // ---------------------------------------------------------------------------
 await check("bundle: mods/sprite.bundled.mjs is fresh and activates like the source", async () => {
   const { statSync } = await import("node:fs");
-  const src = statSync(join(import.meta.dirname, "mods", "sprite.tsx")).mtimeMs;
-  const bundled = statSync(join(import.meta.dirname, "mods", "sprite.bundled.mjs")).mtimeMs;
+  const src = statSync(join(import.meta.dirname, "..", "mods", "sprite.tsx")).mtimeMs;
+  const bundled = statSync(join(import.meta.dirname, "..", "mods", "sprite.bundled.mjs")).mtimeMs;
   assert.ok(bundled >= src, "bundle is older than source — run `bun run build`");
-  const { default: activateBundled } = await import("./mods/sprite.bundled.mjs");
+  const { default: activateBundled } = await import("../mods/sprite.bundled.mjs");
   const agent = { id: "agent-bundle", name: "Bundle" };
   seedAlive(agent.id);
   const h = makeLetta(agent, null); const d = activateBundled(h.letta);
@@ -948,7 +948,7 @@ function mockSoulClient(opts = {}) {
     },
   };
 }
-const { __setSoulClientFactory } = await import("./mods/sprite.tsx");
+const { __setSoulClientFactory } = await import("../mods/sprite.tsx");
 const tick = () => new Promise((r) => setTimeout(r, 30));
 
 // helper: ensoul through the tool, the way the agent would after the walkthrough
@@ -1312,8 +1312,8 @@ await check("soul: sprite_ensoul and sprite_soul_persona require approval; soul 
 
 // ---------------------------------------------------------------------------
 await check("help: every subcommand has an entry, `<sub> help` works, GUIDE.md is generated from the same table", async () => {
-  const { HELP } = await import("./mods/sprite.tsx");
-  const src = readFileSync(join(import.meta.dirname, "mods", "sprite.tsx"), "utf-8");
+  const { HELP } = await import("../mods/sprite.tsx");
+  const src = readFileSync(join(import.meta.dirname, "..", "mods", "sprite.tsx"), "utf-8");
   const dispatched = new Set([...src.matchAll(/^\s{12}case "([a-z-]+)":/gm)].map((m) => m[1]).filter((c) => !["-h", "--help"].includes(c)));
   const helped = new Set(HELP.flatMap((h) => [h.cmd, ...(h.aliases ?? [])]));
   for (const c of dispatched) if (!helped.has(c) && c !== "?") assert.fail(`dispatched subcommand "${c}" has no help entry`);
@@ -1327,14 +1327,14 @@ await check("help: every subcommand has an entry, `<sub> help` works, GUIDE.md i
   assert.match(host.command("backup --help"), /restore force/);
   assert.match(host.command("help nope"), /no help for "nope"/);
   d();
-  const guide = readFileSync(join(import.meta.dirname, "GUIDE.md"), "utf-8");
+  const guide = readFileSync(join(import.meta.dirname, "..", "GUIDE.md"), "utf-8");
   for (const h of HELP) assert.ok(guide.includes(`### /sprite ${h.cmd}`), `GUIDE.md missing ${h.cmd} — run bun run guide`);
   const { statSync } = await import("node:fs");
-  assert.ok(statSync(join(import.meta.dirname, "GUIDE.md")).mtimeMs >= statSync(join(import.meta.dirname, "mods", "sprite.tsx")).mtimeMs - 5_000, "GUIDE.md is older than the help table — run bun run guide");
+  assert.ok(statSync(join(import.meta.dirname, "..", "GUIDE.md")).mtimeMs >= statSync(join(import.meta.dirname, "..", "mods", "sprite.tsx")).mtimeMs - 5_000, "GUIDE.md is older than the help table — run bun run guide");
 });
 
 await check("soul: cloud minds go through the host's letta.client (in-process), not a spawned Letta Code", async () => {
-  const { __setHostClient } = await import("./mods/sprite.tsx");
+  const { __setHostClient } = await import("../mods/sprite.tsx");
   __setSoulClientFactory(undefined); // restore the real factory for this check
   const created = new Map(); const calls = [];
   const host = {

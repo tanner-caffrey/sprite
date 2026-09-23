@@ -26,11 +26,8 @@
     "README.md",
     "RELEASE-NOTES.md",
     "breeding",
-    "hardening-test.mjs",
     "mods",
-    "persistence-test.mjs",
-    "scripts",
-    "smoke-test.mjs"
+    "scripts"
   ],
   "letta": {
     "manifestVersion": 1,
@@ -51,7 +48,7 @@
     }
   },
   "scripts": {
-    "test": "bun smoke-test.mjs && bun persistence-test.mjs && bun hardening-test.mjs && node breeding/genetics.test.mjs",
+    "test": "bun test/smoke.test.mjs && bun test/persistence.test.mjs && bun test/hardening.test.mjs && node test/genetics.test.mjs",
     "changelog": "node scripts/changelog.mjs",
     "build": "node scripts/build.mjs",
     "release": "scripts/release.sh",

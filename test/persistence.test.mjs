@@ -136,7 +136,7 @@ function lifetimeXp(sprite) {
 
 setupMemoryRepo();
 writeLegacyState();
-const { default: activate } = await import("./mods/sprite.tsx");
+const { default: activate } = await import("../mods/sprite.tsx");
 
 try {
   const first = makeLetta(AGENT_A);

@@ -1,8 +1,8 @@
-// genetics.test.mjs — verify the breeding core behaves as designed. `node genetics.test.mjs`
+// genetics.test.mjs — verify the breeding core behaves as designed. `node test/genetics.test.mjs`
 import {
   breed, childFateSeed, rollSpecies, rollShiny, rollTemperament, rarityOf,
   SPECIES, TEMPERAMENTS,
-} from "./genetics.mjs";
+} from "../breeding/genetics.mjs";
 
 let pass = 0, fail = 0;
 const ok = (name, cond, extra = "") => {

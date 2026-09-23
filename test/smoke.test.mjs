@@ -6,7 +6,7 @@ import { join } from "node:path";
 const tempDir = mkdtempSync(join(tmpdir(), "sprite-smoke-"));
 process.env.SPRITE_STATE_PATH = join(tempDir, "sprite.state.json");
 
-const { default: activate } = await import("./mods/sprite.tsx");
+const { default: activate } = await import("../mods/sprite.tsx");
 
 const tools = new Map();
 const commands = new Map();
