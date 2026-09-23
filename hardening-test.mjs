@@ -711,4 +711,81 @@ check("multi: concurrent hatch another can't exceed the cap", () => {
   assert.equal(Object.keys(readState().collections[agent.id].sprites).length, 12);
 });
 
+// ---------------------------------------------------------------------------
+check("breed: gates, lineage, order-independence, and a forced hauntcrab", () => {
+  const agent = { id: "agent-breed", name: "Breed" };
+  const { host, dispose } = hatchFor(agent, null);
+  host.command("name Poof");
+  dispose();
+  const st = readState(); const c = st.collections[agent.id];
+  const poof = c.sprites[c.activeSpriteId];
+  poof.species = "ghost"; poof.level = 12; poof.temperament = "odd";
+  const clawId = "sprite_clawson00000000000000000";
+  c.sprites[clawId] = { ...poof, id: clawId, name: "Clawson", founder: undefined, seed: "clawson", species: "crab", temperament: "bold", level: 3 };
+  writeFileSync(statePath, JSON.stringify(st));
+  const h = makeLetta(agent, null); const d = activate(h.letta); h.fire("conversation_open", { agentId: agent.id });
+  assert.match(h.command("breed Poof Clawson"), /only lv\.3/);
+  assert.match(h.command("breed Poof Poof"), /can't breed with itself/);
+  const st2 = readState(); st2.collections[agent.id].sprites[clawId].level = 10; writeFileSync(statePath, JSON.stringify(st2));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
+  d();
+  const out = h2.command("breed Clawson Poof");
+  assert.match(out, /egg appears .* \(gen 1\)/, out);
+  const c3 = readState().collections[agent.id];
+  const egg = Object.values(c3.sprites).find((sp) => sp.parents);
+  assert.ok(egg);
+  assert.deepEqual(new Set(egg.parents), new Set([poof.id, clawId]));
+  assert.equal(egg.generation, 1);
+  assert.equal(c3.activeSpriteId, egg.id);
+  assert.ok(c3.sprites[poof.id].lastBredAt && c3.sprites[clawId].lastBredAt);
+  assert.match(h2.command("breed Poof Clawson"), /already an egg/);
+  // hatch by hand, then cooldown blocks
+  const st4 = readState(); const c4 = st4.collections[agent.id]; c4.sprites[egg.id].phase = "alive"; writeFileSync(statePath, JSON.stringify(st4));
+  const h3 = makeLetta(agent, null); const d3 = activate(h3.letta); h3.fire("conversation_open", { agentId: agent.id });
+  d2();
+  assert.match(h3.command("breed Poof Clawson"), /ready again in \d+ day/);
+  assert.match(h3.command("list"), /gen 1/);
+  h3.command(`switch ${egg.id}`);
+  assert.match(h3.command(""), /lineage: gen 1, child of (Poof and Clawson|Clawson and Poof)/, h3.command(""));
+  // release-on-parent leaves lineage readable
+  assert.match(h3.command(`release confirm:${clawId}`), /drifts off/);
+  assert.match(h3.command(""), /a companion now gone/);
+  d3();
+});
+
+check("breed: a hybrid child renders + speaks with its own body and voice", () => {
+  // search nonces offline until crab×ghost rolls "hybrid", then plant the egg
+  const agent = { id: "agent-hybrid", name: "Hybrid" };
+  const { host, dispose } = hatchFor(agent, null); host.command("name Poof"); dispose();
+  const st = readState(); const c = st.collections[agent.id]; const poof = c.sprites[c.activeSpriteId];
+  poof.species = "ghost"; poof.level = 12;
+  const clawId = "sprite_clawson00000000000000000";
+  c.sprites[clawId] = { ...poof, id: clawId, name: "Clawson", founder: undefined, seed: "clawson", species: "crab", temperament: "bold" };
+  writeFileSync(statePath, JSON.stringify(st));
+  let hybridSeen = null;
+  for (let i = 0; i < 400 && !hybridSeen; i += 1) {
+    const st2 = readState(); const c2 = st2.collections[agent.id];
+    for (const sp of Object.values(c2.sprites)) { delete sp.lastBredAt; if (sp.parents) delete c2.sprites[sp.id]; }
+    delete c2.released; c2.activeSpriteId = poof.id; writeFileSync(statePath, JSON.stringify(st2));
+    const h = makeLetta(agent, null); const d = activate(h.letta); h.fire("conversation_open", { agentId: agent.id });
+    const out = h.command("breed Poof Clawson");
+    assert.match(out, /egg appears/, out);
+    d();
+    const egg = Object.values(readState().collections[agent.id].sprites).find((sp) => sp.parents);
+    if (egg.species === "hauntcrab") hybridSeen = egg;
+  }
+  assert.ok(hybridSeen, "never rolled a hauntcrab in 400 tries (expected ~5%)");
+  const st3 = readState(); st3.collections[agent.id].sprites[hybridSeen.id].phase = "alive"; writeFileSync(statePath, JSON.stringify(st3));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
+  h2.command(`switch ${hybridSeen.id}`);
+  const card = h2.command("");
+  assert.match(card, /\(👻ω👻\)⌐/, card);
+  assert.match(card, /species: hauntcrab \(special\)/, card);
+  assert.match(card, /a hybrid, the first of its kind/, card);
+  const pet = String(h2.tools.get("sprite_pet").run({ agent, args: {} }));
+  assert.match(pet, /clack|claw|hauntcrab|boo|drift|through me|sideways/i, pet);
+  assert.match(h2.command("molt hauntcrab"), /unknown species/); // hybrids aren't moltable-into
+  d2();
+});
+
 console.log(`\nSprite hardening test passed (${passed} checks).`);

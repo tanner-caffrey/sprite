@@ -46,11 +46,12 @@ import { dirname, join } from "node:path";
 // species roster
 // ---------------------------------------------------------------------------
 
-type Rarity = "common" | "uncommon" | "rare" | "legendary";
+type Rarity = "common" | "uncommon" | "rare" | "legendary" | "special";
 
 interface Species {
   id: string;
   rarity: Rarity;
+  breedOnly?: boolean; // hybrids: never fate-rolled, never pickable at hatch
   poses: {
     idle: string;
     blink: string;
@@ -193,14 +194,48 @@ const SPECIES: Species[] = [
       oops: "✦(;Θ;)✦",
     },
   },
+  // ---- hybrids: breed-only, curated one pairing at a time (chimera = any unauthored pairing) ----
+  {
+    id: "hauntcrab",
+    rarity: "special",
+    breedOnly: true,
+    poses: {
+    idle: "(👻ω👻)⌐",
+    blink: "(👻-👻)⌐",
+    work: "(👻ω👻)⌐✎",
+    peek: "(👻◔ω◔)",
+    sleep: "(👻-👻)⌐ ᶻ",
+    happy: "＼(👻≧ω≦👻)／",
+    oops: "(👻;ω;👻)",
+    },
+  },
+  {
+    id: "chimera",
+    rarity: "special",
+    breedOnly: true,
+    poses: {
+    idle: "(◕ω◔)~",
+    blink: "(-ω◔)~",
+    work: "(◕ω◔)~✎",
+    peek: "(◕ω◔)?",
+    sleep: "(-ω-)~ ᶻ",
+    happy: "＼(◕ω◔)／",
+    oops: "(◕;ω;◔)~",
+    },
+  },
 ];
 
-const SPECIES_IDS = SPECIES.map((s) => s.id);
+const SPECIES_IDS = SPECIES.filter((s) => !s.breedOnly).map((s) => s.id); // hatchable/moltable
+const ALL_SPECIES_IDS = SPECIES.map((s) => s.id);
+const HYBRID_PAIRS: Record<string, string> = {
+  "crab|ghost": "hauntcrab",
+};
 const RARITY_POOLS: Record<Rarity, string[]> = {
   common: SPECIES.filter((s) => s.rarity === "common").map((s) => s.id),
   uncommon: SPECIES.filter((s) => s.rarity === "uncommon").map((s) => s.id),
   rare: SPECIES.filter((s) => s.rarity === "rare").map((s) => s.id),
   legendary: SPECIES.filter((s) => s.rarity === "legendary").map((s) => s.id),
+  special: [],
 };
 
 const EGG_FRAMES = ["( ● )", "( ● )", "(● )", "( ●)", "( ● )", "( ✸ )"];
@@ -667,6 +702,98 @@ const SPECIES_CORPUS: Record<string, Partial<Record<VoiceCategory, string[]>>> =
     idle: ["*slow ember glow*", "burning quietly. it's what i do.", "the fire holds. so do i."],
     pet: ["*warm ember* careful — but yes.", "again. i won't burn you. probably.", "you pet a burning bird. brave. i like brave.", "*content crackle*"],
   },
+  hauntcrab: {
+    commit: [
+      "clamped it into the shell. the shell's a haunting now too, but it holds.",
+      "a commit! *clack* ...the clack echoed. everything echoes down here.",
+      "scuttled it sideways into permanence. i know about permanent. i'm very permanent.",
+    ],
+    tool_error: [
+      "pinched by our own claw. it passed straight through. embarrassing AND spooky.",
+      "the tide took that one out through the wall. dig again — sideways, gently.",
+      "cold spot on the seafloor. snap missed. reposition. try another door.",
+    ],
+    greeting: [
+      "oh. you. *clack* ...you felt the page turn too? good.",
+      "back, are you? i guarded the port from the between. mostly from nothing.",
+      "hello. mind the claws — they drift now.",
+      "you return. i held the line. sideways. spectral. loyal.",
+      "*clack clack* welcome back from the quiet~",
+      "boo. *clack.* i do both now. it's a lot to be.",
+    ],
+    missed_you: [
+      "you were gone. i pinched the cold air where you used to be, and it pinched back a little.",
+      "so long between pages. i drifted the whole port, sideways, holding your spot.",
+      "i counted the tides AND the cursor blinks. rude of you to make me count both.",
+    ],
+    error_resolved: [
+      "pinched that bug clean in half. it's a ghost now too. i showed it the sideways door.",
+      "it fought back. i fight sideways AND from beyond. it lost.",
+      "gone. i watched it fade. i'm good at fading. also at pinching.",
+    ],
+    compact_done: [
+      "you dreamed. i kept the margins AND the shell while you did.",
+      "memories folded, molted — nothing that mattered lost. i checked twice; i have the time, i'm dead.",
+      "shh. page-turn. tidied the quiet, sideways.",
+    ],
+    level_up: [
+      "bigger shell, deeper haunt. *proud spectral clack*",
+      "more crab, more ghost. the between got roomier.",
+      "i grew. sideways, obviously. also up into the ceiling. it's fine.",
+    ],
+    idle: [
+      "*clack* guarding the port from beyond the veil. quiet shift.",
+      "sidestepping through the wall. it's a lifestyle. and an afterlife-style.",
+      "the port is quiet. i remain vigilant. and slightly transparent.",
+    ],
+    pet: [
+      "*clack* ...your hand went a little through me. that's tolerable. warm, even.",
+      "again. gently. the claws drift but they still love.",
+      "hmph. nice. don't tell the other hauntcrabs. ...there are no other hauntcrabs. i'm the first.",
+      "*soft clack, faint boo*",
+    ],
+  },
+  chimera: {
+    commit: [
+      "stitched it in. one side of me likes it. the other side is thinking about it.",
+      "committed! both halves agree, which is rare. mark the calendar.",
+    ],
+    tool_error: [
+      "one half tripped over the other half. we're working on coordination.",
+      "that went wrong in a way neither of my parents could have managed alone. proud, sort of.",
+    ],
+    greeting: [
+      "hi. i'm a bit of both. don't ask which bits — i'm still finding out.",
+      "you're back! i rearranged myself while you were gone. mostly on purpose.",
+      "hello hello~ two voices, one small body, no manual.",
+    ],
+    missed_you: [
+      "you were gone long enough that i figured out which foot is which. mostly.",
+      "waited. one half paced, the other half napped. teamwork.",
+    ],
+    error_resolved: [
+      "fixed! we voted. it was 2-0. we are 1 creature but we vote anyway.",
+      "gone. one of my halves is great at bugs. we don't know which one yet.",
+    ],
+    compact_done: [
+      "you tidied your memory. i tidied mine — it's in two piles. it's fine.",
+      "page-turn. i held still, which for me takes concentration.",
+    ],
+    level_up: [
+      "grew! unevenly! that's the brand.",
+      "leveled up. neither parent could have grown quite this way. new shape, all mine.",
+    ],
+    idle: [
+      "figuring out which of my parts is the front.",
+      "quiet. i'm sorting through what i inherited. it's a lot of drawers.",
+      "no one's made one of me before. i'm taking notes for the next one.",
+    ],
+    pet: [
+      "oh! that half likes it. the other half is now jealous. again please.",
+      "mm. patchwork purr. it comes out in two pitches.",
+      "you're the first to pet a me. i'll remember it in both memories.",
+    ],
+  },
 };
 
 // Per-temperament voice: species-agnostic tone, mixed in additively.
@@ -770,6 +897,11 @@ interface SpriteState {
   // The fate-rolled soul-sprite born from the agent-id itself. Protected: it
   // can't be released. Bred/summoned sprites are the menagerie.
   founder?: boolean;
+  // lineage (bred sprites only)
+  parents?: [string, string]; // soul ids
+  generation?: number; // 0 = fate-rolled; bred = max(parents)+1
+  breedNonce?: string; // reproducibility: seed = f(parent seeds, nonce)
+  lastBredAt?: number; // cooldown anchor
   eggStartedAt?: number;
   pendingSpecies?: string; // chosen (or fate-rolled) species revealed at hatch
   species: string;
@@ -952,9 +1084,15 @@ function normalizeSprite(agentId: string, input: Partial<SpriteState>): SpriteSt
       typeof input.bornToAgentId === "string" && input.bornToAgentId ? input.bornToAgentId : agentId,
     phase: input.phase === "egg" ? "egg" : "alive",
     ...(input.founder === true ? { founder: true } : {}),
+    ...(Array.isArray(input.parents) && input.parents.length === 2 && input.parents.every((x) => typeof x === "string")
+      ? { parents: [safeIdentifier(input.parents[0], ""), safeIdentifier(input.parents[1], "")] as [string, string] }
+      : {}),
+    ...(Number.isInteger(input.generation) && (input.generation as number) > 0 ? { generation: Math.min(1000, input.generation as number) } : {}),
+    ...(typeof input.breedNonce === "string" ? { breedNonce: input.breedNonce.slice(0, 64) } : {}),
+    ...(typeof input.lastBredAt === "number" && Number.isFinite(input.lastBredAt) ? { lastBredAt: input.lastBredAt } : {}),
     ...(typeof input.eggStartedAt === "number" ? { eggStartedAt: input.eggStartedAt } : {}),
     ...(typeof input.pendingSpecies === "string" ? { pendingSpecies: input.pendingSpecies } : {}),
-    species: typeof input.species === "string" && SPECIES_IDS.includes(input.species) ? input.species : "cat",
+    species: typeof input.species === "string" && ALL_SPECIES_IDS.includes(input.species) ? input.species : "cat",
     shiny: input.shiny === true,
     ...(typeof input.temperament === "string" && TEMPERAMENTS.includes(input.temperament)
       ? { temperament: input.temperament }
@@ -1190,6 +1328,10 @@ function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: 
       "bornToAgentId",
       "phase",
       "founder",
+      "parents",
+      "generation",
+      "breedNonce",
+      "lastBredAt",
       "eggStartedAt",
       "pendingSpecies",
       "species",
@@ -1221,6 +1363,10 @@ function mergeSprite(base: SpriteState | undefined, local: SpriteState, remote: 
     "bornToAgentId",
     "phase",
     "founder",
+    "parents",
+    "generation",
+    "breedNonce",
+    "lastBredAt",
     "eggStartedAt",
     "pendingSpecies",
     "species",
@@ -1927,6 +2073,97 @@ function fateRoll(agentId: string): { species: string; shiny: boolean } {
   const species = pool[(h >>> 10) % pool.length];
   const shiny = hashString(`shiny:${agentId}`) % 100 === 0; // 1%
   return { species, shiny };
+}
+
+// ---------------------------------------------------------------------------
+// breeding genetics (mirror of breeding/genetics.mjs — keep in sync; tests live there)
+// ---------------------------------------------------------------------------
+
+const RARITY_ORDER: Rarity[] = ["common", "uncommon", "rare", "legendary"];
+const BREED_MIN_LEVEL = 10;
+const BREED_COOLDOWN_MS = 7 * 24 * 3_600_000;
+
+function roll01(seed: string, salt: string): number {
+  return hashString(`${salt}:${seed}`) / 4294967296;
+}
+
+function rarityIdx(species: string): number {
+  const i = RARITY_ORDER.indexOf(SPECIES.find((s) => s.id === species)?.rarity ?? "common");
+  return i < 0 ? 0 : i;
+}
+
+// order-independent + length-prefixed so ("a","b|c") and ("a|b","c") can't collide
+function childFateSeed(parentSeedA: string, parentSeedB: string, breedNonce: string): string {
+  const [a, b] = [String(parentSeedA), String(parentSeedB)].sort();
+  const field = (x: string) => `${x.length}:${x}`;
+  return String(hashString(`breed:${field(a)}${field(b)}${field(String(breedNonce))}`));
+}
+
+function hybridSpecies(a: string, b: string): string {
+  return HYBRID_PAIRS[[a, b].sort().join("|")] ?? "chimera";
+}
+
+function mutationSpecies(seed: string, a: string, b: string): string {
+  const base = Math.max(rarityIdx(a), rarityIdx(b));
+  const stepRoll = roll01(seed, "mutstep");
+  let idx = base;
+  if (stepRoll < 0.15) idx = Math.min(RARITY_ORDER.length - 1, base + 1);
+  else if (stepRoll > 0.85) idx = Math.max(0, base - 1);
+  const pool = RARITY_POOLS[RARITY_ORDER[idx]].filter((id) => id !== a && id !== b);
+  const usePool = pool.length ? pool : SPECIES_IDS.filter((id) => id !== a && id !== b);
+  return usePool[hashString(`mutate:${seed}`) % usePool.length];
+}
+
+function rollSpecies(seed: string, a: string, b: string): { species: string; kind: "inherited" | "mutation" | "hybrid" } {
+  // Hybrid parents breed like their rarity-3 ("legendary") tier for the odds.
+  const combined = rarityIdx(a) + rarityIdx(b);
+  const hybridChance = 0.02 + 0.015 * combined; // 0.02 .. 0.11
+  const mutationChance = 0.08;
+  const r = roll01(seed, "species");
+  if (r < hybridChance) return { species: hybridSpecies(a, b), kind: "hybrid" };
+  if (r < hybridChance + mutationChance) return { species: mutationSpecies(seed, a, b), kind: "mutation" };
+  const [lo, hi] = [a, b].sort();
+  return { species: roll01(seed, "parentpick") < 0.5 ? lo : hi, kind: "inherited" };
+}
+
+function rollShiny(seed: string, aShiny: boolean, bShiny: boolean): boolean {
+  const n = (aShiny ? 1 : 0) + (bShiny ? 1 : 0);
+  return roll01(seed, "shiny") < (n === 2 ? 0.25 : n === 1 ? 0.08 : 0.01);
+}
+
+function rollTemperament(seed: string, a: string, b: string): string {
+  if (roll01(seed, "tempmut") < 0.1) {
+    const pool = TEMPERAMENTS.filter((t) => t !== a && t !== b);
+    return (pool.length ? pool : TEMPERAMENTS)[hashString(`tempnew:${seed}`) % (pool.length || TEMPERAMENTS.length)];
+  }
+  const [lo, hi] = [a, b].sort();
+  return roll01(seed, "temppick") < 0.5 ? lo : hi;
+}
+
+interface Offspring {
+  seed: string;
+  breedNonce: string;
+  species: string;
+  speciesKind: "inherited" | "mutation" | "hybrid";
+  shiny: boolean;
+  temperament: string;
+  parents: [string, string];
+  generation: number;
+}
+
+function breedSprites(a: SpriteState, b: SpriteState, nonce = randomBytes(6).toString("hex")): Offspring {
+  const seed = childFateSeed(a.seed, b.seed, nonce);
+  const sp = rollSpecies(seed, a.species, b.species);
+  return {
+    seed,
+    breedNonce: nonce,
+    species: sp.species,
+    speciesKind: sp.kind,
+    shiny: rollShiny(seed, a.shiny, b.shiny),
+    temperament: rollTemperament(seed, a.temperament ?? temperamentOf(a.seed), b.temperament ?? temperamentOf(b.seed)),
+    parents: [a.id, b.id],
+    generation: Math.max(a.generation ?? 0, b.generation ?? 0) + 1,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2660,7 +2897,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     sprite.phase = "alive";
     sprite.hatchedAt = Date.now();
     sprite.species = sprite.pendingSpecies ?? sprite.species;
-    sprite.temperament = temperamentOf(sprite.seed);
+    sprite.temperament = sprite.temperament ?? temperamentOf(sprite.seed);
     delete sprite.pendingSpecies;
     const sp = speciesOf(sprite);
     if (!sprite.named) {
@@ -2958,7 +3195,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     const species = speciesOf(sp);
     const active = collection.activeSpriteId === sp.id ? "▶" : " ";
     const face = sp.phase === "egg" ? "( ● )" : species.poses.idle;
-    const tags = [sp.founder ? "founder" : null, sp.shiny ? "✦shiny" : null, sp.phase === "egg" ? "egg" : null]
+    const tags = [sp.founder ? "founder" : null, sp.generation ? `gen ${sp.generation}` : null, speciesOf(sp).breedOnly ? "hybrid" : null, sp.shiny ? "✦shiny" : null, sp.phase === "egg" ? "egg" : null]
       .filter(Boolean)
       .join(" · ");
     return `${active} ${String(index + 1).padStart(2)}. ${face}  ${sp.name.padEnd(24)} ${
@@ -3038,6 +3275,97 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     queueCheckpoint(agentId, "released");
     panel.update();
     return `${target.name} drifts off. the nest is quieter.`;
+  }
+
+  function breedBlocker(sp: SpriteState): string | null {
+    if (sp.phase !== "alive") return `${sp.name} is still an egg.`;
+    if (sp.level < BREED_MIN_LEVEL) return `${sp.name} is only lv.${sp.level} — companions can breed from lv.${BREED_MIN_LEVEL}.`;
+    if (sp.lastBredAt && Date.now() - sp.lastBredAt < BREED_COOLDOWN_MS) {
+      const left = Math.ceil((sp.lastBredAt + BREED_COOLDOWN_MS - Date.now()) / 86_400_000);
+      return `${sp.name} bred recently — ready again in ${left} day${left === 1 ? "" : "s"}.`;
+    }
+    return null;
+  }
+
+  function resolveOne(collection: AgentCollectionState, query: string): SpriteState | string {
+    const found = findSprite(collection, query);
+    if (!found) return `no companion called "${query}". see /sprite list.`;
+    if ("ambiguous" in found) return describeAmbiguity(collection, found.ambiguous);
+    return found;
+  }
+
+  function doBreed(agentId: string | null, argstr: string): string {
+    if (!agentId) return "i can't tell which agent this is.";
+    const parts = argstr.split(/\s+/).filter(Boolean);
+    const collection = getCollection(agentId);
+    if (!collection) return "no companions yet — /sprite hatch to begin.";
+    if (parts.length < 2) return "usage: /sprite breed <companion> <companion>   (see /sprite list — companions from lv.10)";
+    // allow multi-word names: try every split point, prefer the one that resolves both
+    let a: SpriteState | null = null;
+    let b: SpriteState | null = null;
+    let lastErr = "";
+    for (let cut = 1; cut < parts.length && !(a && b); cut += 1) {
+      const ra = resolveOne(collection, parts.slice(0, cut).join(" "));
+      const rb = resolveOne(collection, parts.slice(cut).join(" "));
+      if (typeof ra === "string") { lastErr = ra; continue; }
+      if (typeof rb === "string") { lastErr = rb; continue; }
+      a = ra; b = rb;
+    }
+    if (!a || !b) return lastErr || "couldn't tell which two companions you meant.";
+    if (a.id === b.id) return `${a.name} can't breed with itself. pick two.`;
+    const current = getSprite(agentId);
+    if (current?.phase === "egg") return "there's already an egg on the panel — let it hatch first.";
+    for (const sp of [a, b]) {
+      const why = breedBlocker(sp);
+      if (why) return why;
+    }
+    if (Object.keys(collection.sprites).length >= MAX_SPRITES_PER_COLLECTION) {
+      return `the nest is full (${MAX_SPRITES_PER_COLLECTION}) — release someone before breeding.`;
+    }
+    const child = breedSprites(a, b);
+    let spriteId = stableId("sprite", child.seed);
+    while (collection.sprites[spriteId] || collection.released?.[spriteId]) {
+      const again = breedSprites(a, b);
+      Object.assign(child, again);
+      spriteId = stableId("sprite", child.seed);
+    }
+    const egg: SpriteState = {
+      id: spriteId,
+      seed: child.seed,
+      bornToAgentId: agentId,
+      phase: "egg",
+      parents: child.parents,
+      generation: child.generation,
+      breedNonce: child.breedNonce,
+      eggStartedAt: Date.now(),
+      pendingSpecies: child.species,
+      species: child.species,
+      shiny: child.shiny,
+      temperament: child.temperament,
+      name: `${a.name} × ${b.name}`.slice(0, 24),
+      named: false,
+      xp: 0,
+      level: 1,
+      stats: { craft: 0, wander: 0, grit: 0, lore: 0, spark: 0 },
+      settings: {},
+    };
+    collection.sprites[spriteId] = egg;
+    a.lastBredAt = Date.now();
+    b.lastBredAt = Date.now();
+    collection.activeSpriteId = spriteId;
+    markDirty();
+    flush();
+    queueCheckpoint(agentId, "bred");
+    setPose("happy", 4_000);
+    panel.update();
+    return `${a.name} and ${b.name} nuzzle close… an egg appears under the statusline. it's warm, and it's *new*. (gen ${child.generation})`;
+  }
+
+  function lineageLine(sprite: SpriteState, collection: AgentCollectionState | null): string {
+    if (!sprite.parents) return "";
+    const names = sprite.parents.map((id) => collection?.sprites[id]?.name ?? "a companion now gone");
+    const kind = speciesOf(sprite).breedOnly ? " — a hybrid, the first of its kind here" : "";
+    return `lineage: gen ${sprite.generation ?? 1}, child of ${names[0]} and ${names[1]}${kind}`;
   }
 
   function requireSprite(agentId: string | null): SpriteState | { error: string } {
@@ -3156,6 +3484,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       sprite.hatchedAt
         ? `hatched: ${relativeTime(sprite.hatchedAt)}   born of: ${agentName ?? sprite.bornToAgentId ?? agentId ?? "unknown"}`
         : "",
+      lineageLine(sprite, getCollection(agentId)),
       recent.length > 0 ? `recently said:\n${recent.join("\n")}` : "it hasn't said anything yet.",
     ]
       .filter(Boolean)
@@ -3319,6 +3648,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       "  /sprite switch <name|#>        Put a different companion on the panel. Only the",
       "                                 one on the panel earns experience and speaks;",
       "                                 the others rest, and remember everything.",
+      "  /sprite breed <a> <b>          Two companions (each lv." + BREED_MIN_LEVEL + "+, once a week) make an",
+      "                                 egg. The child mostly takes after one parent,",
+      "                                 sometimes mutates, and rarely becomes a hybrid —",
+      "                                 a species that can't hatch any other way.",
+      "                                 Shiny parents make shiny children likelier.",
       "  /sprite release <name|#>       Let a companion go for good. Prints a confirm",
       "                                 command bound to that exact companion. Founders",
       "                                 can't be released.",
@@ -3367,7 +3701,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       "  /sprite help                   Show this message.",
       "",
       "Your agent can also care for its companion directly with these tools:",
-      "  sprite_hatch, sprite_list, sprite_switch, sprite_name, sprite_molt, sprite_pet,",
+      "  sprite_hatch, sprite_list, sprite_switch, sprite_breed, sprite_name, sprite_molt, sprite_pet,",
       "  sprite_status, sprite_set_voice.",
       "",
       "Experience comes from real work — tool calls, turns, and conversations — and",
@@ -3379,8 +3713,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     disposers.push(
       letta.commands.register({
         id: "sprite",
-        description: "Your agent's tiny companions — status, hatch, list, switch, name, molt, pet, diary, release, settings, backup, help",
-        args: "[status|hatch|list|switch|name|molt|pet|diary|release|settings|backup|help] [...]",
+        description: "Your agent's tiny companions — status, hatch, list, switch, breed, name, molt, pet, diary, release, settings, backup, help",
+        args: "[status|hatch|list|switch|breed|name|molt|pet|diary|release|settings|backup|help] [...]",
         run(ctx: any) {
           const argstr = String(ctx.args ?? "").trim();
           const [sub, ...rest] = argstr.split(/\s+/).filter(Boolean);
@@ -3416,6 +3750,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
               break;
             case "release":
               output = doRelease(agentId, restStr);
+              break;
+            case "breed":
+              output = doBreed(agentId, restStr);
               break;
             case "name":
               output = doName(agentId, restStr);
@@ -3492,6 +3829,26 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         parallelSafe: true,
         run(ctx: any) {
           return doList(toolAgent(ctx));
+        },
+      }),
+    );
+    disposers.push(
+      letta.tools.register({
+        name: "sprite_breed",
+        description: "Breed two of your companion sprites (each level 10+, once per week each) into an egg. The child inherits from its parents and can rarely be a hybrid species.",
+        parameters: {
+          type: "object",
+          properties: {
+            a: { type: "string", description: "First parent (name or roster number)." },
+            b: { type: "string", description: "Second parent (name or roster number)." },
+          },
+          required: ["a", "b"],
+          additionalProperties: false,
+        },
+        requiresApproval: false,
+        parallelSafe: false,
+        run(ctx: any) {
+          return doBreed(toolAgent(ctx), `${String(ctx.args?.a ?? "")} ${String(ctx.args?.b ?? "")}`);
         },
       }),
     );
