@@ -13309,22 +13309,27 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     const see = sprite.soul?.see ?? "nothing";
     return see === "tools" || see === "turns" ? specific : generic;
   }
+  function speakFallback(sprite, category, force) {
+    const canned = speak(sprite, category, force);
+    if (!canned)
+      return null;
+    bubble = `(${canned})`;
+    const last = sprite.log?.[sprite.log.length - 1];
+    if (last && last.line === canned)
+      last.line = `(${canned})`;
+    markDirty();
+    flush();
+    panel.update();
+    return canned;
+  }
   function speakOrSoul(sprite, category, moment, force = false) {
     if (!sprite.soul)
       return speak(sprite, category, force);
     soulSay(sprite, moment, { force }).then((line) => {
       if (line)
         showSoulLine(sprite, category, line);
-      else {
-        const canned = speak(sprite, category, force);
-        if (canned) {
-          bubble = `(${canned})`;
-          if (sprite.log?.length)
-            sprite.log[sprite.log.length - 1].line = `(${canned})`;
-          flush();
-          panel.update();
-        }
-      }
+      else
+        speakFallback(sprite, category, force);
     });
     return null;
   }
@@ -13951,7 +13956,7 @@ ${sprite.name}: ${line}` : `
           showSoulLine(res, "pet", line2);
           return `you pet ${res.name}. ${sp.poses.happy}  \u201C${line2}\u201D`;
         }
-        const canned = speak(res, "pet", true);
+        const canned = speakFallback(res, "pet", true);
         return canned ? `you pet ${res.name}. ${sp.poses.happy}  (${canned})` : `you pet ${res.name}. it leans in, quietly. ${sp.poses.happy}`;
       });
     }

@@ -3818,20 +3818,25 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return see === "tools" || see === "turns" ? specific : generic;
   }
 
+  // The mind didn't answer: say a corpus line, marked (like this) so the rare
+  // canned line is the visible exception, not the live ones.
+  function speakFallback(sprite: SpriteState, category: VoiceCategory, force: boolean): string | null {
+    const canned = speak(sprite, category, force);
+    if (!canned) return null;
+    bubble = `(${canned})`;
+    const last = sprite.log?.[sprite.log.length - 1];
+    if (last && last.line === canned) last.line = `(${canned})`;
+    markDirty();
+    flush();
+    panel.update();
+    return canned;
+  }
+
   function speakOrSoul(sprite: SpriteState, category: VoiceCategory, moment: string, force = false) {
     if (!sprite.soul) return speak(sprite, category, force);
     void soulSay(sprite, moment, { force }).then((line) => {
       if (line) showSoulLine(sprite, category, line);
-      else {
-        // the mind didn't answer — fall back to the corpus, and say so
-        const canned = speak(sprite, category, force);
-        if (canned) {
-          bubble = `(${canned})`;
-          if (sprite.log?.length) sprite.log[sprite.log.length - 1].line = `(${canned})`;
-          flush();
-          panel.update();
-        }
-      }
+      else speakFallback(sprite, category, force);
     });
     return null;
   }
@@ -4351,7 +4356,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           showSoulLine(res, "pet", line);
           return `you pet ${res.name}. ${sp.poses.happy}  “${line}”`;
         }
-        const canned = speak(res, "pet", true);
+        const canned = speakFallback(res, "pet", true);
         return canned
           ? `you pet ${res.name}. ${sp.poses.happy}  (${canned})`
           : `you pet ${res.name}. it leans in, quietly. ${sp.poses.happy}`;
