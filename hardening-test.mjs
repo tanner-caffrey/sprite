@@ -928,68 +928,93 @@ function mockSoulClient() {
 const { __setSoulClientFactory } = await import("./mods/sprite.tsx");
 const tick = () => new Promise((r) => setTimeout(r, 30));
 
-await check("soul: the wizard walks every step, only the user drives it, persona has no changing facts and no gendered pronouns", async () => {
+// helper: ensoul through the tool, the way the agent would after the walkthrough
+async function ensoulVia(host, agent, extra = {}) {
+  return String(await host.tools.get("sprite_ensoul").run({ agent, args: { backend: "local", model: "zai/glm-5.3-flash", see: "nothing", ...extra } }));
+}
+
+await check("soul: /sprite ensoul hands the agent a walkthrough prompt; sprite_ensoul applies confirmed answers", async () => {
   const mock = mockSoulClient();
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-soul", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
   host.command("name Poof");
-  assert.equal(host.tools.get("sprite_ensoul"), undefined, "ensoul must not be a tool");
-  assert.match(await host.command("ensoul"), /Where does its mind live/);
-  assert.match(await host.command("ensoul 1"), /Which model/);
-  assert.match(await host.command("ensoul 2"), /What can it see/);
-  assert.match(await host.command("ensoul back"), /Which model/);
-  assert.match(await host.command("ensoul zai/glm-9.9-nope"), /isn't in the catalog/);
-  assert.match(await host.command("ensoul sonnet"), /What can it see/); // unique substring → picked
-  assert.match(await host.command("ensoul back"), /Which model/);
-  assert.match(await host.command("ensoul glm"), /What can it see/);
-  assert.match(await host.command("ensoul 1"), /Who writes its persona/); // nothing → skips comment step
-  const confirm = await host.command("ensoul template");
-  assert.match(confirm, /persona it will be given/);
-  const persona = confirm.split("─".repeat(60))[1];
-  assert.match(persona, /You are Poof, a ghost/);
-  assert.match(persona, /hatched on \d{4}-\d{2}-\d{2}T/);
-  assert.doesNotMatch(persona, /level \d|lv\.|days old|\bxp\b/i, "persona leaks changing facts");
-  assert.doesNotMatch(persona, /\b(he|she|his|her|him)\b/i, "persona must be gender-neutral");
-  assert.match(persona, /\bthem\b|\btheir\b|\bthey\b/);
-  assert.match(persona, /my_stats/);
-  assert.equal(mock.calls.length, 0, "nothing created before confirm");
-  const done = await host.command("ensoul confirm");
+  const raw = await host.raw("ensoul");
+  assert.equal(raw.type, "prompt");
+  assert.match(raw.content, /walk them through/i);
+  assert.match(raw.content, /AskUserQuestion/);
+  assert.match(raw.content, /sprite_models/);
+  assert.match(raw.content, /sprite_ensoul/);
+  assert.match(raw.content, /they\/them/);
+  for (const [k, d] of [["nothing", "Nothing about your work"], ["turns", "Never its memory"]]) assert.match(raw.content, new RegExp(`\`${k}\` — .*${d}`));
+  assert.equal(mock.calls.length, 0, "nothing created by the command itself");
+  // models tool
+  const models = String(await host.tools.get("sprite_models").run({ agent, args: { backend: "local", filter: "glm" } }));
+  assert.match(models, /zai\/glm-5\.3-flash/);
+  assert.doesNotMatch(models, /sonnet/);
+  // bad model refused
+  assert.match(await ensoulVia(host, agent, { model: "zai/glm-9.9-nope" }), /isn't in the local catalog/);
+  assert.equal(mock.calls.filter((c) => c[0] === "create").length, 0);
+  // template persona (no persona arg)
+  const done = await ensoulVia(host, agent);
   assert.match(done, /has a mind of its own now/);
-  assert.match(done, /…oh\. i can think now\./); // first line, one line only
+  assert.match(done, /…oh\. i can think now\./);
   const created = mock.calls.find((c) => c[0] === "create")[1];
   assert.equal(created.hidden, true);
   assert.equal(created.memfs, true);
   assert.equal(created.model, "zai/glm-5.3-flash");
   assert.deepEqual(created.baseTools, []);
-  assert.ok(created.tags.includes("sprite") && created.tags.some((t) => t.startsWith("sprite-owner:agent-soul")));
   assert.deepEqual(created.memory.map((m) => m.label), ["persona", "voice", "diary", "bond"]);
+  const persona = created.memory[0].value;
+  assert.match(persona, /You are Poof, a ghost/);
+  assert.doesNotMatch(persona, /level \d|lv\.|days old|\bxp\b/i, "persona leaks changing facts");
+  assert.doesNotMatch(persona, /\b(he|she|his|her|him)\b/i, "persona must be gender-neutral");
+  assert.match(persona, /my_stats/);
   const sp = activeSprite(agent.id);
   assert.equal(sp.soul.agentId, "agent-mock-1");
-  assert.equal(sp.soul.see, "nothing");
+  assert.equal(sp.soul.personaSource, "template");
   assert.equal(sp.soul.talkGate, 5);
+  assert.match(await ensoulVia(host, agent), /already has a mind/);
   assert.match(await host.command("ensoul"), /already has a mind/);
   dispose();
 });
 
-await check("soul: pet goes to the mind (✦), tools my_stats/my_diary are offered, corpus is the fallback", async () => {
+await check("soul: agent-written persona via the tool keeps the footer and records the source", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-soul7", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  host.command("name Poof");
+  const done = await ensoulVia(host, agent, { persona: "You are Poof, a ghost who announces their agent's wakings and felt the page turn.", personaSource: "agent", see: "turns", comment: { every: "turns", n: 3 } });
+  assert.match(done, /has a mind of its own/);
+  const created = mock.calls.find((c) => c[0] === "create")[1];
+  assert.match(created.memory[0].value, /^You are Poof, a ghost who announces/);
+  assert.match(created.memory[0].value, /my_stats/);
+  const soul = activeSprite(agent.id).soul;
+  assert.equal(soul.personaSource, "agent");
+  assert.equal(soul.see, "turns");
+  assert.deepEqual(soul.comment, { every: "turns", n: 3 });
+  dispose();
+});
+
+await check("soul: pet goes to the mind, tools my_stats/my_diary are offered, corpus is the fallback", async () => {
   const mock = mockSoulClient();
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-soul2", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
-  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  await ensoulVia(host, agent);
   await tick();
   assert.match(await host.command("pet"), /“mrrp\. \(from the mind\.\)”/);
+  await tick();
   const sp = activeSprite(agent.id);
   assert.ok(sp.log.some((e) => e.line === "mrrp. (from the mind.)"), JSON.stringify(sp.log.slice(-3)));
   const promptCall = mock.calls.find((c) => c[0] === "prompt" && c[2].includes("petted"));
   assert.deepEqual(promptCall[3].tools.map((t) => t.name), ["my_stats", "my_diary"]);
   const stats = await promptCall[3].tools[0].execute();
   assert.match(stats.content, /level: \d+/);
-  // mind gone → corpus fallback, no crash
   mock.agents.clear();
   const before = (activeSprite(agent.id).log ?? []).length;
-  assert.match(await host.command("pet"), /\(.*\)/); // canned fallback, parenthesised
+  assert.match(await host.command("pet"), /\(.*\)/);
   await tick();
   const after = activeSprite(agent.id).log;
   assert.ok(after.length > before && after[after.length - 1].line.startsWith("("), "fallback should be a parenthesised corpus line: " + after[after.length - 1].line);
@@ -1001,19 +1026,19 @@ await check("soul: talk gate stops a chatty agent; user talk is ungated; both si
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-soul3", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
-  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  await ensoulVia(host, agent);
   const talk = host.tools.get("sprite_talk");
   for (let i = 0; i < 5; i += 1) assert.match(String(await talk.run({ agent, args: { text: `hi ${i}` } })), /heard: hi/);
   assert.match(String(await talk.run({ agent, args: { text: "hi 6" } })), /napping/);
-  assert.match(await host.command("talk hello there"), /heard: hello there/); // user ungated
+  assert.match(await host.command("talk hello there"), /heard: hello there/);
   const log = activeSprite(agent.id).log.map((e) => e.line);
   assert.ok(log.some((l) => l.startsWith("Owner → ")), "agent side not in diary");
   assert.ok(log.some((l) => l.startsWith("you → ")), "user side not in diary");
   assert.ok(log.some((l) => l.startsWith("heard:")), "reply not in diary");
   assert.match(await host.command("soul gate off"), /gate → off/);
+  assert.match(String(await talk.run({ agent, args: { text: "hi 7" } })), /heard: hi 7/);
   assert.match(await host.command("soul model letta/auto-fast"), /model → letta\/auto-fast/);
   assert.ok(mock.calls.some((c) => c[0] === "updateModel" && c[2] === "letta/auto-fast"), "model change must go through session.updateModel");
-  assert.match(String(await talk.run({ agent, args: { text: "hi 7" } })), /heard: hi 7/);
   dispose();
 });
 
@@ -1022,7 +1047,7 @@ await check("soul: ambient lines (commit, errors) are live once ensouled; `see` 
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-soulamb", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
-  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  await ensoulVia(host, agent);
   await tick();
   const n0 = mock.calls.filter((c) => c[0] === "prompt").length;
   host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "t1", args: { command: "git commit -m 'secret msg'" } });
@@ -1035,8 +1060,7 @@ await check("soul: ambient lines (commit, errors) are live once ensouled; `see` 
   host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "t2", args: { command: "git commit -m 'visible msg'" } });
   host.fire("tool_end", { agentId: agent.id, toolName: "Bash", toolCallId: "t2", status: "success" });
   await tick();
-  const commit2 = mock.calls.filter((c) => c[0] === "prompt").pop();
-  assert.match(commit2[2], /visible msg/);
+  assert.match(mock.calls.filter((c) => c[0] === "prompt").pop()[2], /visible msg/);
   dispose();
 });
 
@@ -1045,7 +1069,7 @@ await check("soul: `see` shapes exactly what the mind hears; nothing → no comm
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-soul4", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
-  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  await ensoulVia(host, agent);
   const promptsBefore = mock.calls.filter((c) => c[0] === "prompt").length;
   host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success", args: { file_path: "/secret/path.ts" } });
   host.fire("turn_end", { agentId: agent.id, text: "SECRET WORDS" });
@@ -1068,28 +1092,29 @@ await check("soul: `see` shapes exactly what the mind hears; nothing → no comm
   await host.command("soul comment turn");
   host.fire("turn_end", { agentId: agent.id, text: "SECRET WORDS" });
   await tick();
-  last = mock.calls.filter((c) => c[0] === "prompt").pop();
-  assert.match(last[2], /SECRET WORDS/);
+  assert.match(mock.calls.filter((c) => c[0] === "prompt").pop()[2], /SECRET WORDS/);
   dispose();
 });
 
-await check("soul: release keeps the agent unless delete-agent is given; delete failure releases nothing", async () => {
+async function secondEnsouled(agentId, name) {
+  const agent = { id: agentId, name: "Owner" };
   const mock = mockSoulClient();
   __setSoulClientFactory(async () => mock.client);
-  const agent = { id: "agent-soul5", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
   await host.command("hatch another");
   const st = readState(); const c = st.collections[agent.id];
-  const egg = Object.values(c.sprites).find((sp) => !sp.founder); egg.phase = "alive"; egg.name = "Second"; egg.named = true;
+  const egg = Object.values(c.sprites).find((sp) => !sp.founder); egg.phase = "alive"; egg.name = name; egg.named = true;
   writeFileSync(statePath, JSON.stringify(st));
   const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
   dispose();
-  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await h2.command(`ensoul ${step}`.trim());
-  const soulId = activeSprite(agent.id).soul.agentId;
+  await ensoulVia(h2, agent, { sprite: name });
+  return { mock, agent, h2, d2, soulId: readState().collections[agent.id].sprites[egg.id].soul.agentId, id: egg.id };
+}
+
+await check("soul: release keeps the agent unless delete-agent is given", async () => {
+  const { mock, h2, d2, soulId, id } = await secondEnsouled("agent-soul5", "Second");
   const prompt = await h2.command("release Second");
   assert.match(prompt, /delete-agent/);
-  const id = /confirm:(\S+)/.exec(prompt)[1];
-  // without delete-agent → sprite gone, agent kept
   assert.match(await h2.command(`release confirm:${id}`), /still there/);
   assert.ok(mock.agents.has(soulId));
   assert.ok(!mock.calls.some((c) => c[0] === "delete"));
@@ -1097,20 +1122,8 @@ await check("soul: release keeps the agent unless delete-agent is given; delete 
 });
 
 await check("soul: release with delete-agent deletes the agent; a failed delete releases nothing", async () => {
-  const mock = mockSoulClient();
-  __setSoulClientFactory(async () => mock.client);
-  const agent = { id: "agent-soul6", name: "Owner" };
-  const { host, dispose } = hatchFor(agent, null);
-  await host.command("hatch another");
-  const st = readState(); const c = st.collections[agent.id];
-  const egg = Object.values(c.sprites).find((sp) => !sp.founder); egg.phase = "alive"; egg.name = "Second"; egg.named = true;
-  writeFileSync(statePath, JSON.stringify(st));
-  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
-  dispose();
-  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await h2.command(`ensoul ${step}`.trim());
-  const soulId = activeSprite(agent.id).soul.agentId;
-  const id = /confirm:(\S+)/.exec(await h2.command("release Second"))[1];
-  mock.agents.delete(soulId); // simulate an agent that can't be deleted (already gone)
+  const { mock, h2, d2, soulId, id, agent } = await secondEnsouled("agent-soul6", "Second");
+  mock.agents.delete(soulId);
   assert.match(await h2.command(`release confirm:${id} delete-agent`), /couldn't delete its agent/);
   assert.ok(readState().collections[agent.id].sprites[id], "sprite was released despite failed delete");
   mock.agents.set(soulId, {});
@@ -1119,13 +1132,16 @@ await check("soul: release with delete-agent deletes the agent; a failed delete 
   d2();
 });
 
-await check("soul: /sprite soul persona rewrites the persona file and shows cost", async () => {
+await check("soul: /sprite soul persona prompts the agent; sprite_soul_persona rewrites the file; cost line shown", async () => {
   const mock = mockSoulClient();
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-soulpersona", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
-  for (const step of ["", "1", "default", "nothing", "template", "confirm"]) await host.command(`ensoul ${step}`.trim());
+  await ensoulVia(host, agent);
   assert.match(await host.command("soul"), /cost: ~\d+(\.\d+)?k tokens per line/);
+  const raw = await host.raw("soul persona");
+  assert.equal(raw.type, "prompt");
+  assert.match(raw.content, /sprite_soul_persona/);
   const soul = activeSprite(agent.id).soul;
   const memDir = join(root, "lc-local-backend", "memfs", soul.agentId, "memory");
   mkdirSync(join(memDir, "system"), { recursive: true });
@@ -1133,9 +1149,7 @@ await check("soul: /sprite soul persona rewrites the persona file and shows cost
   git(memDir, ["init", "-q"]); commitAll(memDir, "init");
   const prevDir = process.env.LETTA_LOCAL_BACKEND_DIR;
   process.env.LETTA_LOCAL_BACKEND_DIR = join(root, "lc-local-backend");
-  assert.match(await host.command("soul persona"), /Who writes its persona/);
-  assert.match(await host.command("ensoul user You are a rewritten ghost. They are your person."), /\/sprite ensoul apply/);
-  const out = await host.command("ensoul apply");
+  const out = String(await host.tools.get("sprite_soul_persona").run({ agent, args: { persona: "You are a rewritten ghost. They are your person.", personaSource: "user" } }));
   assert.match(out, /persona rewritten/, out);
   const file = readFileSync(join(memDir, "system", "persona.md"), "utf-8");
   assert.match(file, /^---\ndescription: Memory block persona\n---\nYou are a rewritten ghost/);
@@ -1143,32 +1157,6 @@ await check("soul: /sprite soul persona rewrites the persona file and shows cost
   assert.match(git(memDir, ["log", "-1", "--format=%s"]), /persona rewritten/);
   assert.equal(activeSprite(agent.id).soul.personaSource, "user");
   if (prevDir === undefined) delete process.env.LETTA_LOCAL_BACKEND_DIR; else process.env.LETTA_LOCAL_BACKEND_DIR = prevDir;
-  dispose();
-});
-
-await check("soul: agent-written persona prompts the owner agent, then persona-done picks up their reply", async () => {
-  const mock = mockSoulClient();
-  __setSoulClientFactory(async () => mock.client);
-  const agent = { id: "agent-soul7", name: "Owner" };
-  const { host, dispose } = hatchFor(agent, null);
-  host.command("name Poof");
-  for (const step of ["", "1", "default", "nothing"]) await host.command(`ensoul ${step}`.trim());
-  const raw = await host.raw("ensoul agent");
-  assert.equal(raw.type, "prompt");
-  assert.equal(typeof raw.content, "string", "prompt results carry `content`");
-  assert.match(raw.content, /write the persona for your companion sprite \*\*Poof\*\*/);
-  assert.match(raw.content, /permanent facts only/i);
-  assert.match(raw.content, /they\/them/);
-  assert.match(raw.content, /tell the user to run:  \/sprite ensoul persona-done/);
-  host.history.push({ role: "assistant", content: "You are Poof, a ghost who announces their agent's wakings and felt the page turn." });
-  assert.match(await host.command("ensoul persona-done"), /announces their agent's wakings/);
-  const done = await host.command("ensoul confirm");
-  assert.match(done, /has a mind of its own/);
-  const created = mock.calls.find((c) => c[0] === "create")[1];
-  const persona = created.memory.find((m) => m.label === "persona").value;
-  assert.match(persona, /^You are Poof, a ghost who announces/);
-  assert.match(persona, /call\nmy_stats|my_stats/); // footer appended
-  assert.equal(activeSprite(agent.id).soul.personaSource, "agent");
   dispose();
 });
 

@@ -3,6 +3,15 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.9.0 — your agent walks you through ensoulment
+- `/sprite ensoul` now hands your agent a walkthrough: it asks you each
+  question with a proper picker (where the mind lives, which model from the
+  real catalog, what it may see, when it comments, who writes the persona),
+  shows a summary, and only creates the agent after you confirm.
+- `/sprite soul persona` works the same way for rewrites.
+- New tools for the agent: `sprite_models`, `sprite_ensoul`,
+  `sprite_soul_persona`. The numbered-options screens are gone.
+
 ## v0.8.8
 - `/sprite soul persona` rewrites an ensouled companion's persona — from the
   template, written by your agent, or by you — then `/sprite ensoul apply`

@@ -13434,102 +13434,12 @@ Reply in one line.`, { force: true });
     showSoulLine(sprite, "mood", line);
     return `${sprite.name}: ${line}`;
   }
-  let wizard = null;
   const SEE_OPTIONS = [
     ["nothing", "It only hears the moments you send it: pets, check-ins, level-ups, hatches. Nothing about your work."],
     ["events", "Tool names and whether they succeeded, how many in a row, when your agent speaks. No content, no file names."],
     ["tools", "Events, plus the first line of each tool's arguments (file paths, commands). None of your agent's words."],
     ["turns", "Everything above, plus the text of what your agent says each turn. Never its memory or system prompt."]
   ];
-  function wizardStepText(w) {
-    const sprite = getCollection(w.agentId)?.sprites[w.spriteId];
-    const name = sprite?.name ?? "your companion";
-    const head = `ensoul ${name} \u2014 step: ${w.step}   (answer with /sprite ensoul <choice> \xB7 back \xB7 cancel)`;
-    switch (w.step) {
-      case "backend":
-        return [head, "", "Where does its mind live?", "  1. local  \u2014 on this machine, alongside your other local agents. No account needed.", "  2. cloud  \u2014 on Letta Cloud. Needs you to be logged in; survives this machine."].join(`
-`);
-      case "model": {
-        const all = w.models ?? [];
-        const filter = (w.modelFilter ?? "").toLowerCase();
-        const shown = filter ? all.filter((m) => m.toLowerCase().includes(filter)).slice(0, 60) : all.slice(0, 20);
-        const list = shown.map((m) => `  ${all.indexOf(m) + 1}. ${m}`);
-        return [
-          head,
-          "",
-          `Which model should it think with? (${w.backend} \xB7 ${all.length} available${filter ? ` \xB7 showing "${filter}"` : ", showing the first 20"})`,
-          ...list.length ? list : ["  (nothing matches \u2014 type part of a handle, e.g. flash, haiku, mini)"],
-          "",
-          "Answer with a number, type part of a handle to filter, or a full handle to pick it.",
-          `Default: ${DEFAULT_SOUL_MODEL} (free)  (/sprite ensoul default)`
-        ].join(`
-`);
-      }
-      case "see":
-        return [head, "", "What can it see of your agent's work?", ...SEE_OPTIONS.map(([k, d], i) => `  ${i + 1}. ${k.padEnd(8)} ${d}`), "", "Default: nothing (safest)."].join(`
-`);
-      case "comment":
-        return [head, "", "When should it comment on what it sees?", "  1. every turn        \u2014 after each time your agent speaks", "  2. every N turns     \u2014 /sprite ensoul turns 3", "  3. every N tools     \u2014 /sprite ensoul tools 10", "", "Default: every turn."].join(`
-`);
-      case "persona":
-        return [head, "", "Who writes its persona?", "  1. template \u2014 a persona built from its species, temperament, and lineage (shown at confirm).", "  2. agent    \u2014 your agent writes it, knowing what they know about " + name + ". You'll confirm.", "  3. user     \u2014 you write it: /sprite ensoul user <text>"].join(`
-`);
-      case "persona-wait":
-        return [head, "", "Your agent has been asked to write the persona. Once their reply appears in the conversation, run:", "", "  /sprite ensoul persona-done", "", "(their last reply is used verbatim; you'll see it before anything is saved)"].join(`
-`);
-      case "confirm": {
-        const persona = `${w.personaText ?? ""}${SOUL_FOOTER}`;
-        if (w.rewrite) {
-          return [
-            head,
-            "",
-            "new persona:",
-            "\u2500".repeat(60),
-            persona,
-            "\u2500".repeat(60),
-            "",
-            "/sprite ensoul apply   to write it into its memory (replaces the old persona).   /sprite ensoul back   to change it."
-          ].join(`
-`);
-        }
-        return [
-          head,
-          "",
-          `mind lives: ${w.backend}   model: ${w.model}   sees: ${w.see}   comments: ${w.comment?.every === "turn" ? "every turn" : `every ${w.comment?.n} ${w.comment?.every}`}`,
-          "memory: its own (memfs) \xB7 dreaming: on \xB7 talk gate: 5 per 5 min (agent\u2192sprite)",
-          "",
-          "persona it will be given:",
-          "\u2500".repeat(60),
-          persona,
-          "\u2500".repeat(60),
-          "",
-          "/sprite ensoul confirm   to create its agent.   /sprite ensoul back   to change something."
-        ].join(`
-`);
-      }
-    }
-  }
-  const wizardPanel = hasPanels && wizard ? null : null;
-  let wizardPanelHandle = null;
-  function refreshWizardPanel() {
-    if (!hasPanels)
-      return;
-    if (!wizard) {
-      wizardPanelHandle?.close();
-      wizardPanelHandle = null;
-      return;
-    }
-    if (!wizardPanelHandle) {
-      wizardPanelHandle = letta.ui.openPanel({
-        id: "sprite-ensoul",
-        order: 50,
-        render: ({ chalk }) => wizard ? chalk.dim(`ensoul: step ${wizard.step} \u2014 /sprite ensoul <choice> \xB7 back \xB7 cancel`) : ""
-      });
-      disposers.push(() => wizardPanelHandle?.close());
-    } else {
-      wizardPanelHandle.update();
-    }
-  }
   async function listSoulModels(backend) {
     try {
       const client = await soulClient(backend);
@@ -13550,258 +13460,101 @@ Reply in one line.`, { force: true });
       return [];
     }
   }
-  function wizardParentNames(sprite, collection) {
+  function parentNamesOf(sprite, collection) {
     if (!sprite.parents)
       return;
     return [collection.sprites[sprite.parents[0]]?.name ?? "a companion now gone", collection.sprites[sprite.parents[1]]?.name ?? "a companion now gone"];
   }
-  async function doEnsoul(agentId, agentName, argstr, ctx) {
+  function spriteFacts(sprite, collection, ownerName) {
+    const diary = (sprite.log ?? []).slice(-20).map((e) => `- (${e.category}) ${e.line}`).join(`
+`) || "- (nothing yet)";
+    return [
+      `- name: ${sprite.name} \xB7 species: ${sprite.species}${sprite.shiny ? " (shiny)" : ""} \xB7 temperament: ${sprite.temperament ?? "odd"}${sprite.founder ? " \xB7 the founder (fate-rolled from your agent-id)" : ""}${sprite.parents ? ` \xB7 bred, generation ${sprite.generation}` : ""}`,
+      `- hatched: ${new Date(sprite.hatchedAt ?? Date.now()).toISOString()}`,
+      `- species imagery: ${SPECIES_CARDS[sprite.species] ?? ""}`,
+      `- temperament: ${TEMPERAMENT_CARDS[sprite.temperament ?? "odd"]}`,
+      "",
+      "Things it has said recently:",
+      diary,
+      "",
+      "The template persona it would otherwise get:",
+      "```",
+      personaTemplate(sprite, ownerName, parentNamesOf(sprite, collection)),
+      "```"
+    ].join(`
+`);
+  }
+  function ensoulPrompt(sprite, collection, ownerName) {
+    return [
+      `The user ran \`/sprite ensoul\` for your companion sprite **${sprite.name}**. Walk them through giving it a mind of its own \u2014 its own Letta agent, with memory it keeps and dreams about. Ask with your AskUserQuestion tool, one bundle at a time, and do not create anything until they have confirmed the summary.`,
+      "",
+      "Ask, in order:",
+      "1. **Where does its mind live?**  `local` \u2014 on this machine, alongside your other local agents, no account needed.  `cloud` \u2014 on Letta Cloud; needs you to be logged in; survives this machine.",
+      "2. **Which model?** Call `sprite_models` with the chosen backend to get the real catalog, then offer 3\u20134 good picks (the free `letta/auto-fast` is the default; a small/fast model is right for a pet) and let them type another handle. Only handles from that catalog are accepted.",
+      "3. **What can it see of your work?** default `nothing`. Show these descriptions verbatim:",
+      ...SEE_OPTIONS.map(([k, d]) => `   - \`${k}\` \u2014 ${d}`),
+      "4. **When should it comment?** (skip if `nothing`) `turn` \u2014 after every turn you take (default); `turns N` \u2014 every N turns; `tools N` \u2014 every N tools.",
+      '5. **Who writes its persona?** `template` (shown below), `agent` \u2014 you write it, knowing what you know about it, or `user` \u2014 they paste their own. If you write it: permanent facts only (no level, stats, age in days, mood), they/them for yourself and for it, addressed to the sprite ("You are \u2026"), one to three short paragraphs. Show them your draft and let them edit it before continuing.',
+      "",
+      "Then show a short summary (backend \xB7 model \xB7 sees \xB7 comments \xB7 persona source) and ask them to confirm. On yes, call `sprite_ensoul` with the answers. It creates the agent, stores the pointer, and returns its first line \u2014 repeat that line to the user. On no, ask what to change.",
+      "",
+      "What it is:",
+      spriteFacts(sprite, collection, ownerName)
+    ].join(`
+`);
+  }
+  function personaRewritePrompt(sprite, collection, ownerName) {
+    return [
+      `The user ran \`/sprite soul persona\` for **${sprite.name}** \u2014 they want its persona rewritten. Ask them (AskUserQuestion) whether it should come from the template, from you, or from them. If you write it: permanent facts only, they/them, addressed to the sprite, one to three short paragraphs; show the draft and let them edit. Then confirm, and call \`sprite_soul_persona\` with the final text. Its voice, diary, and bond memory are untouched; only the persona file is replaced.`,
+      "",
+      "What it is:",
+      spriteFacts(sprite, collection, ownerName)
+    ].join(`
+`);
+  }
+  async function applyEnsoul(agentId, agentName, args) {
     if (!agentId)
-      return { output: "i can't tell which agent this is." };
+      return "i can't tell which agent this is.";
     const collection = getCollection(agentId);
     if (!collection)
-      return { output: "no companions yet \u2014 /sprite hatch to begin." };
-    const args = argstr.trim();
-    const [word, ...rest] = args.split(/\s+/).filter(Boolean);
-    const lower = (word ?? "").toLowerCase();
-    if (lower === "cancel") {
-      wizard = null;
-      refreshWizardPanel();
-      return { output: "ensoul cancelled. nothing was created." };
+      return "no companions yet \u2014 /sprite hatch to begin.";
+    const found = args.sprite ? findSprite(collection, args.sprite) : getSprite(agentId);
+    if (!found)
+      return `no companion called "${args.sprite}". see /sprite list.`;
+    if ("ambiguous" in found)
+      return describeAmbiguity(collection, found.ambiguous);
+    const sprite = found;
+    if (sprite.phase !== "alive")
+      return "it's still an egg \u2014 let it hatch first.";
+    if (sprite.soul)
+      return `${sprite.name} already has a mind of its own (${sprite.soul.backend} \xB7 ${sprite.soul.agentId}). /sprite soul to inspect it, /sprite soul persona to rewrite its persona.`;
+    const backend = args.backend === "cloud" ? "cloud" : "local";
+    const model = (args.model ?? DEFAULT_SOUL_MODEL).trim();
+    const catalog = await listSoulModels(backend);
+    if (catalog.length && !catalog.includes(model)) {
+      return `"${model}" isn't in the ${backend} catalog (${catalog.length} models). call sprite_models to see it, and pick one of those.`;
     }
-    if (!wizard || wizard.agentId !== agentId) {
-      const target = word ? findSprite(collection, args) : getSprite(agentId);
-      if (!target)
-        return { output: `no companion called "${args}". see /sprite list.` };
-      if ("ambiguous" in target)
-        return { output: describeAmbiguity(collection, target.ambiguous) };
-      if (target.phase !== "alive")
-        return { output: "it's still an egg \u2014 let it hatch first." };
-      if (target.soul)
-        return { output: `${target.name} already has a mind of its own (${target.soul.backend} \xB7 ${target.soul.agentId}). /sprite soul to inspect it, /sprite soul persona to rewrite its persona.` };
-      wizard = { agentId, spriteId: target.id, step: "backend" };
-      refreshWizardPanel();
-      return { output: wizardStepText(wizard) };
-    }
-    const w = wizard;
-    const sprite = collection.sprites[w.spriteId];
-    if (!sprite) {
-      wizard = null;
-      refreshWizardPanel();
-      return { output: "that companion is gone. ensoul cancelled." };
-    }
-    if (lower === "back") {
-      const order = w.rewrite ? ["persona", "confirm"] : ["backend", "model", "see", "comment", "persona", "confirm"];
-      const i = order.indexOf(w.step === "persona-wait" ? "persona" : w.step);
-      w.step = order[Math.max(0, i - 1)];
-      refreshWizardPanel();
-      return { output: wizardStepText(w) };
-    }
-    switch (w.step) {
-      case "backend": {
-        if (!word)
-          return { output: wizardStepText(w) };
-        const pick = lower === "1" || lower === "local" ? "local" : lower === "2" || lower === "cloud" ? "cloud" : null;
-        if (!pick)
-          return { output: "answer 1 (local) or 2 (cloud)." };
-        w.backend = pick;
-        w.models = await listSoulModels(pick);
-        w.step = "model";
-        refreshWizardPanel();
-        return { output: wizardStepText(w) };
-      }
-      case "model": {
-        if (!word)
-          return { output: wizardStepText(w) };
-        const models2 = w.models ?? [];
-        let pick = null;
-        const forced = lower === "force" && rest[0];
-        if (forced)
-          pick = rest[0];
-        else if (lower === "default")
-          pick = DEFAULT_SOUL_MODEL;
-        else if (/^\d+$/.test(lower))
-          pick = models2[Number(lower) - 1] ?? null;
-        else if (models2.includes(args))
-          pick = args;
-        else {
-          const hits = models2.filter((m) => m.toLowerCase().includes(lower));
-          if (hits.length === 1)
-            pick = hits[0];
-          else if (hits.length > 1) {
-            w.modelFilter = lower;
-            return { output: wizardStepText(w) };
-          } else if (args.includes("/")) {
-            return {
-              output: `"${args}" isn't in the catalog this mind will use (${models2.length} models on ${w.backend}) \u2014 it may be a provider this runtime can't see, or a typo. Pick from the list, filter with part of a name, or, if you're sure it works:  /sprite ensoul force ${args}`
-            };
-          } else {
-            w.modelFilter = lower;
-            return { output: wizardStepText(w) };
-          }
-        }
-        if (!pick)
-          return { output: "no such number \u2014 pick from the list or type part of a handle." };
-        if (!forced && models2.length && !models2.includes(pick)) {
-          return { output: `"${pick}" isn't in the catalog for ${w.backend}. /sprite ensoul force ${pick} to use it anyway.` };
-        }
-        w.model = pick;
-        w.step = "see";
-        refreshWizardPanel();
-        return { output: wizardStepText(w) };
-      }
-      case "see": {
-        if (!word)
-          return { output: wizardStepText(w) };
-        const idx = /^\d+$/.test(lower) ? Number(lower) - 1 : SEE_OPTIONS.findIndex(([k]) => k === lower);
-        if (idx < 0 || idx >= SEE_OPTIONS.length)
-          return { output: "answer 1\u20134 (nothing / events / tools / turns)." };
-        w.see = SEE_OPTIONS[idx][0];
-        w.comment = { every: "turn", n: 1 };
-        w.step = w.see === "nothing" ? "persona" : "comment";
-        refreshWizardPanel();
-        return { output: wizardStepText(w) };
-      }
-      case "comment": {
-        if (!word)
-          return { output: wizardStepText(w) };
-        if (lower === "1" || lower === "turn" || lower === "default")
-          w.comment = { every: "turn", n: 1 };
-        else if (lower === "turns" || lower === "2") {
-          const n = Number(rest[0]);
-          if (!(n > 0))
-            return { output: "how many turns? e.g. /sprite ensoul turns 3" };
-          w.comment = { every: "turns", n };
-        } else if (lower === "tools" || lower === "3") {
-          const n = Number(rest[0]);
-          if (!(n > 0))
-            return { output: "how many tools? e.g. /sprite ensoul tools 10" };
-          w.comment = { every: "tools", n };
-        } else
-          return { output: "answer 1, turns <n>, or tools <n>." };
-        w.step = "persona";
-        refreshWizardPanel();
-        return { output: wizardStepText(w) };
-      }
-      case "persona": {
-        if (!word)
-          return { output: wizardStepText(w) };
-        const owner = agentName ?? "your agent";
-        if (lower === "1" || lower === "template") {
-          w.personaSource = "template";
-          w.personaText = personaTemplate(sprite, owner, wizardParentNames(sprite, collection));
-          w.step = "confirm";
-          refreshWizardPanel();
-          return { output: wizardStepText(w) };
-        }
-        if (lower === "3" || lower === "user") {
-          const text = rest.join(" ").trim();
-          if (!text)
-            return { output: "write it after the word: /sprite ensoul user <persona text>" };
-          w.personaSource = "user";
-          w.personaText = text.slice(0, 4000);
-          w.step = "confirm";
-          refreshWizardPanel();
-          return { output: wizardStepText(w) };
-        }
-        if (lower === "2" || lower === "agent") {
-          w.personaSource = "agent";
-          w.step = "persona-wait";
-          refreshWizardPanel();
-          const diary = (sprite.log ?? []).slice(-20).map((e) => `- (${e.category}) ${e.line}`).join(`
-`) || "- (nothing yet)";
-          const prompt2 = [
-            `Please write the persona for your companion sprite **${sprite.name}** \u2014 it is about to be given a mind of its own (its own Letta agent), and this persona will be its identity.`,
-            "",
-            'Rules: permanent facts only. Do not mention its level, stats, age in days, mood, or anything that changes. Use they/them for yourself and for it. Write it addressed to the sprite ("You are \u2026"). One to three short paragraphs. Reply with ONLY the persona text, nothing else \u2014 it will be used verbatim.',
-            "",
-            "What it is:",
-            `- name: ${sprite.name} \xB7 species: ${sprite.species}${sprite.shiny ? " (shiny)" : ""} \xB7 temperament: ${sprite.temperament ?? "odd"}${sprite.founder ? " \xB7 your founder (fate-rolled from your agent-id)" : ""}${sprite.parents ? ` \xB7 bred, generation ${sprite.generation}` : ""}`,
-            `- hatched: ${new Date(sprite.hatchedAt ?? Date.now()).toISOString()}`,
-            `- species imagery: ${SPECIES_CARDS[sprite.species] ?? ""}`,
-            `- temperament: ${TEMPERAMENT_CARDS[sprite.temperament ?? "odd"]}`,
-            "",
-            "Things it has said recently:",
-            diary,
-            "",
-            "For reference, the template persona it would otherwise get:",
-            "```",
-            personaTemplate(sprite, owner, wizardParentNames(sprite, collection)),
-            "```",
-            "",
-            "Reply with only the persona text. When you're done, tell the user to run:  /sprite ensoul persona-done"
-          ].join(`
-`);
-          return { output: wizardStepText(w), prompt: prompt2 };
-        }
-        return { output: "answer 1 (template), 2 (agent), or 3 (user <text>)." };
-      }
-      case "persona-wait": {
-        if (lower !== "persona-done")
-          return { output: wizardStepText(w) };
-        let text = "";
-        try {
-          const history = await ctx?.conversation?.getHistory?.({ limit: 12 });
-          const msgs = Array.isArray(history) ? history : history?.messages ?? [];
-          for (let i = msgs.length - 1;i >= 0; i -= 1) {
-            const m = msgs[i];
-            const role = m?.role ?? m?.message_type;
-            const content = typeof m?.content === "string" ? m.content : Array.isArray(m?.content) ? m.content.map((c) => c?.text ?? "").join(`
-`) : m?.text ?? "";
-            if ((role === "assistant" || role === "assistant_message") && content.trim()) {
-              text = content.trim();
-              break;
-            }
-          }
-        } catch {}
-        if (!text)
-          return { output: "couldn't read your agent's reply from the conversation. paste it instead: /sprite ensoul user <text>" };
-        w.personaText = text.replace(/^```[a-z]*\n?|```$/g, "").trim().slice(0, 4000);
-        w.step = "confirm";
-        refreshWizardPanel();
-        return { output: wizardStepText(w) };
-      }
-      case "confirm": {
-        if (w.rewrite) {
-          if (lower !== "apply")
-            return { output: wizardStepText(w) };
-          if (!sprite.soul) {
-            wizard = null;
-            refreshWizardPanel();
-            return { output: `${sprite.name} has no mind to rewrite.` };
-          }
-          const persona2 = `${w.personaText ?? ""}${SOUL_FOOTER}`;
-          const err = writeSoulPersona(sprite.soul, persona2, agentName ?? agentId);
-          if (err)
-            return { output: `couldn't write the persona: ${err}` };
-          sprite.soul.personaSource = w.personaSource ?? "template";
-          markDirty();
-          flush();
-          wizard = null;
-          refreshWizardPanel();
-          const line = await soulSay(sprite, "Your persona was just rewritten. Read it, then say one line as yourself.", { force: true });
-          if (line)
-            showSoulLine(sprite, "mood", line);
-          return { output: `${sprite.name}'s persona rewritten.${line ? `
-${sprite.name}: ${line}` : ""}` };
-        }
-        if (lower !== "confirm")
-          return { output: wizardStepText(w) };
-        const persona = `${w.personaText ?? personaTemplate(sprite, agentName ?? "your agent")}${SOUL_FOOTER}`;
-        try {
-          const client = await soulClient(w.backend);
-          const soulAgentId = await client.createAgent({
-            name: `${sprite.name} (sprite of ${agentName ?? agentId})`,
-            description: `Companion sprite ${sprite.name} \u2014 a ${sprite.species} belonging to agent ${agentId}. Created by the sprite mod.`,
-            hidden: true,
-            tags: ["sprite", `sprite:${sprite.id}`, `sprite-owner:${agentId}`],
-            model: w.model,
-            baseTools: [],
-            memfs: true,
-            dreaming: { trigger: "step-count", stepCount: 20 },
-            memory: [
-              { label: "persona", value: persona },
-              { label: "voice", value: `# ${sprite.name}'s voice
+    const see = SEE_OPTIONS.some(([k]) => k === args.see) ? args.see : "nothing";
+    const every = args.comment?.every && ["turn", "turns", "tools"].includes(args.comment.every) ? args.comment.every : "turn";
+    const n = every === "turn" ? 1 : Math.max(1, Math.floor(Number(args.comment?.n) || 1));
+    const ownerName = agentName ?? "your agent";
+    const personaText = (args.persona ?? "").trim() || personaTemplate(sprite, ownerName, parentNamesOf(sprite, collection));
+    const personaSource = args.persona?.trim() ? args.personaSource === "user" ? "user" : "agent" : "template";
+    const persona = `${personaText.slice(0, 6000)}${SOUL_FOOTER}`;
+    try {
+      const client = await soulClient(backend);
+      const soulAgentId = await client.createAgent({
+        name: `${sprite.name} (sprite of ${ownerName})`,
+        description: `Companion sprite ${sprite.name} \u2014 a ${sprite.species} belonging to agent ${agentId}. Created by the sprite mod.`,
+        hidden: true,
+        tags: ["sprite", `sprite:${sprite.id}`, `sprite-owner:${agentId}`],
+        model,
+        baseTools: [],
+        memfs: true,
+        dreaming: { trigger: "step-count", stepCount: 20 },
+        memory: [
+          { label: "persona", value: persona },
+          { label: "voice", value: `# ${sprite.name}'s voice
 
 Lines you like to say. Add your own as you find them.
 
@@ -13810,49 +13563,89 @@ ${pickLines(sprite, c).map((l) => `- ${l}`).join(`
 `)}`).join(`
 
 `)}` },
-              { label: "diary", value: `# ${sprite.name}'s diary
+          { label: "diary", value: `# ${sprite.name}'s diary
 
 (what you want to remember about your days)` },
-              { label: "bond", value: `# about ${agentName ?? "them"}
+          { label: "bond", value: `# about ${ownerName}
 
 (what you've learned about the one you keep company)` }
-            ]
-          });
-          sprite.soul = {
-            agentId: soulAgentId,
-            backend: w.backend,
-            model: w.model,
-            createdAt: Date.now(),
-            see: w.see ?? "nothing",
-            comment: w.comment ?? { every: "turn", n: 1 },
-            commentRateMin: 0,
-            talkGate: 5,
-            dreaming: "step-count",
-            personaSource: w.personaSource ?? "template",
-            lineCount: 0
-          };
-          markDirty();
-          flush();
-          queueCheckpoint(agentId, "ensouled");
-          wizard = null;
-          refreshWizardPanel();
-          setPose("happy", 6000);
-          const first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
-          if (first)
-            showSoulLine(sprite, "greeting", first);
-          const verdict = first ? `
+        ]
+      });
+      sprite.soul = {
+        agentId: soulAgentId,
+        backend,
+        model,
+        createdAt: Date.now(),
+        see,
+        comment: { every, n },
+        commentRateMin: 0,
+        talkGate: 5,
+        dreaming: "step-count",
+        personaSource,
+        lineCount: 0
+      };
+      markDirty();
+      flush();
+      queueCheckpoint(agentId, "ensouled");
+      setPose("happy", 6000);
+      const first = await soulSay(sprite, "You have just been given a mind of your own. Say your first line.", { force: true });
+      if (first)
+        showSoulLine(sprite, "greeting", first);
+      const verdict = first ? `
 ${sprite.name}: ${first}` : `
-\u26A0 its mind was created but didn't answer with ${w.model}. try another model:  /sprite soul model <handle>`;
-          return { output: `${sprite.name} has a mind of its own now. (${w.backend} \xB7 ${soulAgentId} \xB7 ${w.model})${verdict}
+\u26A0 its mind was created but didn't answer with ${model}. try another:  /sprite soul model <handle>`;
+      return `${sprite.name} has a mind of its own now. (${backend} \xB7 ${soulAgentId} \xB7 ${model} \xB7 sees ${see})${verdict}
 
-talk to it: /sprite talk <text> \xB7 inspect: /sprite soul` };
-        } catch (error) {
-          return { output: `couldn't create ${sprite.name}'s mind: ${String(error?.message ?? error).slice(0, 200)}
-nothing was changed. (/sprite ensoul back to adjust, or cancel)` };
-        }
-      }
+talk to it: /sprite talk <text> \xB7 inspect: /sprite soul`;
+    } catch (error) {
+      return `couldn't create ${sprite.name}'s mind: ${String(error?.message ?? error).slice(0, 200)}
+nothing was changed.`;
     }
-    return { output: wizardStepText(w) };
+  }
+  async function applyPersonaRewrite(agentId, agentName, args) {
+    const collection = getCollection(agentId);
+    if (!agentId || !collection)
+      return "no companions yet.";
+    const found = args.sprite ? findSprite(collection, args.sprite) : getSprite(agentId);
+    if (!found)
+      return `no companion called "${args.sprite}".`;
+    if ("ambiguous" in found)
+      return describeAmbiguity(collection, found.ambiguous);
+    const sprite = found;
+    if (!sprite.soul)
+      return `${sprite.name} has no mind to rewrite \u2014 /sprite ensoul first.`;
+    const text = (args.persona ?? "").trim();
+    if (!text)
+      return "persona text is required.";
+    const err = writeSoulPersona(sprite.soul, `${text.slice(0, 6000)}${SOUL_FOOTER}`, agentName ?? agentId);
+    if (err)
+      return `couldn't write the persona: ${err}`;
+    sprite.soul.personaSource = args.personaSource === "user" ? "user" : args.personaSource === "template" ? "template" : "agent";
+    markDirty();
+    flush();
+    const line = await soulSay(sprite, "Your persona was just rewritten. Read it, then say one line as yourself.", { force: true });
+    if (line)
+      showSoulLine(sprite, "mood", line);
+    return `${sprite.name}'s persona rewritten.${line ? `
+${sprite.name}: ${line}` : ""}`;
+  }
+  function doEnsoul(agentId, agentName, argstr) {
+    if (!agentId)
+      return { output: "i can't tell which agent this is." };
+    const collection = getCollection(agentId);
+    if (!collection)
+      return { output: "no companions yet \u2014 /sprite hatch to begin." };
+    const q = argstr.trim();
+    const target = q ? findSprite(collection, q) : getSprite(agentId);
+    if (!target)
+      return { output: `no companion called "${q}". see /sprite list.` };
+    if ("ambiguous" in target)
+      return { output: describeAmbiguity(collection, target.ambiguous) };
+    if (target.phase !== "alive")
+      return { output: "it's still an egg \u2014 let it hatch first." };
+    if (target.soul)
+      return { output: `${target.name} already has a mind of its own (${target.soul.backend} \xB7 ${target.soul.agentId}). /sprite soul to inspect it, /sprite soul persona to rewrite its persona.` };
+    return { output: `asking ${agentName ?? "your agent"} to walk you through it\u2026`, prompt: ensoulPrompt(target, collection, agentName ?? "your agent") };
   }
   function pickLines(sprite, category) {
     const custom = sprite.voice?.[category];
@@ -13928,13 +13721,6 @@ nothing was changed. (/sprite ensoul back to adjust, or cancel)` };
           soul.talkGate = Math.floor(n);
         }
         break;
-      }
-      case "persona": {
-        wizard = { agentId, spriteId: sprite.id, step: "persona", rewrite: true };
-        refreshWizardPanel();
-        return wizardStepText(wizard) + `
-
-(this rewrites ${sprite.name}'s persona file; its own edits to that file are replaced. voice, diary, and bond are untouched.)`;
       }
       case "dreaming": {
         if (!["off", "step-count", "compaction-event"].includes(value))
@@ -14313,10 +14099,10 @@ ${recent.join(`
       "                                 Deliberate and irreversible.",
       "",
       "  /sprite ensoul [name]          Give a companion a mind of its own: its own Letta",
-      "                                 agent, with memory and dreaming. A short guided",
-      "                                 flow asks where it lives (local or cloud), which",
-      "                                 model, what it may see of your work (nothing, by",
-      "                                 default), when it comments, and who writes its",
+      "                                 agent, with memory and dreaming. Your agent walks",
+      "                                 you through it \u2014 where it lives (local or cloud),",
+      "                                 which model, what it may see of your work (nothing,",
+      "                                 by default), when it comments, and who writes its",
       "                                 persona (a template, your agent, or you).",
       "  /sprite soul [key value]       Inspect or change an ensouled companion's settings,",
       "                                 including a rough token cost. `/sprite soul persona`",
@@ -14329,7 +14115,8 @@ ${recent.join(`
       "  /sprite help                   Show this message.",
       "",
       "Your agent can also care for its companion directly with these tools:",
-      "  sprite_hatch, sprite_list, sprite_switch, sprite_breed, sprite_talk, sprite_name, sprite_molt, sprite_pet,",
+      "  sprite_hatch, sprite_list, sprite_switch, sprite_breed, sprite_talk, sprite_ensoul, sprite_soul_persona,",
+      "  sprite_models, sprite_name, sprite_molt, sprite_pet,",
       "  sprite_status, sprite_set_voice.",
       "",
       "Experience comes from real work \u2014 tool calls, turns, and conversations \u2014 and",
@@ -14377,10 +14164,29 @@ ${recent.join(`
             break;
           case "release":
             return doRelease(agentId, restStr).then((o) => ({ type: "output", output: o }));
-          case "ensoul":
-            return doEnsoul(agentId, agentName, restStr, ctx).then((r) => r.prompt ? { type: "prompt", content: r.prompt } : { type: "output", output: r.output });
-          case "soul":
+          case "ensoul": {
+            const r = doEnsoul(agentId, agentName, restStr);
+            if (r.prompt)
+              return { type: "prompt", content: r.prompt };
+            output = r.output;
+            break;
+          }
+          case "soul": {
+            if (rest[0]?.toLowerCase() === "persona") {
+              const sp = getSprite(agentId);
+              const col = getCollection(agentId);
+              if (!sp || !col) {
+                output = "no companion yet.";
+                break;
+              }
+              if (!sp.soul) {
+                output = `${sp.name} has no mind yet \u2014 /sprite ensoul first.`;
+                break;
+              }
+              return { type: "prompt", content: personaRewritePrompt(sp, col, agentName ?? "your agent") };
+            }
             return doSoul(agentId, restStr).then((o) => ({ type: "output", output: o }));
+          }
           case "talk": {
             const target = getSprite(agentId);
             if (!target || target.phase !== "alive") {
@@ -14468,6 +14274,80 @@ ${recent.join(`
       parallelSafe: true,
       run(ctx) {
         return doList(toolAgent(ctx));
+      }
+    }));
+    disposers.push(letta.tools.register({
+      name: "sprite_models",
+      description: "List the model handles available for a companion sprite's mind on a backend. Call this while walking the user through /sprite ensoul so you offer real choices.",
+      parameters: {
+        type: "object",
+        properties: {
+          backend: { type: "string", enum: ["local", "cloud"], description: "Where the mind will live." },
+          filter: { type: "string", description: "Optional substring to narrow the list (e.g. flash, mini, haiku)." }
+        },
+        required: ["backend"],
+        additionalProperties: false
+      },
+      requiresApproval: false,
+      parallelSafe: true,
+      async run(ctx) {
+        const backend = ctx.args?.backend === "cloud" ? "cloud" : "local";
+        const all = await listSoulModels(backend);
+        const f = String(ctx.args?.filter ?? "").toLowerCase();
+        const list = f ? all.filter((m) => m.toLowerCase().includes(f)) : all;
+        if (!list.length)
+          return all.length ? `no ${backend} models match "${f}" (${all.length} available)` : `couldn't list ${backend} models (is the backend reachable / are you logged in?)`;
+        return `${list.length} ${backend} model${list.length === 1 ? "" : "s"}${f ? ` matching "${f}"` : ""} (featured/free first). default: ${DEFAULT_SOUL_MODEL}
+${list.slice(0, 80).join(`
+`)}${list.length > 80 ? `
+\u2026 ${list.length - 80} more \u2014 narrow with filter` : ""}`;
+      }
+    }));
+    disposers.push(letta.tools.register({
+      name: "sprite_ensoul",
+      description: "Give a companion sprite a mind of its own: creates its Letta agent with the persona and settings the user chose. Only call this at the end of walking the user through /sprite ensoul, after they have confirmed the summary. Returns the sprite's first line.",
+      parameters: {
+        type: "object",
+        properties: {
+          sprite: { type: "string", description: "Which companion (name or roster number). Omit for the one on the panel." },
+          backend: { type: "string", enum: ["local", "cloud"], description: "Where its mind lives." },
+          model: { type: "string", description: `Model handle from sprite_models. Default ${DEFAULT_SOUL_MODEL}.` },
+          see: { type: "string", enum: ["nothing", "events", "tools", "turns"], description: "What it may see of the agent's work. Default nothing." },
+          comment: {
+            type: "object",
+            description: "When it comments on what it sees.",
+            properties: { every: { type: "string", enum: ["turn", "turns", "tools"] }, n: { type: "number" } },
+            additionalProperties: false
+          },
+          persona: { type: "string", description: "Persona text if written by you or the user. Omit to use the template. Permanent facts only; they/them." },
+          personaSource: { type: "string", enum: ["template", "agent", "user"] }
+        },
+        required: ["backend"],
+        additionalProperties: false
+      },
+      requiresApproval: false,
+      parallelSafe: false,
+      async run(ctx) {
+        return applyEnsoul(toolAgent(ctx), ctx.agent?.name ?? activeAgentName, ctx.args ?? { backend: "local" });
+      }
+    }));
+    disposers.push(letta.tools.register({
+      name: "sprite_soul_persona",
+      description: "Rewrite an ensouled companion sprite's persona file. Only call this at the end of /sprite soul persona, after the user has confirmed the text. Its voice, diary, and bond memory are untouched.",
+      parameters: {
+        type: "object",
+        properties: {
+          sprite: { type: "string", description: "Which companion. Omit for the one on the panel." },
+          persona: { type: "string", description: "The full persona text. Permanent facts only; they/them." },
+          personaSource: { type: "string", enum: ["template", "agent", "user"] }
+        },
+        required: ["persona"],
+        additionalProperties: false
+      },
+      requiresApproval: false,
+      parallelSafe: false,
+      async run(ctx) {
+        return applyPersonaRewrite(toolAgent(ctx), ctx.agent?.name ?? activeAgentName, ctx.args ?? { persona: "" });
       }
     }));
     disposers.push(letta.tools.register({
