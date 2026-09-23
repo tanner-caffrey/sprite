@@ -26,7 +26,8 @@
     "breeding",
     "smoke-test.mjs",
     "persistence-test.mjs",
-    "hardening-test.mjs"
+    "hardening-test.mjs",
+    "scripts"
   ],
   "letta": {
     "manifestVersion": 1,
@@ -47,6 +48,7 @@
     }
   },
   "scripts": {
-    "test": "bun smoke-test.mjs && bun persistence-test.mjs && bun hardening-test.mjs && node breeding/genetics.test.mjs"
+    "test": "bun smoke-test.mjs && bun persistence-test.mjs && bun hardening-test.mjs && node breeding/genetics.test.mjs",
+    "changelog": "node scripts/changelog.mjs"
   }
 }
