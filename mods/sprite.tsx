@@ -1381,16 +1381,102 @@ interface SoulClient {
 // does NOT go looking for the session bus itself — if someone runs without
 // one, that may be deliberate. It explains what to do instead (see the
 // createAgent error hint).
+// Cloud souls use the client the HOST hands every mod (`letta.client`): it is
+// the host's own resolved Letta API client — same login, keyring, and token
+// refresh as the session, in-process, no second Letta Code to re-derive auth.
+// (It happens to be the older letta-client SDK; that's the host's choice and
+// it will follow whatever the host moves to. We don't import it ourselves.)
+// Local souls use the agent-sdk app-server, because the local backend is
+// files and a second process can open the same store.
+let hostClient: any = null;
+export function __setHostClient(c: any) { hostClient = c; }
+
+function adaptHostClient(client: any): SoulClient {
+  const textOf = (msg: any): string => {
+    if (typeof msg?.content === "string") return msg.content;
+    if (Array.isArray(msg?.content)) return msg.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("");
+    return "";
+  };
+  return {
+    async createAgent(o) {
+      const memory = Array.isArray(o.memory) ? (o.memory as any[]) : [];
+      const created = await client.agents.create({
+        name: o.name,
+        description: o.description,
+        hidden: o.hidden ?? true,
+        tags: o.tags,
+        model: o.model,
+        include_base_tools: false,
+        memory_blocks: memory.map((m) => ({ label: m.label, value: m.value })),
+      });
+      return String(created?.id);
+    },
+    resumeSession(agentId, sessionOpts) {
+      // A one-turn "session" over the plain messages API. Client tools can't
+      // execute server-side here, so my_stats/my_diary are inlined into the
+      // message as context instead. No harness toolset exists on this path at
+      // all: the agent has only its memory tools.
+      let msg = "";
+      let aborted = false;
+      return {
+        async send(text: string) { msg = text; },
+        async *stream() {
+          const tools: any[] = Array.isArray(sessionOpts?.tools) ? sessionOpts.tools : [];
+          let context = "";
+          for (const t of tools) {
+            try { const r = await t.execute("inline", {}); context += `\n\n[${t.name}]\n${String(r?.content ?? "")}`; } catch { /* skip */ }
+          }
+          if (aborted) return;
+          const res: any = await client.agents.messages.create(agentId, {
+            messages: [{ role: "user", content: `${msg}${context ? `\n\n(for reference — you asked:${context})` : ""}` }],
+            max_steps: 4,
+          });
+          if (aborted) return;
+          const text = (res?.messages ?? [])
+            .filter((m: any) => m?.message_type === "assistant_message")
+            .map(textOf)
+            .join("\n");
+          yield { type: "assistant", content: text };
+          yield { type: "result", success: true, result: text };
+        },
+        async abort() { aborted = true; },
+        async updateModel(m: string) { await client.agents.update(agentId, { model: m }); return { modelHandle: m }; },
+        close() { /* nothing to close */ },
+      };
+    },
+    async prompt() { throw new Error("use resumeSession"); },
+    agents: {
+      async retrieve(id) { return client.agents.retrieve(id); },
+      async delete(id) { await client.agents.delete(id); },
+      async update(id, body) { return client.agents.update(id, body); },
+    },
+    models: {
+      async list() {
+        const out: any[] = [];
+        const page: any = await client.models.list();
+        const items: any[] = Array.isArray(page) ? page : page?.items ?? page?.data ?? [];
+        for (const m of items) out.push({ handle: m?.handle ?? m?.id, isFeatured: false, free: /^letta\//.test(String(m?.handle ?? "")) });
+        return { entries: out };
+      },
+    },
+  };
+}
+
 let soulClientFactory: (backend: SoulBackend) => Promise<SoulClient> = async (backend) => {
+  if (backend === "cloud") {
+    if (!hostClient) throw new Error("this Letta Code doesn't expose a cloud client to mods (letta.client missing)");
+    return adaptHostClient(hostClient);
+  }
   if (!process.env.LETTA_CLI_PATH) {
     const bin = process.env.LETTA_CODE_BIN;
     if (bin && existsSync(bin)) { process.env.LETTA_CLI_PATH = bin; soulSetCliPath = true; }
   }
   const mod: any = await import("@letta-ai/letta-agent-sdk");
-  return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: backend === "cloud" ? "api" : "local" } }) as SoulClient;
+  return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: "local" } }) as SoulClient;
 };
-export function __setSoulClientFactory(f: typeof soulClientFactory) {
-  soulClientFactory = f;
+const defaultSoulClientFactory = soulClientFactory;
+export function __setSoulClientFactory(f: typeof soulClientFactory | undefined) {
+  soulClientFactory = f ?? defaultSoulClientFactory;
   soulClients.clear();
 }
 const soulClients = new Map<SoulBackend, Promise<SoulClient>>();
@@ -2996,6 +3082,7 @@ export const __genetics = { breedSprites, childFateSeed, rollSpecies, rollShiny,
 
 export default function activate(letta: any) {
   const guardable = Boolean(letta && typeof letta === "object");
+  if (letta?.client && !hostClient) hostClient = letta.client;
   if (guardable) {
     if (ACTIVE_HOSTS.has(letta)) {
       try {
@@ -4589,7 +4676,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       const hint = /Missing LETTA_API_KEY/.test(msg) && backend === "cloud"
         ? (process.platform === "linux" && !process.env.DBUS_SESSION_BUS_ADDRESS
           ? "\nThis Letta Code was started without access to the login keyring (no D-Bus session bus). Start it from a desktop session, or launch it with  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus  — or set LETTA_API_KEY in its environment. Nothing was created."
-          : "\nThis machine isn't logged in to Letta Cloud from here. Run `letta --backend cloud agents list` to check, or set LETTA_API_KEY. Nothing was created.")
+          : "\nThis Letta Code session isn't logged in to Letta Cloud. Run `letta` and sign in, or set LETTA_API_KEY where Letta Code is launched. Nothing was created.")
         : "";
       return `couldn't create ${sprite.name}'s mind: ${msg}${hint}\nnothing was changed.`;
     }

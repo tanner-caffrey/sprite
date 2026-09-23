@@ -1333,4 +1333,41 @@ await check("help: every subcommand has an entry, `<sub> help` works, GUIDE.md i
   assert.ok(statSync(join(import.meta.dirname, "GUIDE.md")).mtimeMs >= statSync(join(import.meta.dirname, "mods", "sprite.tsx")).mtimeMs - 5_000, "GUIDE.md is older than the help table — run bun run guide");
 });
 
+await check("soul: cloud minds go through the host's letta.client (in-process), not a spawned Letta Code", async () => {
+  const { __setHostClient } = await import("./mods/sprite.tsx");
+  __setSoulClientFactory(undefined); // restore the real factory for this check
+  const created = new Map(); const calls = [];
+  const host = {
+    agents: {
+      async create(b) { const id = `agent-cloud-${created.size + 1}`; created.set(id, b); calls.push(["create", b]); return { id }; },
+      async retrieve(id) { const b = created.get(id); if (!b) throw new Error("404"); return { id, hidden: b.hidden, description: b.description, tags: [] }; },
+      async delete(id) { calls.push(["delete", id]); created.delete(id); },
+      async update(id, body) { calls.push(["update", id, body]); },
+      messages: { async create(id, body) { calls.push(["message", id, body]); return { messages: [{ message_type: "assistant_message", content: "quack from the cloud" }] }; } },
+    },
+    models: { async list() { return { items: [{ handle: "letta/auto-fast" }, { handle: "letta/auto" }] }; } },
+  };
+  __setHostClient(host);
+  const agent = { id: "agent-cloudsoul", name: "Owner" };
+  const { host: h, dispose } = hatchFor(agent, null);
+  const out = String(await h.tools.get("sprite_ensoul").run({ agent, args: { backend: "cloud", model: "letta/auto-fast", see: "events" } }));
+  assert.match(out, /has a mind of its own now\. \(cloud/, out);
+  assert.match(out, /quack from the cloud/);
+  const c = calls.find((x) => x[0] === "create")[1];
+  assert.equal(c.include_base_tools, false);
+  assert.equal(c.hidden, true);
+  assert.match(c.description, /\[sprite:sprite_[a-z0-9]+ owner:agent-cloudsoul\]/); // ownership marker, since cloud returns tags: []
+  assert.deepEqual(c.memory_blocks.map((b) => b.label), ["persona", "voice", "diary", "bond"]);
+  // ownership verified via the marker; pet works; my_stats inlined as context
+  assert.match(await h.command("pet"), /quack from the cloud/);
+  const msg = calls.filter((x) => x[0] === "message").pop()[2].messages[0].content;
+  assert.match(msg, /\[my_stats\]/);
+  assert.match(msg, /petted/);
+  // release with delete-agent goes through the host client
+  const st = readState(); const col = st.collections[agent.id]; const sp = col.sprites[col.activeSpriteId];
+  assert.match(await h.command(`release confirm:${sp.id} delete-agent`), /founder/); // founder can't be released — proves the path reached the guard
+  dispose();
+  __setHostClient(null);
+});
+
 console.log(`\nSprite hardening test passed (${passed} checks).`);

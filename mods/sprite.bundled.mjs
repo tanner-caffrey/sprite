@@ -11234,7 +11234,108 @@ function quoteObs(text) {
 }
 var SOUL_LINE_MAX = 80;
 var DEFAULT_SOUL_MODEL = "letta/auto-fast";
+var hostClient = null;
+function __setHostClient(c) {
+  hostClient = c;
+}
+function adaptHostClient(client) {
+  const textOf = (msg) => {
+    if (typeof msg?.content === "string")
+      return msg.content;
+    if (Array.isArray(msg?.content))
+      return msg.content.map((c) => typeof c?.text === "string" ? c.text : "").join("");
+    return "";
+  };
+  return {
+    async createAgent(o) {
+      const memory = Array.isArray(o.memory) ? o.memory : [];
+      const created = await client.agents.create({
+        name: o.name,
+        description: o.description,
+        hidden: o.hidden ?? true,
+        tags: o.tags,
+        model: o.model,
+        include_base_tools: false,
+        memory_blocks: memory.map((m) => ({ label: m.label, value: m.value }))
+      });
+      return String(created?.id);
+    },
+    resumeSession(agentId, sessionOpts) {
+      let msg = "";
+      let aborted = false;
+      return {
+        async send(text) {
+          msg = text;
+        },
+        async* stream() {
+          const tools = Array.isArray(sessionOpts?.tools) ? sessionOpts.tools : [];
+          let context = "";
+          for (const t of tools) {
+            try {
+              const r = await t.execute("inline", {});
+              context += `
+
+[${t.name}]
+${String(r?.content ?? "")}`;
+            } catch {}
+          }
+          if (aborted)
+            return;
+          const res = await client.agents.messages.create(agentId, {
+            messages: [{ role: "user", content: `${msg}${context ? `
+
+(for reference \u2014 you asked:${context})` : ""}` }],
+            max_steps: 4
+          });
+          if (aborted)
+            return;
+          const text = (res?.messages ?? []).filter((m) => m?.message_type === "assistant_message").map(textOf).join(`
+`);
+          yield { type: "assistant", content: text };
+          yield { type: "result", success: true, result: text };
+        },
+        async abort() {
+          aborted = true;
+        },
+        async updateModel(m) {
+          await client.agents.update(agentId, { model: m });
+          return { modelHandle: m };
+        },
+        close() {}
+      };
+    },
+    async prompt() {
+      throw new Error("use resumeSession");
+    },
+    agents: {
+      async retrieve(id) {
+        return client.agents.retrieve(id);
+      },
+      async delete(id) {
+        await client.agents.delete(id);
+      },
+      async update(id, body) {
+        return client.agents.update(id, body);
+      }
+    },
+    models: {
+      async list() {
+        const out = [];
+        const page = await client.models.list();
+        const items = Array.isArray(page) ? page : page?.items ?? page?.data ?? [];
+        for (const m of items)
+          out.push({ handle: m?.handle ?? m?.id, isFeatured: false, free: /^letta\//.test(String(m?.handle ?? "")) });
+        return { entries: out };
+      }
+    }
+  };
+}
 var soulClientFactory = async (backend) => {
+  if (backend === "cloud") {
+    if (!hostClient)
+      throw new Error("this Letta Code doesn't expose a cloud client to mods (letta.client missing)");
+    return adaptHostClient(hostClient);
+  }
   if (!process.env.LETTA_CLI_PATH) {
     const bin = process.env.LETTA_CODE_BIN;
     if (bin && existsSync4(bin)) {
@@ -11243,10 +11344,11 @@ var soulClientFactory = async (backend) => {
     }
   }
   const mod = await Promise.resolve().then(() => (init_dist(), exports_dist));
-  return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: backend === "cloud" ? "api" : "local" } });
+  return new mod.LettaAgentClient({ backend: "local", appServer: { harnessBackend: "local" } });
 };
+var defaultSoulClientFactory = soulClientFactory;
 function __setSoulClientFactory(f) {
-  soulClientFactory = f;
+  soulClientFactory = f ?? defaultSoulClientFactory;
   soulClients.clear();
 }
 var soulClients = new Map;
@@ -12583,6 +12685,8 @@ var ACTIVE_HOSTS = globalThis[Symbol.for("@faye/sprite:hosts")] ??= new WeakSet;
 var __genetics = { breedSprites, childFateSeed, rollSpecies, rollShiny, rollTemperament, rarityIdx };
 function activate(letta) {
   const guardable = Boolean(letta && typeof letta === "object");
+  if (letta?.client && !hostClient)
+    hostClient = letta.client;
   if (guardable) {
     if (ACTIVE_HOSTS.has(letta)) {
       try {
@@ -14117,7 +14221,7 @@ talk to it: /sprite talk <text> \xB7 inspect: /sprite soul`;
       unreserve();
       const msg = String(error?.message ?? error).slice(0, 200);
       const hint = /Missing LETTA_API_KEY/.test(msg) && backend === "cloud" ? process.platform === "linux" && !process.env.DBUS_SESSION_BUS_ADDRESS ? `
-This Letta Code was started without access to the login keyring (no D-Bus session bus). Start it from a desktop session, or launch it with  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus  \u2014 or set LETTA_API_KEY in its environment. Nothing was created.` : "\nThis machine isn't logged in to Letta Cloud from here. Run `letta --backend cloud agents list` to check, or set LETTA_API_KEY. Nothing was created." : "";
+This Letta Code was started without access to the login keyring (no D-Bus session bus). Start it from a desktop session, or launch it with  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus  \u2014 or set LETTA_API_KEY in its environment. Nothing was created.` : "\nThis Letta Code session isn't logged in to Letta Cloud. Run `letta` and sign in, or set LETTA_API_KEY where Letta Code is launched. Nothing was created." : "";
       return `couldn't create ${sprite.name}'s mind: ${msg}${hint}
 nothing was changed.`;
     }
@@ -14985,6 +15089,7 @@ export {
   renderHelpEntry,
   activate as default,
   __setSoulClientFactory,
+  __setHostClient,
   __genetics,
   HELP
 };

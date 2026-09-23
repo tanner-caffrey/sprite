@@ -8,6 +8,14 @@ the version you last used; `/sprite changelog all` shows everything.
   (no D-Bus) now find the login keyring themselves. If they still can't, the
   error says exactly what to do.
 
+## v0.9.8 — cloud minds through your own session
+- A cloud mind is now created and spoken to through the client Letta Code
+  hands the mod — the same login your session already has. No second Letta
+  Code is started, no keyring or D-Bus dance, no `LETTA_API_KEY` to set. If
+  your session is logged in to Letta Cloud, cloud companions work.
+- Local minds still run through the agent SDK's app-server (the local
+  backend is files, so a second process can share it).
+
 ## v0.9.7
 - The mod no longer looks for the D-Bus session bus itself. If your Letta
   Code was started without access to the login keyring, cloud ensoul says
