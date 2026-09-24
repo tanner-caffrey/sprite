@@ -18,13 +18,13 @@ A tiny persistent pet for your Letta agent.
   during compaction — which, on Letta, is when the agent is actually
   consolidating memory. The pet naps because its agent is napping.
 - It gains XP **passively** from real activity (tool results, LLM turns,
-  conversations opening). No tools are called; the mod adds zero tokens and
-  zero extra turns.
+  conversations opening). No tools are called; without ensoulment the mod
+  adds zero tokens and zero extra turns.
 - Five witness-stats grow from what it observes: CRAFT (edits/builds), WANDER
   (reads/searches), GRIT (recovering after error streaks), LORE (memory
-  operations), SPARK (LLM turns). Bars are log-scale (8 blocks, each ~3× the
-  last) so the sheet stays a living portrait for months instead of maxing in
-  a week.
+  operations), SPARK (LLM turns). Bars wrap: when one fills it starts over and
+  its lap count rises, so the sheet stays a living portrait — growth is always
+  visible, and an old companion looks old.
 - Each sprite has a **nature**: a temperament seeded at birth (gentle / wry /
   bold / sleepy / odd) plus a vocation earned from its dominant stat
   (diligent / curious / stubborn / bookish / chatty). Milestone titles land
@@ -43,8 +43,9 @@ Core care actions have agent-tool twins: `sprite_hatch`, `sprite_name`,
 `sprite_molt`, `sprite_pet`, `sprite_set_voice`, and `sprite_status`. You can
 simply ask your agent to hatch and name its own companion — or to **author
 its pet's voice**: the agent writes a replacement line-corpus once (per
-trigger category), and the lines play back deterministically forever.
-Personality customization with zero runtime cost.
+trigger category), and the lines play back forever (dealt from a shuffled
+bag so they don't repeat back-to-back). Personality customization with zero
+runtime cost.
 
 The pet speaks into a panel the agent cannot see, so perception is built in:
 action results carry what the pet did and said (petting returns its response),
@@ -85,9 +86,9 @@ Settings keys: `voice on|off`, `voiceRateMin <minutes>`, `visible on|off`, `laps
 
 Stat bars wrap: when one fills it starts over and its lap count rises (lap cost grows +15% per lap for ten laps, then stays flat). `laps` picks how the count is drawn; `hue` colours bars by age (grey → white → gold → rose → violet → teal → shimmer); `bars` adds a compact stat strip to the panel row.
 
-Ensoulment (a live tiny-mind voice on a model you choose) is planned for a
-future update; today the voice is a static or agent-authored corpus at zero
-token cost.
+Ensoulment — `/sprite ensoul` — gives a companion its own Letta agent: memory
+it keeps, dreaming, a persona, and live lines instead of the corpus. It sees
+only what `see` allows and runs with only its own tools; see GUIDE.md.
 
 ## State & safety
 

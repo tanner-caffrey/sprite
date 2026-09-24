@@ -268,19 +268,19 @@ Inspect or change an ensouled companion's mind.
 
 | Option | What it does |
 | --- | --- |
-| `(no arguments)` | Where its mind lives, model, what it sees, when it comments, talk gate, dreaming, persona source, live lines so far, and a rough token cost. |
+| `(no arguments)` | Where its mind lives, model, what it sees, when it comments, talk gate, dreaming, persona source, live lines so far, and a rough token estimate (answered lines only). |
 | `model <handle>` | Change its model. It says a line afterwards to prove the model works. |
-| `see nothing|events|tools|turns` | What it may see of your agent's work. Applies immediately, even to lines already waiting to be sent. |
+| `see nothing\|events\|tools\|turns` | What it may see of your agent's work. Applies immediately, even to lines already waiting to be sent. |
 | `comment turn` | Comment after every turn your agent takes (default). |
 | `comment turns <n>` | Comment every N turns. |
 | `comment tools <n>` | Comment every N tool calls. |
 | `rate <minutes>` | At most one comment per N minutes. 0 = no limit (default). |
 | `gate <n>` | How many messages your agent may send it per 5 minutes (default 5). Stops a chatty agent from talking to it forever. |
 | `gate off` | No limit on agent messages. |
-| `dreaming off|step-count|compaction-event` | When its own memory consolidates. |
+| `dreaming off\|step-count\|compaction-event` | When its own memory consolidates. |
 | `persona` | Rewrite its persona. Your agent walks you through it (template, agent-written, or yours) and applies it after you confirm. Its voice, diary, and bond memory are untouched. |
 
-Every change is checked against the agent's tags first: the mod only ever touches an agent that is really this companion's.
+Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud.
 
 ### /sprite talk
 
@@ -344,12 +344,12 @@ Show or change how the companion behaves and looks.
 
 | Option | What it does |
 | --- | --- |
-| `voice on|off` | Whether it speaks at all. Off also silences a mind of its own. |
+| `voice on\|off` | Whether it speaks at all. Off also silences a mind of its own. |
 | `voiceRateMin <minutes>` | At most one built-in line per N minutes (default 10). Petting ignores this. |
-| `visible on|off` | Show or hide the panel row. |
-| `laps count|odometer|belt|pips` | How a wrapped stat bar shows its lap count: ×3 after the bar; ⟨3⟩ before it; each lap a heavier glyph; one dot per lap. |
-| `hue on|off` | Colour stat bars by age: grey → white → gold → rose → violet → teal → shimmer. |
-| `bars on|off` | Also show a compact stat strip on the panel row when it isn't speaking. |
+| `visible on\|off` | Show or hide the panel row. |
+| `laps count\|odometer\|belt\|pips` | How a wrapped stat bar shows its lap count: ×3 after the bar; ⟨3⟩ before it; each lap a heavier glyph; one dot per lap. |
+| `hue on\|off` | Colour stat bars by age: grey → white → gold → rose → violet → teal → shimmer. |
+| `bars on\|off` | Also show a compact stat strip on the panel row when it isn't speaking. |
 
 A setting for this companion overrides the global default. Use `global` to change the default for all of them.
 

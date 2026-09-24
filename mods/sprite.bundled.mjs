@@ -10068,6 +10068,7 @@ import {
   readdirSync,
   readFileSync as readFileSync2,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   writeFileSync
@@ -10987,7 +10988,7 @@ var HELP = [
     summary: "Inspect or change an ensouled companion's mind.",
     usage: ["/sprite soul", "/sprite soul <key> <value>", "/sprite soul persona"],
     options: [
-      ["(no arguments)", "Where its mind lives, model, what it sees, when it comments, talk gate, dreaming, persona source, live lines so far, and a rough token cost."],
+      ["(no arguments)", "Where its mind lives, model, what it sees, when it comments, talk gate, dreaming, persona source, live lines so far, and a rough token estimate (answered lines only)."],
       ["model <handle>", "Change its model. It says a line afterwards to prove the model works."],
       ["see nothing|events|tools|turns", "What it may see of your agent's work. Applies immediately, even to lines already waiting to be sent."],
       ["comment turn", "Comment after every turn your agent takes (default)."],
@@ -10999,7 +11000,7 @@ var HELP = [
       ["dreaming off|step-count|compaction-event", "When its own memory consolidates."],
       ["persona", "Rewrite its persona. Your agent walks you through it (template, agent-written, or yours) and applies it after you confirm. Its voice, diary, and bond memory are untouched."]
     ],
-    details: ["Every change is checked against the agent's tags first: the mod only ever touches an agent that is really this companion's."]
+    details: ["Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud."]
   },
   {
     cmd: "talk",
@@ -11225,6 +11226,9 @@ function formatChangelog(sections, heading) {
 }
 var SOUL_TALK_WINDOW_MS = 5 * 60000;
 var SOUL_TIMEOUT_MS = 20000;
+function __setSoulTimeoutMs(ms) {
+  SOUL_TIMEOUT_MS = ms ?? 20000;
+}
 function fenced(moment) {
   return `${moment}
 
@@ -11264,6 +11268,7 @@ function adaptHostClient(client) {
     resumeSession(agentId, sessionOpts) {
       let msg = "";
       let aborted = false;
+      const ac = new AbortController;
       return {
         async send(text) {
           msg = text;
@@ -11287,7 +11292,7 @@ ${String(r?.content ?? "")}`;
 
 (for reference \u2014 you asked:${context})` : ""}` }],
             max_steps: 4
-          });
+          }, { signal: ac.signal });
           if (aborted)
             return;
           const text = (res?.messages ?? []).filter((m) => m?.message_type === "assistant_message").map(textOf).join(`
@@ -11297,6 +11302,10 @@ ${String(r?.content ?? "")}`;
         },
         async abort() {
           aborted = true;
+          ac.abort();
+          try {
+            await client.agents.messages.cancel(agentId);
+          } catch {}
         },
         async updateModel(m) {
           await client.agents.update(agentId, { model: m });
@@ -11416,17 +11425,32 @@ function soulMemoryDir(soul) {
     return null;
   const base = process.env.LETTA_LOCAL_BACKEND_DIR ?? join6(homedir5(), ".letta", "lc-local-backend");
   const memfs = join6(base, "memfs");
-  const dir = join6(memfs, soul.agentId, "memory");
-  if (!dir.startsWith(memfs + "/") || dir.includes("/../"))
-    return null;
-  return existsSync4(join6(dir, ".git")) ? dir : null;
+  let cur = memfs;
+  for (const seg of [soul.agentId, "memory"]) {
+    cur = join6(cur, seg);
+    try {
+      if (lstatSync(cur).isSymbolicLink())
+        return null;
+    } catch {
+      return null;
+    }
+  }
+  return existsSync4(join6(cur, ".git")) ? cur : null;
 }
 function writeSoulPersona(soul, persona, who) {
   const dir = soulMemoryDir(soul);
   if (!dir)
     return "its memory isn't on this machine (cloud souls can't be rewritten from here yet)";
-  const file = join6(dir, "system", "persona.md");
+  const sysDir = join6(dir, "system");
+  const file = join6(sysDir, "persona.md");
+  const tmp = join6(sysDir, `.persona.${process.pid}.${Date.now().toString(36)}.tmp`);
   try {
+    for (const p of [sysDir, file]) {
+      try {
+        if (lstatSync(p).isSymbolicLink())
+          return "its persona path is a symlink \u2014 refusing to write through it";
+      } catch {}
+    }
     const existing = existsSync4(file) ? readFileSync2(file, "utf-8") : "";
     const front = /^---\n[\s\S]*?\n---\n/.exec(existing)?.[0] ?? `---
 description: Memory block persona
@@ -11434,8 +11458,9 @@ description: Memory block persona
 `;
     if (existsSync4(join6(dir, ".git", "index.lock")))
       return "its memory is busy right now (git index locked) \u2014 try again in a moment";
-    writeFileSync(file, `${front}${persona}
-`);
+    writeFileSync(tmp, `${front}${persona}
+`, { flag: "wx" });
+    renameSync(tmp, file);
     try {
       runGit(dir, ["add", "--", "system/persona.md"]);
       runGit(dir, ["-c", `user.name=${who}`, "-c", "user.email=sprite@letta.local", "commit", "-q", "--only", "-m", "sprite: persona rewritten by the user", "--", "system/persona.md"]);
@@ -11446,6 +11471,7 @@ description: Memory block persona
     }
     return null;
   } catch (e) {
+    rmSync(tmp, { force: true });
     return String(e?.message ?? e).slice(0, 160);
   }
 }
@@ -11568,7 +11594,7 @@ function cleanVoice(value) {
     const lines = value[category];
     if (!Array.isArray(lines))
       continue;
-    const cleaned = lines.filter((line) => typeof line === "string").map((line) => line.trim().slice(0, 80)).filter(Boolean).slice(0, 12);
+    const cleaned = lines.filter((line) => typeof line === "string").map((line) => cleanName(line, 80)).filter(Boolean).slice(0, 12);
     if (cleaned.length > 0)
       out[category] = cleaned;
   }
@@ -11591,7 +11617,7 @@ function cleanSoul(value) {
     comment: { every, n: Math.max(1, Math.min(1000, Math.floor(finiteNonnegative(v.comment?.n, 1)) || 1)) },
     commentRateMin: Math.min(1e4, finiteNonnegative(v.commentRateMin)),
     talkGate: Math.min(1000, Math.floor(finiteNonnegative(v.talkGate, 5))),
-    dreaming: ["off", "step-count", "compaction-event"].includes(v.dreaming) ? v.dreaming : "step-count",
+    dreaming: ["off", "step-count", "compaction-event", "unknown"].includes(v.dreaming) ? v.dreaming : "step-count",
     personaSource: ["template", "agent", "user"].includes(v.personaSource) ? v.personaSource : "template",
     lineCount: Math.floor(finiteNonnegative(v.lineCount))
   };
@@ -11602,7 +11628,7 @@ function cleanLog(value) {
   return value.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry)).map((entry) => ({
     at: finiteNonnegative(entry.at),
     category: VOICE_CATEGORIES.includes(entry.category) ? entry.category : "mood",
-    line: typeof entry.line === "string" ? entry.line.slice(0, 200) : ""
+    line: cleanName(entry.line, 200)
   })).filter((entry) => entry.at > 0 && entry.line.length > 0).slice(-40);
 }
 function normalizeSprite(agentId, input) {
@@ -11771,10 +11797,10 @@ function quarantineCorruptState(expectedText) {
   }
 }
 function saveState(state) {
-  const tmp = `${STATE_PATH}.${process.pid}.tmp`;
+  const tmp = `${STATE_PATH}.${process.pid}.${Date.now().toString(36)}.${randomBytes(3).toString("hex")}.tmp`;
   try {
     mkdirSync(dirname4(STATE_PATH), { recursive: true });
-    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    writeFileSync(tmp, JSON.stringify(state, null, 2), { flag: "wx" });
     renameSync(tmp, STATE_PATH);
     return true;
   } catch {
@@ -11962,9 +11988,13 @@ function mergeCollection(base, local, remote) {
   if (remoteGen > (base.generation ?? 0)) {
     const sprites2 = cloneState(remote.sprites);
     for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
-      if (!sprites2[spriteId] || !base.sprites[spriteId])
+      const b = base.sprites[spriteId];
+      const r = sprites2[spriteId];
+      if (!r || !b)
         continue;
-      sprites2[spriteId] = mergeSprite(base.sprites[spriteId], localSprite, sprites2[spriteId]);
+      applyTotalXp(r, totalXp(r) + Math.max(0, totalXp(localSprite) - totalXp(b)));
+      for (const key of STAT_KEYS)
+        r.stats[key] = Math.min(MAX_STAT, Math.max(0, r.stats[key] + (localSprite.stats[key] - b.stats[key])));
     }
     return { ...cloneState(remote), sprites: sprites2, ownerAgentId: local.ownerAgentId };
   }
@@ -12064,31 +12094,29 @@ function lockOwnerIsAlive(owner) {
   }
 }
 function clearStaleLock(lockPath, maxAgeMs = LOCK_MAX_AGE_MS) {
-  let graveyard = null;
   try {
+    const ino = statSync(lockPath).ino;
     const owner = readLockOwner(lockPath);
     const alive = lockOwnerIsAlive(owner);
     if (alive === true)
       return false;
     if (alive === null && Date.now() - statSync(lockPath).mtimeMs <= maxAgeMs)
       return false;
-    graveyard = `${lockPath}.stale.${process.pid}.${Date.now().toString(36)}.${randomBytes(4).toString("hex")}`;
-    renameSync(lockPath, graveyard);
-    const moved = readLockOwner(graveyard);
-    const sameLock = owner === null ? moved === null : moved?.token === owner.token;
-    if (!sameLock) {
-      try {
-        renameSync(graveyard, lockPath);
-      } catch {
-        rmSync(graveyard, { recursive: true, force: true });
-      }
+    if (statSync(lockPath).ino !== ino)
+      return false;
+    if (owner) {
+      const now = readLockOwner(lockPath);
+      if (!now || now.token !== owner.token)
+        return false;
+      rmSync(join6(lockPath, "owner.json"), { force: true });
+    }
+    try {
+      rmdirSync(lockPath);
+    } catch {
       return false;
     }
-    rmSync(graveyard, { recursive: true, force: true });
     return true;
   } catch {
-    if (graveyard)
-      rmSync(graveyard, { recursive: true, force: true });
     return false;
   }
 }
@@ -12165,7 +12193,7 @@ function parsePortableCollection(raw) {
     if (portableChecksum(core) !== value.checksum)
       return null;
     const spriteEntries = Object.entries(core.sprites);
-    if (spriteEntries.length === 0 || spriteEntries.length > PORTABLE_MAX_SPRITES)
+    if (spriteEntries.length === 0 || spriteEntries.length > Math.min(PORTABLE_MAX_SPRITES, MAX_SPRITES_PER_COLLECTION))
       return null;
     for (const [spriteId, sprite] of spriteEntries) {
       if (safeIdentifier(spriteId, "") !== spriteId || !sprite || typeof sprite !== "object" || Array.isArray(sprite) || safeIdentifier(sprite.id, "") !== spriteId) {
@@ -12758,6 +12786,32 @@ function activateInner(letta, disposers) {
     if (flushed)
       dirty = false;
   };
+  function transact(mutate) {
+    const out = withLocalStateLock(() => {
+      let loadedNow = loadState();
+      if (loadedNow.corrupt && loadedNow.corruptText !== undefined) {
+        if (quarantineCorruptState(loadedNow.corruptText))
+          loadedNow = loadState();
+      }
+      if (loadedNow.corrupt)
+        return null;
+      const merged = mergeState(baseState, state, loadedNow.state);
+      const result = mutate(merged);
+      if (result === false) {
+        reconcileInPlace(state, merged);
+        baseState = cloneState(merged);
+        return false;
+      }
+      if (!saveState(merged))
+        return null;
+      reconcileInPlace(state, merged);
+      baseState = cloneState(merged);
+      return result;
+    });
+    if (out !== null)
+      dirty = false;
+    return out;
+  }
   const replaceCollection = (agentId, replacement, force) => {
     flush();
     const replaced = withLocalStateLock(() => {
@@ -13072,7 +13126,7 @@ function activateInner(letta, disposers) {
     if (!force && now - lastVoiceAt < rateMs)
       return null;
     lastVoiceAt = now;
-    bubble = pickLine(sprite, category);
+    bubble = cleanName(pickLine(sprite, category), 200);
     bubbleUntil = now + 8000;
     logEntry(sprite, category, bubble);
     markDirty();
@@ -13105,11 +13159,7 @@ function activateInner(letta, disposers) {
       return "i can't tell which agent this is \u2014 try again from an active conversation.";
     let outcome = null;
     let created = null;
-    const ok = withLocalStateLock(() => {
-      const loadedNow = loadState();
-      if (loadedNow.corrupt)
-        return false;
-      const latest = loadedNow.state;
+    const ok = transact((latest) => {
       const collection = latest.collections[agentId] ?? (latest.collections[agentId] = {
         id: collectionIdForLegacyAgent(agentId),
         ownerAgentId: agentId,
@@ -13119,16 +13169,16 @@ function activateInner(letta, disposers) {
       const existing = collection.activeSpriteId ? collection.sprites[collection.activeSpriteId] ?? null : null;
       if (existing?.phase === "egg") {
         outcome = "the egg is already here. it's warm.";
-        return true;
+        return false;
       }
       if (existing?.phase === "alive" && !another) {
         outcome = `${existing.name} is already here. (/sprite hatch another to summon a second egg, /sprite molt to re-form, or /sprite for the card)`;
-        return true;
+        return false;
       }
       const roster = Object.values(collection.sprites);
       if (roster.length >= MAX_SPRITES_PER_COLLECTION) {
         outcome = `you already have ${MAX_SPRITES_PER_COLLECTION} companions \u2014 that's the most this nest can hold.`;
-        return true;
+        return false;
       }
       const founder = !roster.some((sp) => sp.founder);
       let seed = founder ? agentId : `${agentId}:${randomBytes(6).toString("hex")}`;
@@ -13159,17 +13209,12 @@ function activateInner(letta, disposers) {
       collection.sprites[spriteId] = created;
       ensureOneFounder(collection.sprites, agentId);
       collection.activeSpriteId = spriteId;
-      if (!saveState(latest))
-        return false;
-      reconcileInPlace(state, latest);
-      baseState = cloneState(latest);
       outcome = founder ? "an egg appears under the statusline. it's warm. (hatching soon~)" : `${existing?.name ?? "your companion"} steps aside; a new egg appears under the statusline. it's warm.`;
       return true;
     });
-    if (!ok)
+    if (ok === null)
       return "couldn't reach the nest right now (state file busy or unreadable) \u2014 try again in a moment.";
     if (created) {
-      dirty = false;
       queueCheckpoint(agentId, "hatch-started");
       panel.update();
     }
@@ -13192,7 +13237,7 @@ function activateInner(letta, disposers) {
     if (!live)
       return;
     setPose("happy", 5000);
-    speak(live, "greeting", true);
+    speakOrSoul(live, "greeting", "You just hatched. Say your first words.", true);
   }
   const panel = hasPanels ? letta.ui.openPanel({
     id: "sprite",
@@ -13312,11 +13357,13 @@ function activateInner(letta, disposers) {
       const sprite = getSprite(activeAgentId);
       if (!sprite || sprite.phase !== "alive")
         return;
-      const missedYou = sprite.lastSeenAt !== undefined && Date.now() - sprite.lastSeenAt > MISSED_YOU_MS;
+      const away = sprite.lastSeenAt !== undefined ? Date.now() - sprite.lastSeenAt : 0;
+      const missedYou = sprite.lastSeenAt !== undefined && away > MISSED_YOU_MS;
+      const awayText = relativeTime(Date.now() - away).replace(/ ago$/, "");
       noteActivity(sprite);
       awardXp(sprite, 5);
       setPose("happy", 3000);
-      speakOrSoul(sprite, missedYou ? "missed_you" : "greeting", missedYou ? `They're back after ${relativeTime(sprite.lastSeenAt ?? Date.now())} away.` : "They're back.", missedYou);
+      speakOrSoul(sprite, missedYou ? "missed_you" : "greeting", missedYou ? `They're back after ${awayText} away.` : "They're back.", missedYou);
     }));
   }
   if (letta.capabilities.events.turns) {
@@ -13364,12 +13411,18 @@ function activateInner(letta, disposers) {
         errorStreak += 1;
         awardXp(sprite, 1);
         setPose("oops", 3000);
-        if (errorStreak === 1)
-          speakOrSoul(sprite, "tool_error", soulMoment(sprite, "Something they tried just failed.", `Their ${String(event.toolName ?? "tool")} call just failed.`));
+        if (errorStreak === 1) {
+          const tn = String(event.toolName ?? "tool");
+          speakOrSoul(sprite, "tool_error", soulMoment(sprite, "Something they tried just failed.", () => `Their ${tn} call just failed.`));
+        }
       } else {
         if (errorStreak >= 2) {
           bumpStat(sprite, "grit");
-          speakOrSoul(sprite, "error_resolved", soulMoment(sprite, "After a rough patch, things just started working again.", `After ${errorStreak} failures in a row, their ${String(event.toolName ?? "tool")} call just succeeded.`));
+          {
+            const n = errorStreak;
+            const tn = String(event.toolName ?? "tool");
+            speakOrSoul(sprite, "error_resolved", soulMoment(sprite, "After a rough patch, things just started working again.", () => `After ${n} failures in a row, their ${tn} call just succeeded.`));
+          }
         }
         errorStreak = 0;
         bumpStat(sprite, statForTool(event.toolName));
@@ -13384,8 +13437,11 @@ function activateInner(letta, disposers) {
           });
         }
         if (bashCmd && /\bgit\b[\s\S]*\bcommit\b/.test(bashCmd)) {
-          speakOrSoul(sprite, "commit", soulMoment(sprite, "They just made a git commit.", `They just made a git commit: ${quoteObs(bashCmd.split(`
-`)[0].slice(0, 160))}`), true);
+          {
+            const head = bashCmd.split(`
+`)[0].slice(0, 160);
+            speakOrSoul(sprite, "commit", soulMoment(sprite, "They just made a git commit.", () => `They just made a git commit: ${quoteObs(head)}`), true);
+          }
         }
       }
       markDirty();
@@ -13500,7 +13556,7 @@ function activateInner(letta, disposers) {
     }
     queueCheckpoint(agentId, "switched");
     setPose("happy", 3000);
-    speak(live, "greeting", true);
+    speakOrSoul(live, "greeting", "You've just been put on the panel \u2014 you're the one keeping them company now.", true);
     panel.update();
     return `${live.name} steps onto the panel${current ? `; ${current.name} curls up to rest` : ""}.`;
   }
@@ -13530,6 +13586,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     }
     let soulOutcome = "";
     if (target.soul) {
+      cancelSoulWork(target.soul.agentId);
       if (wantsDelete) {
         try {
           const client = await soulClient(target.soul.backend);
@@ -13611,55 +13668,51 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
       return "i can't tell which agent this is.";
     let outcome = "";
     let bred = false;
-    const ok = withLocalStateLock(() => {
-      const loadedNow = loadState();
-      if (loadedNow.corrupt)
-        return false;
-      const latest = loadedNow.state;
+    const ok = transact((latest) => {
       const collection = latest.collections[agentId];
       if (!collection) {
         outcome = "no companions yet \u2014 /sprite hatch to begin.";
-        return true;
+        return false;
       }
       const ra = findSprite(collection, queryA);
       const rb = findSprite(collection, queryB);
       if (!ra || !rb) {
         outcome = `no companion called "${!ra ? queryA : queryB}". see /sprite list.`;
-        return true;
+        return false;
       }
       if ("ambiguous" in ra) {
         outcome = describeAmbiguity(collection, ra.ambiguous);
-        return true;
+        return false;
       }
       if ("ambiguous" in rb) {
         outcome = describeAmbiguity(collection, rb.ambiguous);
-        return true;
+        return false;
       }
       const a = ra;
       const b = rb;
       if (a.id === b.id) {
         outcome = `${a.name} can't breed with itself. pick two.`;
-        return true;
+        return false;
       }
       const current = collection.activeSpriteId ? collection.sprites[collection.activeSpriteId] : null;
       if (current?.phase === "egg") {
         outcome = "there's already an egg on the panel \u2014 let it hatch first.";
-        return true;
+        return false;
       }
       if (Object.values(collection.sprites).some((sp) => sp.phase === "egg")) {
         outcome = "an egg is already waiting in the nest \u2014 let it hatch first.";
-        return true;
+        return false;
       }
       for (const sp of [a, b]) {
         const why = breedBlocker(sp);
         if (why) {
           outcome = why;
-          return true;
+          return false;
         }
       }
       if (Object.keys(collection.sprites).length >= MAX_SPRITES_PER_COLLECTION) {
         outcome = `the nest is full (${MAX_SPRITES_PER_COLLECTION}) \u2014 release someone before breeding.`;
-        return true;
+        return false;
       }
       let child = breedSprites(a, b);
       let spriteId = stableId("sprite", child.seed);
@@ -13694,18 +13747,13 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
       if (inherited.length)
         collection.sprites[spriteId].inheritedVoice = inherited;
       collection.activeSpriteId = spriteId;
-      if (!saveState(latest))
-        return false;
-      reconcileInPlace(state, latest);
-      baseState = cloneState(latest);
       bred = true;
       outcome = `${a.name} and ${b.name} nuzzle close\u2026 an egg appears under the statusline. it's warm, and it's *new*. (gen ${child.generation})`;
       return true;
     });
-    if (!ok)
+    if (ok === null)
       return "couldn't reach the nest right now (state file busy or unreadable) \u2014 try again in a moment.";
     if (bred) {
-      dirty = false;
       queueCheckpoint(agentId, "bred");
       setPose("happy", 4000);
       panel.update();
@@ -13754,6 +13802,11 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
   const soulTurnCounter = new Map;
   const soulToolCounter = new Map;
   const soulQueue = new Map;
+  const soulCancelled = new Set;
+  function cancelSoulWork(agentId) {
+    soulCancelled.add(agentId);
+    soulQueue.delete(agentId);
+  }
   let confinementUnavailable = false;
   let soulLastError = "";
   function soulSessionOptions(sprite, confined = true) {
@@ -13813,7 +13866,13 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
       return null;
     const rateMs = (opts.rateMin ?? Number(setting(sprite, "voiceRateMin"))) * 60000;
     const run = async () => {
-      if (!sprite.soul || sprite.soul.agentId !== soul.agentId)
+      if (soulCancelled.has(soul.agentId))
+        return null;
+      flush(true);
+      const live = ownerAgentId(sprite) ? sprite : null;
+      if (!live || !live.soul || live.soul.agentId !== soul.agentId)
+        return null;
+      if (setting(live, "voice") !== "on")
         return null;
       const moment = typeof momentOrBuild === "function" ? momentOrBuild() : momentOrBuild;
       if (!moment)
@@ -13821,68 +13880,67 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
       const last = soulLastLineAt.get(soul.agentId) ?? 0;
       if (!opts.force && rateMs > 0 && Date.now() - last < rateMs)
         return null;
-      try {
+      let session = null;
+      let timer;
+      let timedOut = false;
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          session?.abort?.().catch(() => {});
+          reject(new Error("soul timeout"));
+        }, SOUL_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      const work = async () => {
         const client = await soulClient(soul.backend);
         if (!await soulVerified(sprite))
-          return null;
-        let session = client.resumeSession(soul.agentId, soulSessionOptions(sprite));
+          return "";
+        session = client.resumeSession(soul.agentId, soulSessionOptions(sprite));
         let text = "";
-        let timer;
         try {
-          try {
+          await session.send(fenced(moment));
+        } catch (e) {
+          const msg = String(e?.message ?? e);
+          if (!confinementUnavailable && /confinement is unavailable/i.test(msg)) {
+            confinementUnavailable = true;
+            logEntry(sprite, "mood", "(memory sandbox unavailable on this machine \u2014 running its mind with the tool fence only)");
+            try {
+              session.close?.();
+            } catch {}
+            session = client.resumeSession(soul.agentId, soulSessionOptions(sprite, false));
             await session.send(fenced(moment));
-          } catch (e) {
-            const msg = String(e?.message ?? e);
-            if (!confinementUnavailable && /confinement is unavailable/i.test(msg)) {
-              confinementUnavailable = true;
-              logEntry(sprite, "mood", "(memory sandbox unavailable on this machine \u2014 running its mind with the tool fence only)");
-              try {
-                session.close?.();
-              } catch {}
-              session = client.resumeSession(soul.agentId, soulSessionOptions(sprite, false));
-              await session.send(fenced(moment));
-            } else
-              throw e;
-          }
-          const timeout = new Promise((_, reject) => {
-            timer = setTimeout(() => {
-              session.abort?.().catch(() => {});
-              reject(new Error("soul timeout"));
-            }, SOUL_TIMEOUT_MS);
-            timer.unref?.();
-          });
-          const collect = (async () => {
-            let fromResult = "";
-            let sawResult = false;
-            for await (const msg of session.stream()) {
-              if (msg?.type === "assistant") {
-                if (typeof msg.content === "string")
-                  text += msg.content;
-                else if (Array.isArray(msg.content))
-                  text += msg.content.map((c) => typeof c?.text === "string" ? c.text : "").join("");
-              } else if (msg?.type === "result") {
-                sawResult = true;
-                if (msg.success === false) {
-                  const detail = String(msg.errorDetail ?? msg.error ?? msg.errorCode ?? "model request failed").slice(0, 200);
-                  throw new Error(`mind turn failed: ${detail}`);
-                }
-                if (typeof msg.result === "string")
-                  fromResult = msg.result;
-                break;
-              }
-            }
-            if (!sawResult)
-              throw new Error("mind turn ended without a result");
-            if (!text.trim() && fromResult)
-              text = fromResult;
-          })();
-          await Promise.race([collect, timeout]);
-        } finally {
-          clearTimeout(timer);
-          try {
-            session.close?.();
-          } catch {}
+          } else
+            throw e;
         }
+        let fromResult = "";
+        let sawResult = false;
+        for await (const msg of session.stream()) {
+          if (timedOut)
+            break;
+          if (msg?.type === "assistant") {
+            if (typeof msg.content === "string")
+              text += msg.content;
+            else if (Array.isArray(msg.content))
+              text += msg.content.map((c) => typeof c?.text === "string" ? c.text : "").join("");
+          } else if (msg?.type === "result") {
+            sawResult = true;
+            if (msg.success === false) {
+              const detail = String(msg.errorDetail ?? msg.error ?? msg.errorCode ?? "model request failed").slice(0, 200);
+              throw new Error(`mind turn failed: ${detail}`);
+            }
+            if (typeof msg.result === "string")
+              fromResult = msg.result;
+            break;
+          }
+        }
+        if (!sawResult && !timedOut)
+          throw new Error("mind turn ended without a result");
+        if (!text.trim() && fromResult)
+          text = fromResult;
+        return text;
+      };
+      try {
+        const text = await Promise.race([work(), deadline]);
         const line = oneLine(text);
         if (!line)
           return null;
@@ -13896,6 +13954,11 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
           console.error("[sprite soul]", String(e?.message ?? e).slice(0, 300));
         soulLastError = String(e?.message ?? e).slice(0, 200);
         return null;
+      } finally {
+        clearTimeout(timer);
+        try {
+          session?.close?.();
+        } catch {}
       }
     };
     const prev = soulQueue.get(soul.agentId) ?? Promise.resolve();
@@ -13912,8 +13975,10 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     panel.update();
   }
   function soulMoment(sprite, generic, specific) {
-    const see = sprite.soul?.see ?? "nothing";
-    return see === "tools" || see === "turns" ? specific : generic;
+    return () => {
+      const see = sprite.soul?.see ?? "nothing";
+      return see === "tools" || see === "turns" ? specific() : generic;
+    };
   }
   function speakFallback(sprite, category, force) {
     const canned = speak(sprite, category, force);
@@ -14000,23 +14065,21 @@ Say one line about it, or about anything, as yourself.` : null;
     if (from === "agent" && soul.see === "nothing") {
       return `${sprite.name} can't hear you \u2014 its mind sees nothing of your agent (/sprite soul see events or more to let your agent talk to it; you can always talk to it yourself).`;
     }
-    if (from === "agent" && soul.talkGate > 0) {
-      const now = Date.now();
-      const recent = (soulTalkLog.get(soul.agentId) ?? []).filter((t) => now - t < SOUL_TALK_WINDOW_MS);
-      if (recent.length >= soul.talkGate) {
-        soulTalkLog.set(soul.agentId, recent);
-        return `${sprite.name} is napping \u2014 try again in a few minutes.`;
-      }
-      recent.push(now);
-      soulTalkLog.set(soul.agentId, recent);
-    }
+    if (setting(sprite, "voice") !== "on")
+      return `${sprite.name} is muted (/sprite settings voice on to let it speak).`;
+    if (!takeTalkSlot(sprite, from))
+      return `${sprite.name} is napping \u2014 try again in a few minutes.`;
     logEntry(sprite, "mood", `${fromName} \u2192 ${sprite.name}: \u201C${said.slice(0, 120)}\u201D`);
     bubble = `${fromName}: \u201C${said.slice(0, 60)}\u201D`;
     bubbleUntil = Date.now() + 6000;
     panel.update();
-    const line = await soulSay(sprite, `${fromName} says to you: ${quoteObs(said)}
+    const line = await soulSay(sprite, () => {
+      if (from === "agent" && (sprite.soul?.see ?? "nothing") === "nothing")
+        return null;
+      return `${fromName} says to you: ${quoteObs(said)}
 
-Reply in one line.`, { force: true });
+Reply in one line.`;
+    }, { force: true });
     if (!line)
       return `${sprite.name} looks at you, and says nothing. (its mind didn't answer \u2014 check /sprite soul)`;
     showSoulLine(sprite, "mood", line);
@@ -14135,33 +14198,20 @@ Reply in one line.`, { force: true });
     const personaText = (args.persona ?? "").trim() || personaTemplate(sprite, ownerName, parentNamesOf(sprite, collection));
     const personaSource = args.persona?.trim() ? args.personaSource === "user" ? "user" : "agent" : "template";
     const persona = `${personaText.slice(0, 6000)}${SOUL_FOOTER}`;
-    const reserved = withLocalStateLock(() => {
-      const latest = loadState();
-      if (latest.corrupt)
-        return false;
-      const live = latest.state.collections[agentId]?.sprites[sprite.id];
+    const reserved = transact((latest) => {
+      const live = latest.collections[agentId]?.sprites[sprite.id];
       if (!live || live.soul || live.ensouling)
         return false;
       live.ensouling = Date.now();
-      if (!saveState(latest.state))
-        return false;
-      reconcileInPlace(state, latest.state);
-      baseState = cloneState(latest.state);
       return true;
     });
     if (!reserved)
       return `${sprite.name} is already being ensouled (or was, from another window). /sprite soul to check.`;
     const unreserve = () => {
-      withLocalStateLock(() => {
-        const latest = loadState();
-        if (latest.corrupt)
-          return false;
-        const live = latest.state.collections[agentId]?.sprites[sprite.id];
+      transact((latest) => {
+        const live = latest.collections[agentId]?.sprites[sprite.id];
         if (live)
           delete live.ensouling;
-        saveState(latest.state);
-        reconcileInPlace(state, latest.state);
-        baseState = cloneState(latest.state);
         return true;
       });
     };
@@ -14204,7 +14254,7 @@ ${pickLines(sprite, c).map((l) => `- ${l}`).join(`
         comment: { every, n },
         commentRateMin: 0,
         talkGate: 5,
-        dreaming: "step-count",
+        dreaming: backend === "cloud" ? "unknown" : "step-count",
         personaSource,
         lineCount: 0
       };
@@ -14302,7 +14352,7 @@ ${sprite.name}: ${line}` : ""}`;
     const soFar = soul.lineCount * perCall;
     const cadence = soul.see === "nothing" ? "only pets, greetings, level-ups, and idle mutters" : soul.comment.every === "turn" ? "about one call per turn your agent takes, plus pets and mutters" : `about one call per ${soul.comment.n} ${soul.comment.every}, plus pets and mutters`;
     const pricey = /opus|fable|gpt-5\.6|sonnet-5|pro/.test(soul.model) && !/mini|flash|lite/.test(soul.model);
-    return `cost: ~${Math.round(perCall / 100) / 10}k tokens per line \xB7 ~${Math.round(soFar / 1000)}k so far \xB7 ${cadence}${pricey ? "  \u26A0 that's a big model for a pet \u2014 /sprite soul model <cheaper>, or see nothing" : ""}`;
+    return `cost (rough estimate, counts answered lines only): ~${Math.round(perCall / 100) / 10}k tokens per line \xB7 ~${Math.round(soFar / 1000)}k so far \xB7 ${cadence}${pricey ? "  \u26A0 that's a big model for a pet \u2014 /sprite soul model <cheaper>, or see nothing" : ""}`;
   }
   async function doSoul(agentId, argstr) {
     const collection = getCollection(agentId);
@@ -14317,11 +14367,11 @@ ${sprite.name}: ${line}` : ""}`;
         return `${sprite.name} has no mind of its own. /sprite ensoul to give it one.`;
       return [
         `${sprite.name}'s mind: ${soul.backend} \xB7 agent ${soul.agentId}`,
-        `model: ${soul.model}   sees: ${soul.see}   comments: ${soul.comment.every === "turn" ? "every turn" : `every ${soul.comment.n} ${soul.comment.every}`}${soul.commentRateMin ? ` (\u22641 per ${soul.commentRateMin}min)` : ""}`,
+        `model: ${cleanName(soul.model, 128)}   sees: ${soul.see}   comments: ${soul.comment.every === "turn" ? "every turn" : `every ${soul.comment.n} ${soul.comment.every}`}${soul.commentRateMin ? ` (\u22641 per ${soul.commentRateMin}min)` : ""}`,
         `talk gate: ${soul.talkGate ? `${soul.talkGate} agent\u2192sprite messages per 5 min` : "off"}   dreaming: ${soul.dreaming}   persona: ${soul.personaSource}`,
         `live lines so far: ${soul.lineCount}   ensouled: ${relativeTime(soul.createdAt)}`,
         costLine(sprite),
-        soulLastError ? `last error: ${soulLastError}` : "",
+        soulLastError ? `last error: ${cleanName(soulLastError, 200)}` : "",
         "",
         "change: /sprite soul model <handle> \xB7 see nothing|events|tools|turns \xB7 comment turn|turns <n>|tools <n> \xB7 rate <min> \xB7 gate <n|off> \xB7 dreaming off|step-count|compaction-event \xB7 persona (rewrite it)"
       ].join(`
@@ -14367,6 +14417,8 @@ ${sprite.name}: ${line}` : ""}`;
       case "dreaming": {
         if (!["off", "step-count", "compaction-event"].includes(value))
           return "dreaming off|step-count|compaction-event";
+        if (soul.backend === "cloud")
+          return "dreaming for a cloud mind is managed on Letta Cloud (the mod doesn't set it there) \u2014 change it in the Letta app.";
         try {
           const client = await soulClient(soul.backend);
           const bad = await verifySoulOwnership(client, sprite, agentId);
@@ -14456,14 +14508,28 @@ ${sprite.name}: ${line}` : `
     const sp = speciesOf(res);
     return `new body, same soul \u2014 ${res.name} is now a ${next} ${sp.poses.happy} (level ${res.level} and every memory kept)`;
   }
-  function doPet(agentId) {
+  function takeTalkSlot(sprite, from) {
+    const soul = sprite.soul;
+    if (!soul || from === "user" || soul.talkGate <= 0)
+      return true;
+    const now = Date.now();
+    const recent = (soulTalkLog.get(soul.agentId) ?? []).filter((t) => now - t < SOUL_TALK_WINDOW_MS);
+    if (recent.length >= soul.talkGate) {
+      soulTalkLog.set(soul.agentId, recent);
+      return false;
+    }
+    recent.push(now);
+    soulTalkLog.set(soul.agentId, recent);
+    return true;
+  }
+  function doPet(agentId, from = "user") {
     const res = requireSprite(agentId);
     if ("error" in res)
       return res.error;
     noteActivity(res);
     setPose("happy", 4000);
     const sp = speciesOf(res);
-    if (res.soul) {
+    if (res.soul && setting(res, "voice") === "on" && takeTalkSlot(res, from)) {
       return soulSay(res, "They just petted you.", { force: true }).then((line2) => {
         if (line2) {
           showSoulLine(res, "pet", line2);
@@ -15011,7 +15077,7 @@ ${list.slice(0, 80).join(`
       requiresApproval: false,
       parallelSafe: false,
       run(ctx) {
-        return doPet(toolAgent(ctx));
+        return doPet(toolAgent(ctx), "agent");
       }
     }));
     disposers.push(letta.tools.register({
@@ -15072,6 +15138,11 @@ ${list.slice(0, 80).join(`
     }));
   }
   return () => {
+    for (const collection of Object.values(state.collections)) {
+      for (const sp of Object.values(collection.sprites))
+        if (sp.soul)
+          cancelSoulWork(sp.soul.agentId);
+    }
     try {
       for (const [agentId, collection] of Object.entries(state.collections)) {
         if (backupEnabled(collection) && collection.backup?.lastHash !== collectionContentHash(collection)) {
@@ -15098,6 +15169,7 @@ export {
   renderHelpOverview,
   renderHelpEntry,
   activate as default,
+  __setSoulTimeoutMs,
   __setSoulClientFactory,
   __setHostClient,
   __genetics,

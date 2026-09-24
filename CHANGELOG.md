@@ -3,10 +3,36 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
-## v0.9.6
-- Cloud minds from a Letta Code that was started without a desktop session
-  (no D-Bus) now find the login keyring themselves. If they still can't, the
-  error says exactly what to do.
+## v0.9.10 — a full review pass
+Every finding from an end-to-end adversarial review of the whole mod:
+
+- Nothing your companion earned is lost anymore: hatching, breeding, and
+  ensouling now merge what's pending in memory before they touch the save
+  file. (Before, XP from the last thirty seconds could be dropped.)
+- Privacy settings apply at the moment a line is *sent*, not when it was
+  queued — including changes made from another window. A queued commit or
+  message is dropped after `see nothing`.
+- Your agent can always pet its companion; the mind only answers within the
+  talk gate, otherwise a built-in line. `voice off` silences the mind for
+  pets and talk too.
+- The reply deadline covers the whole call (a hung connection can't wedge
+  the queue); a cloud mind's timeout now cancels the run on the server so it
+  stops charging; releasing a companion or reloading the mod drops its
+  queued calls.
+- Stale-lock recovery can no longer remove a lock another window just took.
+- Persona rewrites and save-file writes refuse to follow symlinks.
+- `backup restore force` keeps only counters from a stale window (as the
+  docs said); backups with more than 12 companions are rejected.
+- Switching to an ensouled companion asks its mind for the greeting; the
+  "you were away for…" line carries the real gap; cloud minds show dreaming
+  as managed on Letta Cloud rather than claimed; a few remaining outputs
+  are sanitized.
+- Docs caught up with the code (no more "ensoulment is coming" or
+  "log-scale bars"); the cost line is labelled as the rough estimate it is.
+- Tests: 49 → 60 checks, and two that didn't test what their names said
+  now do (a real hung turn is aborted; the lock test says what it covers).
+- Releases now refuse to run with untracked files present, and create a
+  GitHub Release with these notes.
 
 ## v0.9.9
 - A failed model turn is no longer mistaken for silence. When a companion's

@@ -41,7 +41,7 @@ for (const [g, title, intro] of GROUPS) {
     out.push("```", ...h.usage, "```", "");
     if (h.options?.length) {
       out.push("| Option | What it does |", "| --- | --- |");
-      for (const [o, d] of h.options) out.push(`| \`${o}\` | ${d.replace(/\|/g, "\\|")} |`);
+      for (const [o, d] of h.options) out.push(`| \`${o.replace(/\|/g, "\\|")}\` | ${d.replace(/\|/g, "\\|")} |`);
       out.push("");
     }
     for (const d of h.details ?? []) out.push(d, "");

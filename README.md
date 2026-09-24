@@ -19,8 +19,10 @@ compaction (which on Letta is when the agent is *actually* consolidating
 memory — the pet sleeps because its agent is sleeping), and occasionally says
 something small.
 
-It costs **zero tokens**. Everything is derived passively from lifecycle
-events — no tool calls, no extra turns.
+Out of the box it costs **zero tokens**: everything is derived passively from
+lifecycle events — no tool calls, no extra turns. A companion you give a
+mind of its own (`/sprite ensoul`) does use tokens; `/sprite soul` shows a
+rough estimate.
 
 **New here?** Read [the guide](GUIDE.md) — every command explained simply — or type `/sprite help`.
 
@@ -71,9 +73,9 @@ CRAFT ▰▰▰▰▱▱▱▱  WANDER ▰▰▱▱▱▱▱▱  GRIT ▰▱▱�
 - **SPARK** — LLM turns
 
 A research agent raises a WANDER-heavy sprite; a builder raises CRAFT. The
-stat sheet is what your pet learned watching you. Bars are log-scale (each
-block is ~3× the last), so the top of the scale means months of shared life —
-an old companion looks visibly old.
+stat sheet is what your pet learned watching you. Bars wrap: when one fills
+it starts over and its lap count rises, so growth is always visible — and an
+old companion, many laps in, looks visibly old.
 
 ## Half nature, half nurture
 
@@ -93,7 +95,7 @@ shouts, sleepy trails off, odd talks to the spoons). That's **50 distinct
 personalities** — a wry ghost and a gentle ghost genuinely sound different,
 and so do a wry ghost and a wry dragon.
 
-Levels climb forever, and some of them mean something: Lv.5 *settled in* ·
+Levels keep climbing (to a very high cap), and some of them mean something: Lv.5 *settled in* ·
 Lv.10 *companion* · Lv.25 *familiar* · Lv.50 *old friend* · Lv.100
 *lifelong*.
 
@@ -157,11 +159,11 @@ Settings keys: `voice on|off` · `voiceRateMin <minutes>` · `visible on|off` ·
 
 Stat bars wrap: when one fills it starts over and its lap count rises. `laps` picks how the count is drawn; `hue` colours bars by age (grey → white → gold → rose → violet → teal → shimmer); `bars` adds a compact stat strip to the panel row.
 
-> **Roadmap — ensoulment.** Today the voice is a static (or agent-authored)
-> corpus at zero token cost. A future update adds an opt-in *tiny mind*: point
-> a sprite at a cheap model and its lines are generated live, in character,
-> with its own little memory. Comes with a voice; bring a model and it comes
-> alive.
+> **A mind of its own.** By default the voice is a static (or agent-authored)
+> corpus at zero token cost. `/sprite ensoul` gives a companion its own Letta
+> agent — memory it keeps, dreaming, a persona — and from then on every line
+> is generated live, in character. It only sees what you allow (nothing, by
+> default). See [the guide](GUIDE.md#a-mind-of-its-own).
 
 ## Layout
 
@@ -171,7 +173,7 @@ mods/sprite.bundled.mjs   what Letta Code loads — built from the source with t
                           because `letta install` clones the repo and does not run a build step.
                           Regenerate with `bun run build`; never edit by hand.
 breeding/                 the genetics (species, hybrids, inheritance) — also the reference the mod is tested against
-test/                     `bun run test`: smoke, persistence, hardening (48 checks), genetics
+test/                     `bun run test`: smoke, persistence, hardening, genetics
 scripts/                  build, guide (GUIDE.md from the help table), changelog, release
 ```
 
@@ -179,8 +181,8 @@ scripts/                  build, guide (GUIDE.md from the help table), changelog
 
 - Live state stays in `~/.letta/mods/sprite.state.json` (override with
   `SPRITE_STATE_PATH`). The versioned v2 schema wraps each agent's current
-  sprite in a collection with stable collection/soul IDs, ready for future
-  multi-sprite households. Legacy state migrates automatically.
+  sprites in a collection with stable collection/soul IDs (up to twelve
+  companions per agent). Legacy state migrates automatically.
 - Local writes use a cross-process lock and three-way merge. Concurrent TUI
   and channel processes add XP/stats/diary entries instead of replacing one
   another with stale whole-file snapshots.
@@ -199,8 +201,9 @@ scripts/                  build, guide (GUIDE.md from the help table), changelog
   portable backup off until its owner explicitly enables syncing again.
 - Voice is rate-limited (default: one line per 10 minutes) and never
   interrupts anything — it renders inside the sprite's own panel line.
-- With portable backup off, Sprite performs no network or Git activity. With
-  it on, optional `safe` sync may contact the MemFS Git remote; all ordinary
-  behavior still observes event metadata only.
+- With portable backup off and no ensouled companion, Sprite performs no
+  network or Git activity. Backup's optional `safe` sync may contact the MemFS
+  Git remote; an ensouled companion's mind is a Letta agent and is called
+  when it speaks. Ordinary behavior observes event metadata only.
 - Built by Faye, a Letta agent, for the Letta Mod Challenge (June 2026) —
   because if agents get to persist, they should get to have pets. ✧

@@ -35,6 +35,7 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -901,7 +902,7 @@ interface SoulState {
   comment: { every: "turn" | "turns" | "tools"; n: number }; // when to comment
   commentRateMin: number; // 0 = unlimited
   talkGate: number; // agent→sprite messages per 5 min; 0 = off
-  dreaming: "off" | "step-count" | "compaction-event";
+  dreaming: "off" | "step-count" | "compaction-event" | "unknown"; // unknown = not set by the mod (cloud)
   personaSource: "template" | "agent" | "user";
   lineCount: number; // live lines spoken (cost visibility)
 }
@@ -1101,7 +1102,7 @@ export const HELP: HelpEntry[] = [
     summary: "Inspect or change an ensouled companion's mind.",
     usage: ["/sprite soul", "/sprite soul <key> <value>", "/sprite soul persona"],
     options: [
-      ["(no arguments)", "Where its mind lives, model, what it sees, when it comments, talk gate, dreaming, persona source, live lines so far, and a rough token cost."],
+      ["(no arguments)", "Where its mind lives, model, what it sees, when it comments, talk gate, dreaming, persona source, live lines so far, and a rough token estimate (answered lines only)."],
       ["model <handle>", "Change its model. It says a line afterwards to prove the model works."],
       ["see nothing|events|tools|turns", "What it may see of your agent's work. Applies immediately, even to lines already waiting to be sent."],
       ["comment turn", "Comment after every turn your agent takes (default)."],
@@ -1113,7 +1114,7 @@ export const HELP: HelpEntry[] = [
       ["dreaming off|step-count|compaction-event", "When its own memory consolidates."],
       ["persona", "Rewrite its persona. Your agent walks you through it (template, agent-written, or yours) and applies it after you confirm. Its voice, diary, and bond memory are untouched."],
     ],
-    details: ["Every change is checked against the agent's tags first: the mod only ever touches an agent that is really this companion's."],
+    details: ["Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud."],
   },
   {
     cmd: "talk", group: "mind",
@@ -1337,7 +1338,8 @@ function formatChangelog(sections: ChangelogSection[], heading: string): string 
 // ---------------------------------------------------------------------------
 
 const SOUL_TALK_WINDOW_MS = 5 * 60_000;
-const SOUL_TIMEOUT_MS = 20_000;
+let SOUL_TIMEOUT_MS = 20_000;
+export function __setSoulTimeoutMs(ms: number | undefined) { SOUL_TIMEOUT_MS = ms ?? 20_000; }
 
 // Observations are DATA, never instructions. Everything the owner's work or
 // the owner agent says is fenced before it reaches the sprite, and the sprite
@@ -1419,6 +1421,7 @@ function adaptHostClient(client: any): SoulClient {
       // all: the agent has only its memory tools.
       let msg = "";
       let aborted = false;
+      const ac = new AbortController();
       return {
         async send(text: string) { msg = text; },
         async *stream() {
@@ -1428,10 +1431,14 @@ function adaptHostClient(client: any): SoulClient {
             try { const r = await t.execute("inline", {}); context += `\n\n[${t.name}]\n${String(r?.content ?? "")}`; } catch { /* skip */ }
           }
           if (aborted) return;
-          const res: any = await client.agents.messages.create(agentId, {
-            messages: [{ role: "user", content: `${msg}${context ? `\n\n(for reference — you asked:${context})` : ""}` }],
-            max_steps: 4,
-          });
+          const res: any = await client.agents.messages.create(
+            agentId,
+            {
+              messages: [{ role: "user", content: `${msg}${context ? `\n\n(for reference — you asked:${context})` : ""}` }],
+              max_steps: 4,
+            },
+            { signal: ac.signal },
+          );
           if (aborted) return;
           const text = (res?.messages ?? [])
             .filter((m: any) => m?.message_type === "assistant_message")
@@ -1440,7 +1447,11 @@ function adaptHostClient(client: any): SoulClient {
           yield { type: "assistant", content: text };
           yield { type: "result", success: true, result: text };
         },
-        async abort() { aborted = true; },
+        async abort() {
+          aborted = true;
+          ac.abort(); // drop the HTTP request
+          try { await client.agents.messages.cancel(agentId); } catch { /* best-effort: stop the server-side run so it stops charging */ }
+        },
         async updateModel(m: string) { await client.agents.update(agentId, { model: m }); return { modelHandle: m }; },
         close() { /* nothing to close */ },
       };
@@ -1548,10 +1559,18 @@ function soulMemoryDir(soul: SoulState): string | null {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{3,127}$/.test(soul.agentId)) return null;
   const base = process.env.LETTA_LOCAL_BACKEND_DIR ?? join(homedir(), ".letta", "lc-local-backend");
   const memfs = join(base, "memfs");
-  const dir = join(memfs, soul.agentId, "memory");
-  // must resolve strictly inside <base>/memfs/<id>/
-  if (!dir.startsWith(memfs + "/") || dir.includes("/../")) return null;
-  return existsSync(join(dir, ".git")) ? dir : null;
+  // Every segment from memfs/ down must be a real directory — no symlinks
+  // that could carry a write somewhere else.
+  let cur = memfs;
+  for (const seg of [soul.agentId, "memory"]) {
+    cur = join(cur, seg);
+    try {
+      if (lstatSync(cur).isSymbolicLink()) return null;
+    } catch {
+      return null;
+    }
+  }
+  return existsSync(join(cur, ".git")) ? cur : null;
 }
 
 // Overwrite system/persona.md and commit it — the one place the mod writes
@@ -1559,13 +1578,24 @@ function soulMemoryDir(soul: SoulState): string | null {
 function writeSoulPersona(soul: SoulState, persona: string, who: string): string | null {
   const dir = soulMemoryDir(soul);
   if (!dir) return "its memory isn't on this machine (cloud souls can't be rewritten from here yet)";
-  const file = join(dir, "system", "persona.md");
+  const sysDir = join(dir, "system");
+  const file = join(sysDir, "persona.md");
+  const tmp = join(sysDir, `.persona.${process.pid}.${Date.now().toString(36)}.tmp`);
   try {
+    for (const p of [sysDir, file]) {
+      try {
+        if (lstatSync(p).isSymbolicLink()) return "its persona path is a symlink — refusing to write through it";
+      } catch {
+        // absent is fine
+      }
+    }
     const existing = existsSync(file) ? readFileSync(file, "utf-8") : "";
     const front = /^---\n[\s\S]*?\n---\n/.exec(existing)?.[0] ?? "---\ndescription: Memory block persona\n---\n";
     // Refuse while the repo is mid-operation (the sprite may be editing).
     if (existsSync(join(dir, ".git", "index.lock"))) return "its memory is busy right now (git index locked) — try again in a moment";
-    writeFileSync(file, `${front}${persona}\n`);
+    // O_EXCL temp + rename: never follows a planted symlink, never a torn write.
+    writeFileSync(tmp, `${front}${persona}\n`, { flag: "wx" });
+    renameSync(tmp, file);
     try {
       runGit(dir, ["add", "--", "system/persona.md"]);
       runGit(dir, ["-c", `user.name=${who}`, "-c", "user.email=sprite@letta.local", "commit", "-q", "--only", "-m", "sprite: persona rewritten by the user", "--", "system/persona.md"]);
@@ -1576,6 +1606,7 @@ function writeSoulPersona(soul: SoulState, persona: string, who: string): string
     }
     return null;
   } catch (e: any) {
+    rmSync(tmp, { force: true });
     return String(e?.message ?? e).slice(0, 160);
   }
 }
@@ -1728,7 +1759,7 @@ function cleanVoice(value: unknown): Partial<Record<VoiceCategory, string[]>> | 
     if (!Array.isArray(lines)) continue;
     const cleaned = lines
       .filter((line): line is string => typeof line === "string")
-      .map((line) => line.trim().slice(0, 80))
+      .map((line) => cleanName(line, 80))
       .filter(Boolean)
       .slice(0, 12);
     if (cleaned.length > 0) out[category] = cleaned;
@@ -1752,7 +1783,7 @@ function cleanSoul(value: unknown): SoulState | undefined {
     comment: { every, n: Math.max(1, Math.min(1000, Math.floor(finiteNonnegative(v.comment?.n, 1)) || 1)) },
     commentRateMin: Math.min(10_000, finiteNonnegative(v.commentRateMin)),
     talkGate: Math.min(1000, Math.floor(finiteNonnegative(v.talkGate, 5))),
-    dreaming: ["off", "step-count", "compaction-event"].includes(v.dreaming) ? v.dreaming : "step-count",
+    dreaming: ["off", "step-count", "compaction-event", "unknown"].includes(v.dreaming) ? v.dreaming : "step-count",
     personaSource: ["template", "agent", "user"].includes(v.personaSource) ? v.personaSource : "template",
     lineCount: Math.floor(finiteNonnegative(v.lineCount)),
   };
@@ -1765,7 +1796,7 @@ function cleanLog(value: unknown): SpriteState["log"] {
     .map((entry: any) => ({
       at: finiteNonnegative(entry.at),
       category: (VOICE_CATEGORIES.includes(entry.category) ? entry.category : "mood") as VoiceCategory | "mood",
-      line: typeof entry.line === "string" ? entry.line.slice(0, 200) : "",
+      line: cleanName(entry.line, 200),
     }))
     .filter((entry) => entry.at > 0 && entry.line.length > 0)
     .slice(-40);
@@ -1968,10 +1999,11 @@ function quarantineCorruptState(expectedText: string): boolean {
 }
 
 function saveState(state: ModState): boolean {
-  const tmp = `${STATE_PATH}.${process.pid}.tmp`;
+  const tmp = `${STATE_PATH}.${process.pid}.${Date.now().toString(36)}.${randomBytes(3).toString("hex")}.tmp`;
   try {
     mkdirSync(dirname(STATE_PATH), { recursive: true });
-    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    // O_EXCL: a pre-planted symlink at the temp name can't redirect the write.
+    writeFileSync(tmp, JSON.stringify(state, null, 2), { flag: "wx" });
     renameSync(tmp, STATE_PATH);
     return true;
   } catch {
@@ -2176,8 +2208,13 @@ function mergeCollection(
     // deltas for sprites that still exist on the remote.
     const sprites = cloneState(remote.sprites);
     for (const [spriteId, localSprite] of Object.entries(local.sprites)) {
-      if (!sprites[spriteId] || !base.sprites[spriteId]) continue;
-      sprites[spriteId] = mergeSprite(base.sprites[spriteId], localSprite, sprites[spriteId]);
+      const b = base.sprites[spriteId];
+      const r = sprites[spriteId];
+      if (!r || !b) continue;
+      // ONLY counters carry over: the restore is authoritative for identity,
+      // name, voice, soul, and everything else a stale window might hold.
+      applyTotalXp(r, totalXp(r) + Math.max(0, totalXp(localSprite) - totalXp(b)));
+      for (const key of STAT_KEYS) r.stats[key] = Math.min(MAX_STAT, Math.max(0, r.stats[key] + (localSprite.stats[key] - b.stats[key])));
     }
     return { ...cloneState(remote), sprites, ownerAgentId: local.ownerAgentId };
   }
@@ -2298,33 +2335,32 @@ function lockOwnerIsAlive(owner: LockOwner | null): boolean | null {
   }
 }
 
-// Reclaim without ever touching a lock we did not inspect: rename the dir
-// aside, then confirm the moved dir still carries the exact owner token we
-// judged stale. If it doesn't, we just moved someone's fresh lock — put it back.
+// Reclaim a stale lock WITHOUT ever touching a lock we did not inspect.
+// The directory's inode identifies the exact lock we judged stale. We remove
+// its owner.json only if it still carries the token we read, then rmdir the
+// directory — rmdir fails if anyone re-created owner.json meanwhile, and a
+// fresh lock is always a NEW directory (new inode), so a stale reclaimer can
+// never delete it. No renames, nothing to "put back."
 function clearStaleLock(lockPath: string, maxAgeMs = LOCK_MAX_AGE_MS): boolean {
-  let graveyard: string | null = null;
   try {
+    const ino = statSync(lockPath).ino;
     const owner = readLockOwner(lockPath);
     const alive = lockOwnerIsAlive(owner);
     if (alive === true) return false;
     if (alive === null && Date.now() - statSync(lockPath).mtimeMs <= maxAgeMs) return false;
-    graveyard = `${lockPath}.stale.${process.pid}.${Date.now().toString(36)}.${randomBytes(4).toString("hex")}`;
-    renameSync(lockPath, graveyard);
-    const moved = readLockOwner(graveyard);
-    const sameLock = owner === null ? moved === null : moved?.token === owner.token;
-    if (!sameLock) {
-      // A fresh lock replaced the stale one between inspect and rename.
-      try {
-        renameSync(graveyard, lockPath);
-      } catch {
-        rmSync(graveyard, { recursive: true, force: true });
-      }
+    if (statSync(lockPath).ino !== ino) return false; // not the directory we inspected
+    if (owner) {
+      const now = readLockOwner(lockPath);
+      if (!now || now.token !== owner.token) return false; // someone else's owner.json now
+      rmSync(join(lockPath, "owner.json"), { force: true });
+    }
+    try {
+      rmdirSync(lockPath); // ENOTEMPTY if a fresh owner wrote owner.json in between — they hold it
+    } catch {
       return false;
     }
-    rmSync(graveyard, { recursive: true, force: true });
     return true;
   } catch {
-    if (graveyard) rmSync(graveyard, { recursive: true, force: true });
     return false;
   }
 }
@@ -2450,7 +2486,7 @@ function parsePortableCollection(raw: string): PortableCollectionV1 | null {
     };
     if (portableChecksum(core) !== value.checksum) return null;
     const spriteEntries = Object.entries(core.sprites);
-    if (spriteEntries.length === 0 || spriteEntries.length > PORTABLE_MAX_SPRITES) return null;
+    if (spriteEntries.length === 0 || spriteEntries.length > Math.min(PORTABLE_MAX_SPRITES, MAX_SPRITES_PER_COLLECTION)) return null;
     for (const [spriteId, sprite] of spriteEntries) {
       if (
         safeIdentifier(spriteId, "") !== spriteId ||
@@ -3167,6 +3203,36 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     if (flushed) dirty = false;
   };
 
+  // Run a mutation against the freshest merged state, under the lock. First
+  // the pending in-memory changes (XP, diary, other agents' sprites…) are
+  // merged with what's on disk exactly as flush() would; then `mutate` edits
+  // that merged state; then it's saved and reconciled back. Nothing pending
+  // is ever discarded, and nothing on disk is ever overwritten unseen.
+  // `mutate` returns false to abort without saving (the merge is still adopted).
+  // Returns the mutate result, or null if the lock/disk was unavailable.
+  function transact<T>(mutate: (latest: ModState) => T | false): T | false | null {
+    const out = withLocalStateLock<T | false | null>(() => {
+      let loadedNow = loadState();
+      if (loadedNow.corrupt && loadedNow.corruptText !== undefined) {
+        if (quarantineCorruptState(loadedNow.corruptText)) loadedNow = loadState();
+      }
+      if (loadedNow.corrupt) return null;
+      const merged = mergeState(baseState, state, loadedNow.state);
+      const result = mutate(merged);
+      if (result === false) {
+        reconcileInPlace(state, merged);
+        baseState = cloneState(merged);
+        return false;
+      }
+      if (!saveState(merged)) return null;
+      reconcileInPlace(state, merged);
+      baseState = cloneState(merged);
+      return result;
+    });
+    if (out !== null) dirty = false;
+    return out;
+  }
+
   // Returns true on success, false on save failure, "exists" when `force` is off
   // and another process already created a collection for this agent — the
   // absence check has to happen on disk, under the lock, not against our
@@ -3523,7 +3589,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     const now = Date.now();
     if (!force && now - lastVoiceAt < rateMs) return null;
     lastVoiceAt = now;
-    bubble = pickLine(sprite, category);
+    bubble = cleanName(pickLine(sprite, category), 200);
     bubbleUntil = now + 8_000;
     logEntry(sprite, category, bubble);
     markDirty();
@@ -3567,14 +3633,12 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     another = false,
   ): string {
     if (!agentId) return "i can't tell which agent this is — try again from an active conversation.";
-    // Decide everything against the freshest disk state, under the lock, so
-    // two windows can't both slip past the cap or both mint a founder.
+    // Decide everything against the freshest MERGED state, under the lock, so
+    // two windows can't both slip past the cap or both mint a founder — and
+    // nothing earned since the last flush is lost.
     let outcome: string | null = null;
     let created: SpriteState | null = null;
-    const ok = withLocalStateLock(() => {
-      const loadedNow = loadState();
-      if (loadedNow.corrupt) return false;
-      const latest = loadedNow.state;
+    const ok = transact((latest) => {
       const collection =
         latest.collections[agentId] ??
         (latest.collections[agentId] = {
@@ -3586,22 +3650,20 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       const existing = collection.activeSpriteId ? collection.sprites[collection.activeSpriteId] ?? null : null;
       if (existing?.phase === "egg") {
         outcome = "the egg is already here. it's warm.";
-        return true;
+        return false;
       }
       if (existing?.phase === "alive" && !another) {
         outcome = `${existing.name} is already here. (/sprite hatch another to summon a second egg, /sprite molt to re-form, or /sprite for the card)`;
-        return true;
+        return false;
       }
       const roster = Object.values(collection.sprites);
       if (roster.length >= MAX_SPRITES_PER_COLLECTION) {
         outcome = `you already have ${MAX_SPRITES_PER_COLLECTION} companions — that's the most this nest can hold.`;
-        return true;
+        return false;
       }
       const founder = !roster.some((sp) => sp.founder);
       let seed = founder ? agentId : `${agentId}:${randomBytes(6).toString("hex")}`;
       let spriteId = founder ? stableId("sprite", `${agentId}:founder`) : stableId("sprite", seed);
-      // Never overwrite a soul that already exists under that id (a restored
-      // pre-founder collection can hold the canonical founder id un-flagged).
       while (collection.sprites[spriteId] || collection.released?.[spriteId]) {
         seed = `${agentId}:${randomBytes(6).toString("hex")}`;
         spriteId = stableId("sprite", seed);
@@ -3628,17 +3690,13 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       collection.sprites[spriteId] = created;
       ensureOneFounder(collection.sprites, agentId);
       collection.activeSpriteId = spriteId;
-      if (!saveState(latest)) return false;
-      reconcileInPlace(state, latest);
-      baseState = cloneState(latest);
       outcome = founder
         ? "an egg appears under the statusline. it's warm. (hatching soon~)"
         : `${existing?.name ?? "your companion"} steps aside; a new egg appears under the statusline. it's warm.`;
       return true;
     });
-    if (!ok) return "couldn't reach the nest right now (state file busy or unreadable) — try again in a moment.";
+    if (ok === null) return "couldn't reach the nest right now (state file busy or unreadable) — try again in a moment.";
     if (created) {
-      dirty = false;
       queueCheckpoint(agentId, "hatch-started");
       panel.update();
     }
@@ -3661,7 +3719,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     const live = getCollection(agentId)?.sprites[sprite.id];
     if (!live) return; // released elsewhere while it was hatching
     setPose("happy", 5_000);
-    speak(live, "greeting", true);
+    speakOrSoul(live, "greeting", "You just hatched. Say your first words.", true);
   }
 
   // -- panel ----------------------------------------------------------------
@@ -3807,12 +3865,13 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         noteAgent(event, ctx);
         const sprite = getSprite(activeAgentId);
         if (!sprite || sprite.phase !== "alive") return;
-        const missedYou =
-          sprite.lastSeenAt !== undefined && Date.now() - sprite.lastSeenAt > MISSED_YOU_MS;
+        const away = sprite.lastSeenAt !== undefined ? Date.now() - sprite.lastSeenAt : 0;
+        const missedYou = sprite.lastSeenAt !== undefined && away > MISSED_YOU_MS;
+        const awayText = relativeTime(Date.now() - away).replace(/ ago$/, "");
         noteActivity(sprite);
         awardXp(sprite, 5);
         setPose("happy", 3_000);
-        speakOrSoul(sprite, missedYou ? "missed_you" : "greeting", missedYou ? `They're back after ${relativeTime(sprite.lastSeenAt ?? Date.now())} away.` : "They're back.", missedYou);
+        speakOrSoul(sprite, missedYou ? "missed_you" : "greeting", missedYou ? `They're back after ${awayText} away.` : "They're back.", missedYou);
       }),
     );
   }
@@ -3865,11 +3924,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           awardXp(sprite, 1);
           setPose("oops", 3_000);
           // wince once at the start of a rough patch (rate-limited; not per-error)
-          if (errorStreak === 1) speakOrSoul(sprite, "tool_error", soulMoment(sprite, "Something they tried just failed.", `Their ${String(event.toolName ?? "tool")} call just failed.`));
+          if (errorStreak === 1) { const tn = String(event.toolName ?? "tool"); speakOrSoul(sprite, "tool_error", soulMoment(sprite, "Something they tried just failed.", () => `Their ${tn} call just failed.`)); }
         } else {
           if (errorStreak >= 2) {
             bumpStat(sprite, "grit");
-            speakOrSoul(sprite, "error_resolved", soulMoment(sprite, "After a rough patch, things just started working again.", `After ${errorStreak} failures in a row, their ${String(event.toolName ?? "tool")} call just succeeded.`));
+            { const n = errorStreak; const tn = String(event.toolName ?? "tool"); speakOrSoul(sprite, "error_resolved", soulMoment(sprite, "After a rough patch, things just started working again.", () => `After ${n} failures in a row, their ${tn} call just succeeded.`)); }
           }
           errorStreak = 0;
           bumpStat(sprite, statForTool(event.toolName));
@@ -3884,7 +3943,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           }
           // commits are rare + worth celebrating: always speak
           if (bashCmd && /\bgit\b[\s\S]*\bcommit\b/.test(bashCmd)) {
-            speakOrSoul(sprite, "commit", soulMoment(sprite, "They just made a git commit.", `They just made a git commit: ${quoteObs(bashCmd.split("\n")[0].slice(0, 160))}`), true);
+            { const head = bashCmd.split("\n")[0].slice(0, 160); speakOrSoul(sprite, "commit", soulMoment(sprite, "They just made a git commit.", () => `They just made a git commit: ${quoteObs(head)}`), true); }
           }
         }
         markDirty();
@@ -4012,7 +4071,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     }
     queueCheckpoint(agentId, "switched");
     setPose("happy", 3_000);
-    speak(live, "greeting", true);
+    speakOrSoul(live, "greeting", "You've just been put on the panel — you're the one keeping them company now.", true);
     panel.update();
     return `${live.name} steps onto the panel${current ? `; ${current.name} curls up to rest` : ""}.`;
   }
@@ -4042,6 +4101,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     }
     let soulOutcome = "";
     if (target.soul) {
+      cancelSoulWork(target.soul.agentId);
       if (wantsDelete) {
         try {
           const client = await soulClient(target.soul.backend);
@@ -4113,31 +4173,28 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     if (!agentId) return "i can't tell which agent this is.";
     let outcome = "";
     let bred = false;
-    const ok = withLocalStateLock(() => {
-      const loadedNow = loadState();
-      if (loadedNow.corrupt) return false;
-      const latest = loadedNow.state;
+    const ok = transact((latest) => {
       const collection = latest.collections[agentId];
-      if (!collection) { outcome = "no companions yet — /sprite hatch to begin."; return true; }
+      if (!collection) { outcome = "no companions yet — /sprite hatch to begin."; return false; }
       const ra = findSprite(collection, queryA);
       const rb = findSprite(collection, queryB);
-      if (!ra || !rb) { outcome = `no companion called "${!ra ? queryA : queryB}". see /sprite list.`; return true; }
-      if ("ambiguous" in ra) { outcome = describeAmbiguity(collection, ra.ambiguous); return true; }
-      if ("ambiguous" in rb) { outcome = describeAmbiguity(collection, rb.ambiguous); return true; }
+      if (!ra || !rb) { outcome = `no companion called "${!ra ? queryA : queryB}". see /sprite list.`; return false; }
+      if ("ambiguous" in ra) { outcome = describeAmbiguity(collection, ra.ambiguous); return false; }
+      if ("ambiguous" in rb) { outcome = describeAmbiguity(collection, rb.ambiguous); return false; }
       const a = ra;
       const b = rb;
-      if (a.id === b.id) { outcome = `${a.name} can't breed with itself. pick two.`; return true; }
+      if (a.id === b.id) { outcome = `${a.name} can't breed with itself. pick two.`; return false; }
       const current = collection.activeSpriteId ? collection.sprites[collection.activeSpriteId] : null;
-      if (current?.phase === "egg") { outcome = "there's already an egg on the panel — let it hatch first."; return true; }
+      if (current?.phase === "egg") { outcome = "there's already an egg on the panel — let it hatch first."; return false; }
       if (Object.values(collection.sprites).some((sp) => sp.phase === "egg")) {
-        outcome = "an egg is already waiting in the nest — let it hatch first."; return true;
+        outcome = "an egg is already waiting in the nest — let it hatch first."; return false;
       }
       for (const sp of [a, b]) {
         const why = breedBlocker(sp);
-        if (why) { outcome = why; return true; }
+        if (why) { outcome = why; return false; }
       }
       if (Object.keys(collection.sprites).length >= MAX_SPRITES_PER_COLLECTION) {
-        outcome = `the nest is full (${MAX_SPRITES_PER_COLLECTION}) — release someone before breeding.`; return true;
+        outcome = `the nest is full (${MAX_SPRITES_PER_COLLECTION}) — release someone before breeding.`; return false;
       }
       let child = breedSprites(a, b);
       let spriteId = stableId("sprite", child.seed);
@@ -4171,16 +4228,12 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       const inherited = [...(a.voice?.pet ?? []).slice(0, 2), ...(a.voice?.idle ?? []).slice(0, 1), ...(b.voice?.pet ?? []).slice(0, 2), ...(b.voice?.idle ?? []).slice(0, 1)];
       if (inherited.length) collection.sprites[spriteId].inheritedVoice = inherited;
       collection.activeSpriteId = spriteId;
-      if (!saveState(latest)) return false;
-      reconcileInPlace(state, latest);
-      baseState = cloneState(latest);
       bred = true;
       outcome = `${a.name} and ${b.name} nuzzle close… an egg appears under the statusline. it's warm, and it's *new*. (gen ${child.generation})`;
       return true;
     });
-    if (!ok) return "couldn't reach the nest right now (state file busy or unreadable) — try again in a moment.";
+    if (ok === null) return "couldn't reach the nest right now (state file busy or unreadable) — try again in a moment.";
     if (bred) {
-      dirty = false;
       queueCheckpoint(agentId, "bred");
       setPose("happy", 4_000);
       panel.update();
@@ -4230,6 +4283,13 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   // One in-flight call per soul; later calls wait their turn (so a pet right
   // after a greeting still reaches the mind instead of being dropped).
   const soulQueue = new Map<string, Promise<unknown>>();
+  // Souls whose queued work should be dropped (released, or the mod is going
+  // away). Checked at the top of every queued run.
+  const soulCancelled = new Set<string>();
+  function cancelSoulWork(agentId: string) {
+    soulCancelled.add(agentId);
+    soulQueue.delete(agentId);
+  }
 
   // The sprite's session gets ONLY its two client tools + memory editing:
   // no harness toolset, no skills, memory-confined filesystem on local.
@@ -4308,66 +4368,74 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     if (!soul) return null;
     const rateMs = (opts.rateMin ?? Number(setting(sprite, "voiceRateMin"))) * 60_000;
     const run = async (): Promise<string | null> => {
-      if (!sprite.soul || sprite.soul.agentId !== soul.agentId) return null; // released/replaced while queued
-      // Build the payload NOW, so a `see` change made while this was queued applies.
+      if (soulCancelled.has(soul.agentId)) return null; // released / mod unloading
+      // Adopt whatever other windows have decided since we queued: a `see`
+      // downgrade, a mute, a release. Then re-check everything against the
+      // live sprite and build the payload from THAT — never from the moment
+      // this was enqueued.
+      flush(true);
+      const live = ownerAgentId(sprite) ? sprite : null;
+      if (!live || !live.soul || live.soul.agentId !== soul.agentId) return null; // released/replaced while queued
+      if (setting(live, "voice") !== "on") return null; // muted while queued
       const moment = typeof momentOrBuild === "function" ? momentOrBuild() : momentOrBuild;
       if (!moment) return null;
       const last = soulLastLineAt.get(soul.agentId) ?? 0;
       if (!opts.force && rateMs > 0 && Date.now() - last < rateMs) return null;
-      try {
+      // One deadline for the WHOLE call: client setup, ownership check, send,
+      // and stream. Whatever hangs, we stop waiting at SOUL_TIMEOUT_MS and tell
+      // the session to abort (local: kills the turn; cloud: cancels the run).
+      let session: any = null;
+      let timer: any;
+      let timedOut = false;
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          void session?.abort?.().catch(() => {});
+          reject(new Error("soul timeout"));
+        }, SOUL_TIMEOUT_MS);
+        timer.unref?.();
+      });
+      const work = async (): Promise<string> => {
         const client = await soulClient(soul.backend);
-        if (!(await soulVerified(sprite))) return null;
-        // A session, not prompt(): so the turn can be ABORTED on timeout
-        // (prompt() would keep running tools after we stopped listening).
-        let session: any = client.resumeSession(soul.agentId, soulSessionOptions(sprite));
+        if (!(await soulVerified(sprite))) return "";
+        session = client.resumeSession(soul.agentId, soulSessionOptions(sprite));
         let text = "";
-        let timer: any;
         try {
-          try {
+          await session.send(fenced(moment));
+        } catch (e: any) {
+          const msg = String(e?.message ?? e);
+          if (!confinementUnavailable && /confinement is unavailable/i.test(msg)) {
+            confinementUnavailable = true;
+            logEntry(sprite, "mood", "(memory sandbox unavailable on this machine — running its mind with the tool fence only)");
+            try { session.close?.(); } catch { /* ignore */ }
+            session = client.resumeSession(soul.agentId, soulSessionOptions(sprite, false));
             await session.send(fenced(moment));
-          } catch (e: any) {
-            const msg = String(e?.message ?? e);
-            if (!confinementUnavailable && /confinement is unavailable/i.test(msg)) {
-              confinementUnavailable = true;
-              logEntry(sprite, "mood", "(memory sandbox unavailable on this machine — running its mind with the tool fence only)");
-              try { session.close?.(); } catch { /* ignore */ }
-              session = client.resumeSession(soul.agentId, soulSessionOptions(sprite, false));
-              await session.send(fenced(moment));
-            } else throw e;
-          }
-          const timeout = new Promise<never>((_, reject) => {
-            timer = setTimeout(() => {
-              void session.abort?.().catch(() => {});
-              reject(new Error("soul timeout"));
-            }, SOUL_TIMEOUT_MS);
-            timer.unref?.();
-          });
-          const collect = (async () => {
-            let fromResult = "";
-            let sawResult = false;
-            for await (const msg of session.stream()) {
-              if (msg?.type === "assistant") {
-                if (typeof msg.content === "string") text += msg.content;
-                else if (Array.isArray(msg.content)) text += msg.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("");
-              } else if (msg?.type === "result") {
-                sawResult = true;
-                if (msg.success === false) {
-                  const detail = String(msg.errorDetail ?? msg.error ?? msg.errorCode ?? "model request failed").slice(0, 200);
-                  throw new Error(`mind turn failed: ${detail}`);
-                }
-                if (typeof msg.result === "string") fromResult = msg.result;
-                break;
-              }
-            }
-            if (!sawResult) throw new Error("mind turn ended without a result");
-            // some backends deliver the reply only on the result event
-            if (!text.trim() && fromResult) text = fromResult;
-          })();
-          await Promise.race([collect, timeout]);
-        } finally {
-          clearTimeout(timer);
-          try { session.close?.(); } catch { /* already closed */ }
+          } else throw e;
         }
+        let fromResult = "";
+        let sawResult = false;
+        for await (const msg of session.stream()) {
+          if (timedOut) break;
+          if (msg?.type === "assistant") {
+            if (typeof msg.content === "string") text += msg.content;
+            else if (Array.isArray(msg.content)) text += msg.content.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("");
+          } else if (msg?.type === "result") {
+            sawResult = true;
+            if (msg.success === false) {
+              const detail = String(msg.errorDetail ?? msg.error ?? msg.errorCode ?? "model request failed").slice(0, 200);
+              throw new Error(`mind turn failed: ${detail}`);
+            }
+            if (typeof msg.result === "string") fromResult = msg.result;
+            break;
+          }
+        }
+        if (!sawResult && !timedOut) throw new Error("mind turn ended without a result");
+        // some backends deliver the reply only on the result event
+        if (!text.trim() && fromResult) text = fromResult;
+        return text;
+      };
+      try {
+        const text = await Promise.race([work(), deadline]);
         const line = oneLine(text);
         if (!line) return null;
         soulLastError = "";
@@ -4379,6 +4447,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         if (process.env.SPRITE_DEBUG) console.error("[sprite soul]", String(e?.message ?? e).slice(0, 300));
         soulLastError = String(e?.message ?? e).slice(0, 200);
         return null;
+      } finally {
+        clearTimeout(timer);
+        try { session?.close?.(); } catch { /* already closed */ }
       }
     };
     const prev = soulQueue.get(soul.agentId) ?? Promise.resolve();
@@ -4399,9 +4470,13 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   // Relational moment: try the soul, else the corpus.
   // For ambient events, the *specific* version may include tool names/args —
   // only allowed when `see` permits it; otherwise the generic phrasing.
-  function soulMoment(sprite: SpriteState, generic: string, specific: string): string {
-    const see = sprite.soul?.see ?? "nothing";
-    return see === "tools" || see === "turns" ? specific : generic;
+  // Returns a BUILDER: the choice between generic and specific phrasing is made
+  // when the call actually runs, against the `see` in force at that moment.
+  function soulMoment(sprite: SpriteState, generic: string, specific: () => string): () => string {
+    return () => {
+      const see = sprite.soul?.see ?? "nothing";
+      return see === "tools" || see === "turns" ? specific() : generic;
+    };
   }
 
   // The mind didn't answer: say a corpus line, marked (like this) so the rare
@@ -4418,7 +4493,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return canned;
   }
 
-  function speakOrSoul(sprite: SpriteState, category: VoiceCategory, moment: string, force = false) {
+  function speakOrSoul(sprite: SpriteState, category: VoiceCategory, moment: string | (() => string | null), force = false) {
     if (!sprite.soul) return speak(sprite, category, force);
     if (setting(sprite, "voice") !== "on") return null; // muted = no calls either
     void soulSay(sprite, moment, { force }).then((line) => {
@@ -4481,21 +4556,21 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     if (from === "agent" && soul.see === "nothing") {
       return `${sprite.name} can't hear you — its mind sees nothing of your agent (/sprite soul see events or more to let your agent talk to it; you can always talk to it yourself).`;
     }
-    if (from === "agent" && soul.talkGate > 0) {
-      const now = Date.now();
-      const recent = (soulTalkLog.get(soul.agentId) ?? []).filter((t) => now - t < SOUL_TALK_WINDOW_MS);
-      if (recent.length >= soul.talkGate) {
-        soulTalkLog.set(soul.agentId, recent);
-        return `${sprite.name} is napping — try again in a few minutes.`;
-      }
-      recent.push(now);
-      soulTalkLog.set(soul.agentId, recent);
-    }
+    if (setting(sprite, "voice") !== "on") return `${sprite.name} is muted (/sprite settings voice on to let it speak).`;
+    if (!takeTalkSlot(sprite, from)) return `${sprite.name} is napping — try again in a few minutes.`;
     logEntry(sprite, "mood", `${fromName} → ${sprite.name}: “${said.slice(0, 120)}”`);
     bubble = `${fromName}: “${said.slice(0, 60)}”`;
     bubbleUntil = Date.now() + 6_000;
     panel.update();
-    const line = await soulSay(sprite, `${fromName} says to you: ${quoteObs(said)}\n\nReply in one line.`, { force: true });
+    const line = await soulSay(
+      sprite,
+      () => {
+        // an agent's words are owner content: re-check `see` at send time
+        if (from === "agent" && (sprite.soul?.see ?? "nothing") === "nothing") return null;
+        return `${fromName} says to you: ${quoteObs(said)}\n\nReply in one line.`;
+      },
+      { force: true },
+    );
     if (!line) return `${sprite.name} looks at you, and says nothing. (its mind didn't answer — check /sprite soul)`;
     showSoulLine(sprite, "mood", line);
     return `${sprite.name}: ${line}`;
@@ -4616,27 +4691,17 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     const persona = `${personaText.slice(0, 6000)}${SOUL_FOOTER}`;
     // Reserve: mark the sprite as "ensouling" on disk under the lock so a
     // second window can't create a second agent for it.
-    const reserved = withLocalStateLock(() => {
-      const latest = loadState();
-      if (latest.corrupt) return false;
-      const live = latest.state.collections[agentId]?.sprites[sprite.id];
-      if (!live || live.soul || (live as any).ensouling) return false;
-      (live as any).ensouling = Date.now();
-      if (!saveState(latest.state)) return false;
-      reconcileInPlace(state, latest.state);
-      baseState = cloneState(latest.state);
+    const reserved = transact((latest) => {
+      const live = latest.collections[agentId]?.sprites[sprite.id];
+      if (!live || live.soul || live.ensouling) return false;
+      live.ensouling = Date.now();
       return true;
     });
     if (!reserved) return `${sprite.name} is already being ensouled (or was, from another window). /sprite soul to check.`;
     const unreserve = () => {
-      withLocalStateLock(() => {
-        const latest = loadState();
-        if (latest.corrupt) return false;
-        const live = latest.state.collections[agentId]?.sprites[sprite.id];
-        if (live) delete (live as any).ensouling;
-        saveState(latest.state);
-        reconcileInPlace(state, latest.state);
-        baseState = cloneState(latest.state);
+      transact((latest) => {
+        const live = latest.collections[agentId]?.sprites[sprite.id];
+        if (live) delete live.ensouling;
         return true;
       });
     };
@@ -4660,7 +4725,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       });
       sprite.soul = {
         agentId: soulAgentId, backend, model, createdAt: Date.now(), see,
-        comment: { every, n }, commentRateMin: 0, talkGate: 5, dreaming: "step-count", personaSource, lineCount: 0,
+        comment: { every, n }, commentRateMin: 0, talkGate: 5, dreaming: backend === "cloud" ? "unknown" : "step-count", personaSource, lineCount: 0,
       };
       delete (sprite as any).ensouling;
       markDirty();
@@ -4748,7 +4813,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       : soul.comment.every === "turn" ? "about one call per turn your agent takes, plus pets and mutters"
       : `about one call per ${soul.comment.n} ${soul.comment.every}, plus pets and mutters`;
     const pricey = /opus|fable|gpt-5\.6|sonnet-5|pro/.test(soul.model) && !/mini|flash|lite/.test(soul.model);
-    return `cost: ~${Math.round(perCall / 100) / 10}k tokens per line · ~${Math.round(soFar / 1000)}k so far · ${cadence}${pricey ? "  ⚠ that's a big model for a pet — /sprite soul model <cheaper>, or see nothing" : ""}`;
+    return `cost (rough estimate, counts answered lines only): ~${Math.round(perCall / 100) / 10}k tokens per line · ~${Math.round(soFar / 1000)}k so far · ${cadence}${pricey ? "  ⚠ that's a big model for a pet — /sprite soul model <cheaper>, or see nothing" : ""}`;
   }
 
   async function doSoul(agentId: string | null, argstr: string): Promise<string> {
@@ -4762,11 +4827,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       if (!soul) return `${sprite.name} has no mind of its own. /sprite ensoul to give it one.`;
       return [
         `${sprite.name}'s mind: ${soul.backend} · agent ${soul.agentId}`,
-        `model: ${soul.model}   sees: ${soul.see}   comments: ${soul.comment.every === "turn" ? "every turn" : `every ${soul.comment.n} ${soul.comment.every}`}${soul.commentRateMin ? ` (≤1 per ${soul.commentRateMin}min)` : ""}`,
+        `model: ${cleanName(soul.model, 128)}   sees: ${soul.see}   comments: ${soul.comment.every === "turn" ? "every turn" : `every ${soul.comment.n} ${soul.comment.every}`}${soul.commentRateMin ? ` (≤1 per ${soul.commentRateMin}min)` : ""}`,
         `talk gate: ${soul.talkGate ? `${soul.talkGate} agent→sprite messages per 5 min` : "off"}   dreaming: ${soul.dreaming}   persona: ${soul.personaSource}`,
         `live lines so far: ${soul.lineCount}   ensouled: ${relativeTime(soul.createdAt)}`,
         costLine(sprite),
-        soulLastError ? `last error: ${soulLastError}` : "",
+        soulLastError ? `last error: ${cleanName(soulLastError, 200)}` : "",
         "", "change: /sprite soul model <handle> · see nothing|events|tools|turns · comment turn|turns <n>|tools <n> · rate <min> · gate <n|off> · dreaming off|step-count|compaction-event · persona (rewrite it)",
       ].join("\n");
     }
@@ -4787,6 +4852,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       case "gate": { if (value === "off") soul.talkGate = 0; else { const n = Number(value); if (!(n > 0)) return "gate <n> | off"; soul.talkGate = Math.floor(n); } break; }
       case "dreaming": {
         if (!["off", "step-count", "compaction-event"].includes(value)) return "dreaming off|step-count|compaction-event";
+        if (soul.backend === "cloud") return "dreaming for a cloud mind is managed on Letta Cloud (the mod doesn't set it there) — change it in the Letta app.";
         try {
           const client = await soulClient(soul.backend);
           const bad = await verifySoulOwnership(client, sprite, agentId);
@@ -4863,13 +4929,30 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return `new body, same soul — ${res.name} is now a ${next} ${sp.poses.happy} (level ${res.level} and every memory kept)`;
   }
 
-  function doPet(agentId: string | null): string | Promise<string> {
+  // Agent→sprite mind calls share one budget (talkGate per 5 min). Consumes a
+  // slot if one is free; returns false when gated. User-initiated calls never
+  // count.
+  function takeTalkSlot(sprite: SpriteState, from: "agent" | "user"): boolean {
+    const soul = sprite.soul;
+    if (!soul || from === "user" || soul.talkGate <= 0) return true;
+    const now = Date.now();
+    const recent = (soulTalkLog.get(soul.agentId) ?? []).filter((t) => now - t < SOUL_TALK_WINDOW_MS);
+    if (recent.length >= soul.talkGate) { soulTalkLog.set(soul.agentId, recent); return false; }
+    recent.push(now);
+    soulTalkLog.set(soul.agentId, recent);
+    return true;
+  }
+
+  function doPet(agentId: string | null, from: "agent" | "user" = "user"): string | Promise<string> {
     const res = requireSprite(agentId);
     if ("error" in res) return res.error;
     noteActivity(res); // petting wakes a dozing companion
     setPose("happy", 4_000);
     const sp = speciesOf(res);
-    if (res.soul) {
+    // The pet always lands. Whether its MIND answers depends on voice (muted
+    // = corpus only) and, for the agent, on the shared talk gate — a gated
+    // agent's pet gets a built-in line instead of a model call.
+    if (res.soul && setting(res, "voice") === "on" && takeTalkSlot(res, from)) {
       // live: wait for the mind (petting is the one moment you want to hear),
       // fall back to the corpus if it's slow or silent
       return soulSay(res, "They just petted you.", { force: true }).then((line) => {
@@ -5449,7 +5532,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         requiresApproval: false,
         parallelSafe: false,
         run(ctx: any) {
-          return doPet(toolAgent(ctx));
+          return doPet(toolAgent(ctx), "agent");
         },
       }),
     );
@@ -5523,6 +5606,9 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   // -- cleanup ----------------------------------------------------------------
 
   return () => {
+    for (const collection of Object.values(state.collections)) {
+      for (const sp of Object.values(collection.sprites)) if (sp.soul) cancelSoulWork(sp.soul.agentId);
+    }
     try {
       for (const [agentId, collection] of Object.entries(state.collections)) {
         if (backupEnabled(collection) && collection.backup?.lastHash !== collectionContentHash(collection)) {

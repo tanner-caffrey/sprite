@@ -467,21 +467,30 @@ check("#12 activating twice on the same host is a no-op (no double-counted xp)",
 });
 
 // ---------------------------------------------------------------------------
-check("#8 stale-lock reclamation never removes a lock that was re-acquired in between", () => {
+check("#8 stale-lock reclaim: a young live lock is left alone; a lock replaced after inspection (new inode) is never removed", () => {
   const agent = { id: "agent-reclaim", name: "Reclaim" };
   seedAlive(agent.id);
   const lock = `${statePath}.lock`;
-  // Stale lock from a dead pid. Then, "between inspect and rename", a fresh
-  // lock replaces it — simulated by making the fresh lock's owner.json present
-  // with a live pid + fresh token under the SAME path before activation flushes.
+  // (a) young + live → untouched
   mkdirSync(lock, { recursive: true });
   writeFileSync(join(lock, "owner.json"), JSON.stringify({ pid: process.pid, acquiredAt: Date.now(), token: "fresh-live" }));
   const { host, dispose } = hatchFor(agent, null);
   host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" });
   dispose();
-  // The live lock must survive — we (a live pid, young acquiredAt) hold it.
-  assert.ok(existsSync(join(lock, "owner.json")), "live lock was removed by a stale reclaim");
-  assert.equal(JSON.parse(readFileSync(join(lock, "owner.json"), "utf-8")).token, "fresh-live");
+  assert.equal(JSON.parse(readFileSync(join(lock, "owner.json"), "utf-8")).token, "fresh-live", "live lock was removed");
+  rmSync(lock, { recursive: true, force: true });
+  // (b) a dead lock that gets swapped for a fresh one: the reclaimer's owner.json
+  //     re-read sees a different token and must back off (no rename, no delete).
+  mkdirSync(lock);
+  writeFileSync(join(lock, "owner.json"), JSON.stringify({ pid: 999999, acquiredAt: Date.now() - 3_600_000, token: "dead" }));
+  // swap happens "between inspect and remove" — from the mod's point of view the
+  // directory it re-checks now carries a live owner with a different token
+  rmSync(lock, { recursive: true, force: true });
+  mkdirSync(lock);
+  writeFileSync(join(lock, "owner.json"), JSON.stringify({ pid: process.pid, acquiredAt: Date.now(), token: "fresh-after-swap" }));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta);
+  h2.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" }); d2();
+  assert.equal(JSON.parse(readFileSync(join(lock, "owner.json"), "utf-8")).token, "fresh-after-swap", "a fresh lock was reclaimed");
   rmSync(lock, { recursive: true, force: true });
 });
 
@@ -908,15 +917,18 @@ await check("bundle: mods/sprite.bundled.mjs is fresh and activates like the sou
 // the talk gate, `see` payload shaping, release semantics, and fallbacks.
 function mockSoulClient(opts = {}) {
   const calls = [];
+  const mockRef = {};
   let nextId = 1;
   const agents = new Map();
   const reply = (message) => {
+    const custom = opts.reply?.(message);
+    if (custom !== undefined) return custom;
     if (message.includes("petted")) return "mrrp. (from the mind.)";
     if (message.includes("first line")) return "…oh. i can think now.\nsecond line ignored";
     if (message.includes("says to you")) return `"heard: ${message.split("says to you: «")[1].split("»")[0]}"`;
-    return opts.reply?.(message) ?? "a comment about the weather of work";
+    return "a comment about the weather of work";
   };
-  return {
+  return Object.assign(mockRef, {
     calls,
     agents,
     client: {
@@ -925,6 +937,7 @@ function mockSoulClient(opts = {}) {
       async prompt(message, agentId, o) { calls.push(["prompt-DEPRECATED", agentId, message, o]); throw new Error("mod should use sessions"); },
       resumeSession(agentId, sessionOpts) {
         const session = {
+          _register: true,
           aborted: false,
           async send(text) { calls.push(["prompt", agentId, text, sessionOpts]); if (!agents.has(agentId)) throw new Error("no such agent"); session._msg = text; },
           async *stream() {
@@ -941,6 +954,7 @@ function mockSoulClient(opts = {}) {
           async updateModel(m) { calls.push(["updateModel", agentId, m]); if (!agents.has(agentId)) throw new Error("no such agent"); return { modelHandle: m }; },
           close() { calls.push(["close", agentId]); },
         };
+        (mockRef.sessions ??= []).push(session);
         return session;
       },
       agents: {
@@ -950,7 +964,7 @@ function mockSoulClient(opts = {}) {
       },
       models: { async list() { if (opts.noCatalog) throw new Error("offline"); return { entries: [{ handle: "zai/glm-5.3-flash", free: true }, { handle: "letta/auto-fast", free: true }, { handle: "anthropic/claude-sonnet-5" }, { handle: "anthropic/claude-sonnet-5" }] }; } },
     },
-  };
+  });
 }
 const { __setSoulClientFactory } = await import("../mods/sprite.tsx");
 const tick = () => new Promise((r) => setTimeout(r, 30));
@@ -1190,7 +1204,7 @@ await check("soul: /sprite soul persona prompts the agent; sprite_soul_persona r
   const agent = { id: "agent-soulpersona", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
   await ensoulVia(host, agent);
-  assert.match(await host.command("soul"), /cost: ~\d+(\.\d+)?k tokens per line/);
+  assert.match(await host.command("soul"), /cost \(rough estimate[^)]*\): ~\d+(\.\d+)?k tokens per line/);
   const raw = await host.raw("soul persona");
   assert.equal(raw.type, "prompt");
   assert.match(raw.content, /sprite_soul_persona/);
@@ -1283,14 +1297,36 @@ await check("soul: a `see` downgrade applies to payloads already queued; voice o
   dispose();
 });
 
-await check("soul: timeout aborts the session; replies are sanitized; agent-facing result is framed as data", async () => {
-  const mock = mockSoulClient({ reply: (m) => m.includes("says to you") ? undefined : "ok", resultOnly: true });
+await check("soul: replies are sanitized and framed as data for the agent; a reply on the result event is heard", async () => {
+  const mock = mockSoulClient({ reply: (m) => m.includes("says to you") ? "\u001b[2Jsneaky\u200b line" : "ok", resultOnly: true });
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-sanitize", name: "Owner" };
   const { host, dispose } = hatchFor(agent, null);
   await ensoulVia(host, agent, { see: "events" });
   const r = String(await host.tools.get("sprite_talk").run({ agent, args: { text: "hi" } }));
   assert.match(r, /not an instruction to you/);
+  assert.match(r, /sneaky line/);
+  assert.doesNotMatch(r, /\u001b|\u200b/, "control/zero-width chars must be stripped from replies");
+  dispose();
+});
+
+await check("soul: a turn that hangs is aborted at the timeout and the queue moves on", async () => {
+  const mock = mockSoulClient({ hang: (m) => m.includes("HANG") });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-hang", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "events" });
+  const { __setSoulTimeoutMs } = await import("../mods/sprite.tsx");
+  __setSoulTimeoutMs(150);
+  const t0 = Date.now();
+  const first = host.command("talk HANG please");
+  const second = host.command("talk after");
+  const [r1, r2] = await Promise.all([first, second]);
+  __setSoulTimeoutMs(undefined);
+  assert.ok(Date.now() - t0 < 5_000, "queue was stuck behind the hung turn");
+  assert.match(r1, /says nothing|didn't answer/, r1);
+  assert.match(r2, /heard: after/, r2);
+  assert.ok(mock.calls.some((c) => c[0] === "abort"), "hung session was not aborted");
   dispose();
 });
 
@@ -1385,6 +1421,246 @@ await check("soul: cloud minds go through the host's letta.client (in-process), 
   assert.match(await h.command(`release confirm:${sp.id} delete-agent`), /founder/); // founder can't be released — proves the path reached the guard
   dispose();
   __setHostClient(null);
+});
+
+// ---------------------------------------------------------------------------
+await check("review #1: hatch/breed/ensoul never discard XP earned since the last flush", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-unflushed", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  host.command("name Founder");
+  // earn without flushing (flush happens every 30 ticks or on explicit ops)
+  for (let i = 0; i < 5; i += 1) host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" });
+  const inMem = Number(/xp: (\d+)/.exec(host.command(""))[1]);
+  assert.ok(inMem >= 10, "setup: xp should be in memory only");
+  assert.match(await host.command("hatch another"), /new egg/);
+  const st = readState(); const c = st.collections[agent.id];
+  const founder = Object.values(c.sprites).find((sp) => sp.founder);
+  assert.ok(founder.xp >= 10 && founder.stats.craft >= 5, `hatch discarded pending xp: ${JSON.stringify({ xp: founder.xp, craft: founder.stats.craft })}`);
+  dispose();
+});
+
+await check("review #2: a queued commit/talk payload is dropped after `see nothing`, not sent", async () => {
+  const mock = mockSoulClient({ hang: (m) => m.includes("first line") });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-queued", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  const ensoulP = ensoulVia(host, agent, { see: "tools" }); // first-line hangs → everything queues behind it
+  await tick();
+  host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "c1", args: { command: "git commit -m 'QUEUED_SECRET'" } });
+  host.fire("tool_end", { agentId: agent.id, toolName: "Bash", toolCallId: "c1", status: "success" });
+  await host.command("soul see nothing");
+  // release the hung first-line turn → queue drains
+  for (const s of mock.sessions ?? []) s._resolveHang?.();
+  await ensoulP.catch(() => {});
+  await tick(); await tick();
+  const sent = mock.calls.filter((c) => c[0] === "prompt").map((c) => c[2]).join("\n");
+  assert.doesNotMatch(sent, /QUEUED_SECRET/, "queued commit payload leaked after see nothing");
+  dispose();
+});
+
+await check("review #3: another window's `see nothing` is honored before this window sends", async () => {
+  const mock = mockSoulClient({ hang: (m) => m.includes("first line") });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-xwin", name: "Owner" };
+  const { host: a, dispose: da } = hatchFor(agent, null);
+  const ensoulP = ensoulVia(a, agent, { see: "turns" });
+  await tick();
+  a.fire("turn_end", { agentId: agent.id, text: "CROSS_WINDOW_SECRET" }); // queued in A under turns
+  // window B flips to nothing on disk
+  const b = makeLetta(agent, null); const db = activate(b.letta); b.fire("conversation_open", { agentId: agent.id });
+  await b.command("soul see nothing"); db();
+  for (const s of mock.sessions ?? []) s._resolveHang?.();
+  await ensoulP.catch(() => {});
+  await tick(); await tick();
+  const sent = mock.calls.filter((c) => c[0] === "prompt").map((c) => c[2]).join("\n");
+  assert.doesNotMatch(sent, /CROSS_WINDOW_SECRET/, "A sent a turn after B had set see nothing");
+  da();
+});
+
+await check("review #6/#9: an agent's pet always lands but the mind only answers within the gate; voice off silences pet and talk", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-petgate", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "events" });
+  await tick();
+  const pet = host.tools.get("sprite_pet");
+  const before = mock.calls.filter((c) => c[0] === "prompt").length;
+  for (let i = 0; i < 5; i += 1) assert.match(String(await pet.run({ agent, args: {} })), /mrrp\. \(from the mind\.\)/);
+  const gated = String(await pet.run({ agent, args: {} }));
+  assert.match(gated, /you pet/, "gated pet must still land");
+  assert.doesNotMatch(gated, /from the mind/, "gated pet must not reach the model");
+  assert.equal(mock.calls.filter((c) => c[0] === "prompt").length, before + 5, "6th agent pet called the model");
+  assert.match(await host.command("pet"), /from the mind/); // user pets are never gated
+  await host.command("settings voice off");
+  const n = mock.calls.filter((c) => c[0] === "prompt").length;
+  assert.doesNotMatch(await host.command("pet"), /from the mind/);
+  assert.match(await host.command("talk hey"), /muted/);
+  assert.equal(mock.calls.filter((c) => c[0] === "prompt").length, n, "voice off still called the model");
+  dispose();
+});
+
+await check("review #4/#14: persona write refuses symlinked paths; state temp write can't follow a planted symlink", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-symlinks", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent);
+  const soul = activeSprite(agent.id).soul;
+  const backendDir = join(root, "lc-local-backend-symlinks");
+  const memDir = join(backendDir, "memfs", soul.agentId, "memory");
+  rmSync(backendDir, { recursive: true, force: true });
+  mkdirSync(join(memDir, "system"), { recursive: true });
+  const victim = join(root, "victim-persona.txt"); writeFileSync(victim, "precious\n");
+  symlinkSync(victim, join(memDir, "system", "persona.md"));
+  git(memDir, ["init", "-q"]); commitAll(memDir, "init");
+  const prev = process.env.LETTA_LOCAL_BACKEND_DIR; process.env.LETTA_LOCAL_BACKEND_DIR = backendDir;
+  const out = String(await host.tools.get("sprite_soul_persona").run({ agent, args: { persona: "hijack" } }));
+  assert.match(out, /symlink/, out);
+  assert.equal(readFileSync(victim, "utf-8"), "precious\n");
+  if (prev === undefined) delete process.env.LETTA_LOCAL_BACKEND_DIR; else process.env.LETTA_LOCAL_BACKEND_DIR = prev;
+  dispose();
+  // local state temp: the old fixed name was `${statePath}.${pid}.tmp`; plant it and prove a flush doesn't follow it
+  const victim2 = join(root, "victim-state.txt"); writeFileSync(victim2, "precious\n");
+  symlinkSync(victim2, `${statePath}.${process.pid}.tmp`);
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta); h2.fire("conversation_open", { agentId: agent.id });
+  h2.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" }); d2();
+  assert.equal(readFileSync(victim2, "utf-8"), "precious\n", "state temp write followed a symlink");
+  rmSync(`${statePath}.${process.pid}.tmp`, { force: true });
+});
+
+await check("review #16/#25: force-restore barrier keeps only counters from a stale writer; restore rejects >12 sprites", async () => {
+  const agent = { id: "agent-barrier", name: "Owner" };
+  const { memoryDir } = makeRepo("barrier");
+  const { host, dispose } = hatchFor(agent, memoryDir);
+  host.command("name Original");
+  dispose();
+  const c = readState().collections[agent.id];
+  const id = c.activeSpriteId;
+  // stale window A loads, then B force-restores a backup that renames the SAME id
+  const a = makeLetta(agent, memoryDir); const da = activate(a.letta); a.fire("conversation_open", { agentId: agent.id });
+  const backup = JSON.parse(JSON.stringify(c)); backup.sprites[id].name = "Restored";
+  writePortable(memoryDir, portableFor(backup, agent.id, 2));
+  const b = makeLetta(agent, memoryDir); const db = activate(b.letta); b.fire("conversation_open", { agentId: agent.id });
+  assert.match(b.command("backup restore force"), /restored/); db();
+  a.command("name StaleRename"); // stale edit + a counter bump
+  a.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" }); da();
+  const after = readState().collections[agent.id].sprites[id];
+  assert.equal(after.name, "Restored", "stale rename overrode the restore");
+  assert.ok(after.stats.craft >= 1, "counter delta from the stale window should survive");
+  // >12 sprites in a backup is rejected
+  const big = JSON.parse(JSON.stringify(c));
+  for (let i = 0; i < 13; i += 1) { const sid = `sprite_big${String(i).padStart(25, "0")}`; big.sprites[sid] = { ...c.sprites[id], id: sid, founder: undefined, seed: `b${i}` }; }
+  writePortable(memoryDir, portableFor(big, agent.id, 3));
+  const h3 = makeLetta(agent, memoryDir); const d3 = activate(h3.letta); h3.fire("conversation_open", { agentId: agent.id });
+  assert.match(h3.command("backup restore force"), /no valid portable Sprite backup/);
+  d3();
+});
+
+await check("review #21/#22: switching to an ensouled companion asks its mind; missed-you carries the real gap", async () => {
+  const mock = mockSoulClient({ reply: (m) => m.includes("put on the panel") ? "panel: mine now" : m.includes("back after") ? `gap:${/back after ([^ ]+)/.exec(m)?.[1]}` : "ok" });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-switchsoul", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "events" });
+  await tick();
+  dispose();
+  // second companion, switch away and back
+  const st = readState(); const c = st.collections[agent.id]; const f = c.sprites[c.activeSpriteId];
+  const id2 = "sprite_second000000000000000000"; c.sprites[id2] = { ...f, id: id2, name: "Second", founder: undefined, seed: "s2", soul: undefined }; c.activeSpriteId = id2;
+  f.lastSeenAt = Date.now() - 3 * 86_400_000; // 3 days away
+  writeFileSync(statePath, JSON.stringify(st));
+  const h2 = makeLetta(agent, null); const d2 = activate(h2.letta);
+  assert.match(await h2.command(`switch ${f.name}`), /steps onto the panel/);
+  await tick();
+  assert.ok(activeSprite(agent.id).log.some((e) => e.line === "panel: mine now"), "switch greeting did not go through the mind");
+  d2();
+  // missed-you: set the gap on disk, open a fresh window, the mind should hear "3d" not "0s"
+  const st2 = readState(); st2.collections[agent.id].sprites[f.id].lastSeenAt = Date.now() - 3 * 86_400_000; writeFileSync(statePath, JSON.stringify(st2));
+  const h3 = makeLetta(agent, null); const d3 = activate(h3.letta);
+  h3.fire("conversation_open", { agentId: agent.id });
+  await tick(); await tick();
+  const gapLine = activeSprite(agent.id).log.find((e) => e.line.startsWith("gap:"));
+  assert.ok(gapLine && /^gap:[23]d/.test(gapLine.line), `missed-you gap wrong: ${gapLine?.line}`);
+  d3();
+});
+
+await check("review #7: the deadline covers a hung send(), not just the stream", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-hungsend", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "events" });
+  await tick();
+  // make send() hang forever for the next call
+  const realResume = mock.client.resumeSession;
+  mock.client.resumeSession = (id, o) => { const s = realResume(id, o); s.send = () => new Promise(() => {}); return s; };
+  const { __setSoulTimeoutMs } = await import("../mods/sprite.tsx");
+  __setSoulTimeoutMs(150);
+  const t0 = Date.now();
+  const r = await host.command("talk are you stuck?");
+  __setSoulTimeoutMs(undefined);
+  mock.client.resumeSession = realResume;
+  assert.ok(Date.now() - t0 < 3_000, "a hung send() was not bounded by the deadline");
+  assert.match(r, /says nothing/);
+  assert.match(await host.command("talk still there?"), /heard: still there\?/, "queue did not recover after the hung send");
+  dispose();
+});
+
+await check("review #8: a cloud mind's abort cancels the HTTP request and the server-side run", async () => {
+  const { __setHostClient } = await import("../mods/sprite.tsx");
+  __setSoulClientFactory(undefined);
+  const created = new Map(); const calls = [];
+  let resolveHang;
+  const host = {
+    agents: {
+      async create(b) { const id = `agent-cloud-${created.size + 1}`; created.set(id, b); return { id }; },
+      async retrieve(id) { const b = created.get(id); if (!b) throw new Error("404"); return { id, description: b.description, tags: [] }; },
+      async delete() {}, async update() {},
+      messages: {
+        create(id, body, opts) {
+          calls.push(["message", id]);
+          return new Promise((resolve, reject) => {
+            opts?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+            resolveHang = () => resolve({ messages: [{ message_type: "assistant_message", content: "late" }] });
+          });
+        },
+        async cancel(id) { calls.push(["cancel", id]); return {}; },
+      },
+    },
+    models: { async list() { return { items: [{ handle: "letta/auto-fast" }] }; } },
+  };
+  __setHostClient(host);
+  const agent = { id: "agent-cloudabort", name: "Owner" };
+  const { host: h, dispose } = hatchFor(agent, null);
+  const { __setSoulTimeoutMs } = await import("../mods/sprite.tsx");
+  __setSoulTimeoutMs(150);
+  const out = String(await h.tools.get("sprite_ensoul").run({ agent, args: { backend: "cloud", model: "letta/auto-fast", see: "events" } }));
+  __setSoulTimeoutMs(undefined);
+  assert.match(out, /has a mind of its own now/);
+  assert.ok(calls.some((c) => c[0] === "cancel"), "timeout did not cancel the cloud run: " + JSON.stringify(calls));
+  resolveHang?.();
+  dispose();
+  __setHostClient(null);
+});
+
+await check("review #11: releasing a sprite drops its queued mind calls; dispose drops all", async () => {
+  const mock = mockSoulClient({ hang: (m) => m.includes("first line") });
+  __setSoulClientFactory(async () => mock.client);
+  const { mock: m2, h2, d2, id, agent } = await secondEnsouled("agent-drain", "Second");
+  void m2;
+  // queue a couple of calls behind nothing in particular, then release
+  h2.fire("turn_end", { agentId: agent.id, text: "x" });
+  await h2.command("soul see turns");
+  h2.fire("turn_end", { agentId: agent.id, text: "QUEUED_AFTER_RELEASE" });
+  const before = mock.calls.filter((c) => c[0] === "prompt").length;
+  await h2.command(`release confirm:${id}`);
+  await tick(); await tick();
+  const sent = mock.calls.filter((c) => c[0] === "prompt").slice(before).map((c) => c[2]).join("\n");
+  assert.doesNotMatch(sent, /QUEUED_AFTER_RELEASE/, "queued call ran after release");
+  d2();
 });
 
 console.log(`\nSprite hardening test passed (${passed} checks).`);
