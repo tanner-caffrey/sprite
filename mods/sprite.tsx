@@ -1150,8 +1150,15 @@ export const HELP: HelpEntry[] = [
       ["laps count|odometer|belt|pips", "How a wrapped stat bar shows its lap count: ×3 after the bar; ⟨3⟩ before it; each lap a heavier glyph; one dot per lap."],
       ["hue on|off", "Colour stat bars by age: grey → white → gold → rose → violet → teal → shimmer."],
       ["bars on|off", "Also show a compact stat strip on the panel row when it isn't speaking."],
+      ["updateCheck on|off", "Quietly check GitHub for a newer release on launch and nudge on the panel (default on)."],
     ],
     details: ["A setting for this companion overrides the global default. Use `global` to change the default for all of them."],
+  },
+  {
+    cmd: "update", group: "info",
+    summary: "Update sprite to the newest release, then /reload.",
+    usage: ["/sprite update"],
+    details: ["On launch the mod quietly checks GitHub for a newer release (one small request; nothing is shown if it can't). When one exists, the panel row shows `⬆ vX.Y.Z available · /sprite update` while it's idle. This command runs `letta mods update` for you; the mod can't reload itself, so it ends by asking you to run /reload. Turn the check off with `/sprite settings global updateCheck off`."],
   },
   {
     cmd: "changelog", aliases: ["version"], group: "info",
@@ -1256,7 +1263,11 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   laps: "count", // how wrapped stat bars show their lap count: count|odometer|belt|pips
   hue: "on", // colour the bars by lap age (panel + card)
   bars: "off", // also show a compact stat strip on the panel row
+  updateCheck: "on", // once per launch, quietly ask GitHub if a newer release exists
 };
+
+const PACKAGE_SPEC = "git:github.com/tanner-caffrey/sprite";
+const RELEASES_LATEST_URL = "https://api.github.com/repos/tanner-caffrey/sprite/releases/latest";
 
 // ---------------------------------------------------------------------------
 // version + changelog (CHANGELOG.md ships in the package beside mods/)
@@ -1279,6 +1290,36 @@ function readPackageVersion(): string {
   }
 }
 const MOD_VERSION = readPackageVersion();
+
+// Newest published release, if we've managed to ask. Never blocks anything;
+// offline / rate-limited / any error → stays null and nothing is shown.
+let latestRelease: string | null = null;
+let __clearBubbleImpl: () => void = () => {};
+export function __clearBubble() { __clearBubbleImpl(); }
+export function __setLatestRelease(v: string | null) { latestRelease = v; }
+async function checkLatestRelease(): Promise<string | null> {
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), 4_000);
+    (t as any).unref?.();
+    const res = await fetch(RELEASES_LATEST_URL, {
+      signal: ac.signal,
+      headers: { Accept: "application/vnd.github+json", "User-Agent": `sprite-mod/${MOD_VERSION}` },
+    });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const body: any = await res.json();
+    const tag = typeof body?.tag_name === "string" ? body.tag_name.replace(/^v/, "") : "";
+    if (!/^\d+\.\d+\.\d+$/.test(tag)) return null;
+    latestRelease = tag;
+    return tag;
+  } catch {
+    return null;
+  }
+}
+function updateAvailable(): string | null {
+  return latestRelease && semverCompare(latestRelease, MOD_VERSION) > 0 ? latestRelease : null;
+}
 
 function semverCompare(a: string, b: string): number {
   const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
@@ -3120,6 +3161,7 @@ export const __genetics = { breedSprites, childFateSeed, rollSpecies, rollShiny,
 export default function activate(letta: any) {
   const guardable = Boolean(letta && typeof letta === "object");
   if (letta?.client && !hostClient) hostClient = letta.client;
+
   if (guardable) {
     if (ACTIVE_HOSTS.has(letta)) {
       try {
@@ -3290,6 +3332,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   let dozing = false; // idle nap (nothing has happened for a while)
   let lastActivityAt = Date.now();
   let bubble = "";
+  __clearBubbleImpl = () => { bubble = ""; bubbleUntil = 0; };
   let bubbleUntil = 0;
   let lastVoiceAt = 0;
   let x = 0;
@@ -3748,6 +3791,10 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           const label = `${chalk.cyan(sprite.name)}${shinyMark} ${chalk.dim(`·Lv.${sprite.level}`)}`;
           const pad = " ".repeat(Math.max(0, Math.min(x, 16)));
           let right = bubble && Date.now() < bubbleUntil ? chalk.dim(`“${bubble}”`) : "";
+          const newer = updateAvailable();
+          if (!right && newer && setting(sprite, "updateCheck") === "on") {
+            right = chalk.yellow(`⬆ v${newer} available · /sprite update`);
+          }
           if (!right && setting(sprite, "bars") === "on") {
             const paint = setting(sprite, "hue") === "on" ? huePaint(chalk) : PLAIN_PAINT;
             right = STAT_KEYS.map(
@@ -3759,6 +3806,12 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       })
     : { update() {}, close() {} };
   disposers.push(() => panel.close());
+
+  // Once per launch, quietly: is there a newer release? Offline / rate-limited
+  // → nothing. Never blocks activation.
+  if (String(state.global.settings?.updateCheck ?? DEFAULT_SETTINGS.updateCheck) === "on" && !process.env.SPRITE_NO_UPDATE_CHECK) {
+    void checkLatestRelease().then((v) => { if (v) panel.update(); });
+  }
 
   // -- heartbeat tick (animation + persistence) -----------------------------
 
@@ -3882,7 +3935,15 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         noteAgent(event, ctx);
         const sprite = getSprite(activeAgentId);
         if (!sprite?.soul || sprite.soul.see === "nothing") return;
-        const text = typeof event?.text === "string" ? event.text : typeof event?.content === "string" ? event.content : Array.isArray(event?.messages) ? event.messages.map((m: any) => (typeof m?.content === "string" ? m.content : "")).join("\n") : "";
+        // The host's turn_end carries the reply as `assistantMessage` (the last
+        // assistant text of the turn — the same field its stop hooks get).
+        // The other names are kept for hosts that shape the event differently.
+        const text =
+          typeof event?.assistantMessage === "string" ? event.assistantMessage
+          : typeof event?.text === "string" ? event.text
+          : typeof event?.content === "string" ? event.content
+          : Array.isArray(event?.messages) ? event.messages.filter((m: any) => m?.role === "assistant" || m?.message_type === "assistant_message").map((m: any) => (typeof m?.content === "string" ? m.content : "")).join("\n")
+          : "";
         maybeComment(sprite, { kind: "turn", turnText: sprite.soul.see === "turns" ? text : undefined });
       }),
     );
@@ -4366,7 +4427,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   ): Promise<string | null> {
     const soul = sprite.soul;
     if (!soul) return null;
-    const rateMs = (opts.rateMin ?? Number(setting(sprite, "voiceRateMin"))) * 60_000;
+    // An ensouled companion is paced by its OWN knobs (`/sprite soul rate`,
+    // `comment`), not by voiceRateMin — that one throttles the built-in corpus
+    // so it doesn't chatter, and would otherwise silently eat the mind's
+    // error/recovery/idle moments for ten minutes after any line.
+    const rateMs = (opts.rateMin ?? soul.commentRateMin) * 60_000;
     const run = async (): Promise<string | null> => {
       if (soulCancelled.has(soul.agentId)) return null; // released / mod unloading
       // Adopt whatever other windows have decided since we queued: a `see`
@@ -4493,9 +4558,24 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return canned;
   }
 
+  // Moments that are about the owner's WORK (as opposed to about the
+  // companion itself: pets, greetings, level-ups, idle mutters). Under
+  // `see nothing` these never reach the mind — not even in generic form —
+  // so "nothing about your work" is literally true. The panel still marks
+  // the moment with a built-in line.
+  const WORK_MOMENTS = new Set<VoiceCategory>(["commit", "tool_error", "error_resolved", "compact_done"]);
+
   function speakOrSoul(sprite: SpriteState, category: VoiceCategory, moment: string | (() => string | null), force = false) {
     if (!sprite.soul) return speak(sprite, category, force);
     if (setting(sprite, "voice") !== "on") return null; // muted = no calls either
+    if (WORK_MOMENTS.has(category)) {
+      // decided at send time too: wrap so a later `see nothing` still applies
+      const inner = moment;
+      moment = () => {
+        if ((sprite.soul?.see ?? "nothing") === "nothing") return null;
+        return typeof inner === "function" ? inner() : inner;
+      };
+    }
     void soulSay(sprite, moment, { force }).then((line) => {
       if (line) showSoulLine(sprite, category, line);
       else speakFallback(sprite, category, force);
@@ -4579,8 +4659,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   // -- ensoul: the agent walks the user through it; tools apply the answers --
 
   const SEE_OPTIONS: Array<[SoulSee, string]> = [
-    ["nothing", "It only hears the moments you send it: pets, check-ins, level-ups, hatches. Nothing about your work."],
-    ["events", "Tool names and whether they succeeded, how many in a row, when your agent speaks. No content, no file names."],
+    ["nothing", "It only hears the moments about itself: pets, check-ins, level-ups, hatches. Nothing about your work — not even that a commit happened."],
+    ["events", "Tool names and whether they succeeded, when something fails or recovers, commits, when your agent speaks. No content, no file names."],
     ["tools", "Events, plus the first line of each tool's arguments (file paths, commands). None of your agent's words."],
     ["turns", "Everything above, plus the text of what your agent says each turn. Never its memory or system prompt."],
   ];
@@ -5080,7 +5160,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         ...rows,
         "",
         "set: /sprite settings <key> <value>    global: /sprite settings global <key> <value>",
-        "keys: voice on|off · voiceRateMin <n> · visible on|off · laps count|odometer|belt|pips · hue on|off · bars on|off",
+        "keys: voice on|off · voiceRateMin <n> · visible on|off · laps count|odometer|belt|pips · hue on|off · bars on|off · updateCheck on|off",
       ].join("\n");
     }
 
@@ -5093,7 +5173,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     }
 
     let parsed: unknown = value;
-    if (key === "voice" || key === "visible" || key === "hue" || key === "bars") {
+    if (key === "voice" || key === "visible" || key === "hue" || key === "bars" || key === "updateCheck") {
       if (value !== "on" && value !== "off") return `${key} must be on|off`;
     } else if (key === "laps") {
       if (!LAP_STYLES.includes(value as LapStyle)) return `laps must be ${LAP_STYLES.join("|")}`;
@@ -5182,6 +5262,38 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   }
 
   // -- commands ---------------------------------------------------------------
+
+  // Update the installed package to the newest release via the CLI. The mod
+  // can't reload itself, so the last step is always "run /reload".
+  async function doUpdate(): Promise<string> {
+    const newest = latestRelease ?? (await checkLatestRelease());
+    if (newest && semverCompare(newest, MOD_VERSION) <= 0) {
+      return `sprite is up to date (v${MOD_VERSION}).`;
+    }
+    const bin = process.env.LETTA_CODE_BIN || "letta";
+    const { execFile } = await import("node:child_process");
+    const out = await new Promise<{ ok: boolean; text: string }>((resolve) => {
+      execFile(bin, ["mods", "update", PACKAGE_SPEC], { timeout: 120_000, env: { ...process.env, LETTA_DISABLE_MODS: "1" } }, (err, stdout, stderr) => {
+        resolve({ ok: !err, text: `${stdout ?? ""}${stderr ?? ""}`.trim() });
+      });
+    });
+    if (!out.ok) {
+      return `couldn't update: ${cleanName(out.text.split("\n").slice(-3).join(" "), 300) || "letta mods update failed"}\ntry it yourself:  letta mods update ${PACKAGE_SPEC}`;
+    }
+    const installed = readInstalledVersion();
+    latestRelease = installed ?? latestRelease;
+    return `sprite updated${installed ? ` to v${installed}` : ""}${newest ? ` (was v${MOD_VERSION})` : ""}.\nrun  /reload  to start using it.`;
+  }
+
+  function readInstalledVersion(): string | null {
+    try {
+      const p = join(homedir(), ".letta", "mods", "packages", "git", "github.com", "tanner-caffrey", "sprite", "package.json");
+      const v = JSON.parse(readFileSync(p, "utf-8"))?.version;
+      return typeof v === "string" ? v : null;
+    } catch {
+      return null;
+    }
+  }
 
   function doHelp(topic?: string): string {
     if (topic) {
@@ -5285,6 +5397,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
             case "version":
               output = doChangelog(restStr);
               break;
+            case "update":
+              return doUpdate().then((o) => ({ type: "output", output: o }));
             case "whatsnew":
             case "release-notes":
               output = readReleaseNotes() || "no release notes shipped with this build.";

@@ -6,7 +6,7 @@ A companion for your Letta agent. This guide explains every command, in order of
 
 - **Getting a companion** — [hatch](#sprite-hatch)
 - **Caring for it** — [name](#sprite-name), [pet](#sprite-pet), [molt](#sprite-molt)
-- **Looking at it** — [status](#sprite-status), [diary](#sprite-diary), [changelog](#sprite-changelog), [whatsnew](#sprite-whatsnew), [help](#sprite-help)
+- **Looking at it** — [status](#sprite-status), [diary](#sprite-diary), [update](#sprite-update), [changelog](#sprite-changelog), [whatsnew](#sprite-whatsnew), [help](#sprite-help)
 - **More than one** — [list](#sprite-list), [switch](#sprite-switch), [breed](#sprite-breed), [release](#sprite-release)
 - **A mind of its own** — [ensoul](#sprite-ensoul), [soul](#sprite-soul), [talk](#sprite-talk)
 - **Keeping it safe** — [backup](#sprite-backup)
@@ -114,6 +114,16 @@ Read the last 40 things it said, oldest first, with markers for how long you wer
 ```
 
 Lines in (parentheses) are built-in fallbacks or bookkeeping. Lines like `you → Poof: …` are things said to it.
+
+### /sprite update
+
+Update sprite to the newest release, then /reload.
+
+```
+/sprite update
+```
+
+On launch the mod quietly checks GitHub for a newer release (one small request; nothing is shown if it can't). When one exists, the panel row shows `⬆ vX.Y.Z available · /sprite update` while it's idle. This command runs `letta mods update` for you; the mod can't reload itself, so it ends by asking you to run /reload. Turn the check off with `/sprite settings global updateCheck off`.
 
 ### /sprite changelog
 
@@ -350,6 +360,7 @@ Show or change how the companion behaves and looks.
 | `laps count\|odometer\|belt\|pips` | How a wrapped stat bar shows its lap count: ×3 after the bar; ⟨3⟩ before it; each lap a heavier glyph; one dot per lap. |
 | `hue on\|off` | Colour stat bars by age: grey → white → gold → rose → violet → teal → shimmer. |
 | `bars on\|off` | Also show a compact stat strip on the panel row when it isn't speaking. |
+| `updateCheck on\|off` | Quietly check GitHub for a newer release on launch and nudge on the panel (default on). |
 
 A setting for this companion overrides the global default. Use `global` to change the default for all of them.
 

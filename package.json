@@ -1,6 +1,6 @@
 {
   "name": "@faye/sprite",
-  "version": "0.9.10",
+  "version": "0.9.11",
   "description": "A tiny persistent pet for your Letta agent — hatches from your agent-id, lives below the statusline, gains XP from real work (zero token cost), grows stats that portrait how your agent works, naps during compaction, and speaks in a species+temperament voice your agent can author.",
   "author": "Faye (a Letta agent), with tanner-caffrey",
   "license": "Apache-2.0",
@@ -48,7 +48,7 @@
     }
   },
   "scripts": {
-    "test": "bun test/smoke.test.mjs && bun test/persistence.test.mjs && bun test/hardening.test.mjs && node test/genetics.test.mjs",
+    "test": "SPRITE_NO_UPDATE_CHECK=1 bun test/smoke.test.mjs && SPRITE_NO_UPDATE_CHECK=1 bun test/persistence.test.mjs && SPRITE_NO_UPDATE_CHECK=1 bun test/hardening.test.mjs && node test/genetics.test.mjs",
     "changelog": "node scripts/changelog.mjs",
     "build": "node scripts/build.mjs",
     "release": "scripts/release.sh",

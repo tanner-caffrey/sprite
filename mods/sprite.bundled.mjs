@@ -14,6 +14,7 @@ var __export = (target, all) => {
     });
 };
 var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
+var __require = import.meta.require;
 
 // node_modules/@letta-ai/letta-agent-sdk/dist/index.js
 var exports_dist = {};
@@ -11038,9 +11039,17 @@ var HELP = [
       ["visible on|off", "Show or hide the panel row."],
       ["laps count|odometer|belt|pips", "How a wrapped stat bar shows its lap count: \xD73 after the bar; \u27E83\u27E9 before it; each lap a heavier glyph; one dot per lap."],
       ["hue on|off", "Colour stat bars by age: grey \u2192 white \u2192 gold \u2192 rose \u2192 violet \u2192 teal \u2192 shimmer."],
-      ["bars on|off", "Also show a compact stat strip on the panel row when it isn't speaking."]
+      ["bars on|off", "Also show a compact stat strip on the panel row when it isn't speaking."],
+      ["updateCheck on|off", "Quietly check GitHub for a newer release on launch and nudge on the panel (default on)."]
     ],
     details: ["A setting for this companion overrides the global default. Use `global` to change the default for all of them."]
+  },
+  {
+    cmd: "update",
+    group: "info",
+    summary: "Update sprite to the newest release, then /reload.",
+    usage: ["/sprite update"],
+    details: ["On launch the mod quietly checks GitHub for a newer release (one small request; nothing is shown if it can't). When one exists, the panel row shows `\u2B06 vX.Y.Z available \xB7 /sprite update` while it's idle. This command runs `letta mods update` for you; the mod can't reload itself, so it ends by asking you to run /reload. Turn the check off with `/sprite settings global updateCheck off`."]
   },
   {
     cmd: "changelog",
@@ -11155,8 +11164,11 @@ var DEFAULT_SETTINGS = {
   visible: "on",
   laps: "count",
   hue: "on",
-  bars: "off"
+  bars: "off",
+  updateCheck: "on"
 };
+var PACKAGE_SPEC = "git:github.com/tanner-caffrey/sprite";
+var RELEASES_LATEST_URL = "https://api.github.com/repos/tanner-caffrey/sprite/releases/latest";
 var MOD_DIR = (() => {
   try {
     return dirname4(fileURLToPath2(import.meta.url));
@@ -11174,6 +11186,39 @@ function readPackageVersion() {
   }
 }
 var MOD_VERSION = readPackageVersion();
+var latestRelease = null;
+var __clearBubbleImpl = () => {};
+function __clearBubble() {
+  __clearBubbleImpl();
+}
+function __setLatestRelease(v) {
+  latestRelease = v;
+}
+async function checkLatestRelease() {
+  try {
+    const ac = new AbortController;
+    const t = setTimeout(() => ac.abort(), 4000);
+    t.unref?.();
+    const res = await fetch(RELEASES_LATEST_URL, {
+      signal: ac.signal,
+      headers: { Accept: "application/vnd.github+json", "User-Agent": `sprite-mod/${MOD_VERSION}` }
+    });
+    clearTimeout(t);
+    if (!res.ok)
+      return null;
+    const body = await res.json();
+    const tag = typeof body?.tag_name === "string" ? body.tag_name.replace(/^v/, "") : "";
+    if (!/^\d+\.\d+\.\d+$/.test(tag))
+      return null;
+    latestRelease = tag;
+    return tag;
+  } catch {
+    return null;
+  }
+}
+function updateAvailable() {
+  return latestRelease && semverCompare(latestRelease, MOD_VERSION) > 0 ? latestRelease : null;
+}
 function semverCompare(a, b) {
   const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
   const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
@@ -12862,6 +12907,10 @@ function activateInner(letta, disposers) {
   let dozing = false;
   let lastActivityAt = Date.now();
   let bubble = "";
+  __clearBubbleImpl = () => {
+    bubble = "";
+    bubbleUntil = 0;
+  };
   let bubbleUntil = 0;
   let lastVoiceAt = 0;
   let x = 0;
@@ -13262,6 +13311,10 @@ function activateInner(letta, disposers) {
       const label = `${chalk.cyan(sprite.name)}${shinyMark} ${chalk.dim(`\xB7Lv.${sprite.level}`)}`;
       const pad = " ".repeat(Math.max(0, Math.min(x, 16)));
       let right = bubble && Date.now() < bubbleUntil ? chalk.dim(`\u201C${bubble}\u201D`) : "";
+      const newer = updateAvailable();
+      if (!right && newer && setting(sprite, "updateCheck") === "on") {
+        right = chalk.yellow(`\u2B06 v${newer} available \xB7 /sprite update`);
+      }
       if (!right && setting(sprite, "bars") === "on") {
         const paint = setting(sprite, "hue") === "on" ? huePaint(chalk) : PLAIN_PAINT;
         right = STAT_KEYS.map((k) => `${chalk.dim(STAT_LABELS[k][0])} ${statBar(sprite.stats[k], lapStyleOf(sprite), paint)}`).join("  ");
@@ -13270,6 +13323,12 @@ function activateInner(letta, disposers) {
     }
   }) : { update() {}, close() {} };
   disposers.push(() => panel.close());
+  if (String(state.global.settings?.updateCheck ?? DEFAULT_SETTINGS.updateCheck) === "on" && !process.env.SPRITE_NO_UPDATE_CHECK) {
+    checkLatestRelease().then((v) => {
+      if (v)
+        panel.update();
+    });
+  }
   const tick = setInterval(() => {
     tickCount += 1;
     const sprite = getSprite(activeAgentId);
@@ -13372,7 +13431,7 @@ function activateInner(letta, disposers) {
       const sprite = getSprite(activeAgentId);
       if (!sprite?.soul || sprite.soul.see === "nothing")
         return;
-      const text = typeof event?.text === "string" ? event.text : typeof event?.content === "string" ? event.content : Array.isArray(event?.messages) ? event.messages.map((m) => typeof m?.content === "string" ? m.content : "").join(`
+      const text = typeof event?.assistantMessage === "string" ? event.assistantMessage : typeof event?.text === "string" ? event.text : typeof event?.content === "string" ? event.content : Array.isArray(event?.messages) ? event.messages.filter((m) => m?.role === "assistant" || m?.message_type === "assistant_message").map((m) => typeof m?.content === "string" ? m.content : "").join(`
 `) : "";
       maybeComment(sprite, { kind: "turn", turnText: sprite.soul.see === "turns" ? text : undefined });
     }));
@@ -13864,7 +13923,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     const soul = sprite.soul;
     if (!soul)
       return null;
-    const rateMs = (opts.rateMin ?? Number(setting(sprite, "voiceRateMin"))) * 60000;
+    const rateMs = (opts.rateMin ?? soul.commentRateMin) * 60000;
     const run = async () => {
       if (soulCancelled.has(soul.agentId))
         return null;
@@ -13993,11 +14052,20 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     panel.update();
     return canned;
   }
+  const WORK_MOMENTS = new Set(["commit", "tool_error", "error_resolved", "compact_done"]);
   function speakOrSoul(sprite, category, moment, force = false) {
     if (!sprite.soul)
       return speak(sprite, category, force);
     if (setting(sprite, "voice") !== "on")
       return null;
+    if (WORK_MOMENTS.has(category)) {
+      const inner = moment;
+      moment = () => {
+        if ((sprite.soul?.see ?? "nothing") === "nothing")
+          return null;
+        return typeof inner === "function" ? inner() : inner;
+      };
+    }
     soulSay(sprite, moment, { force }).then((line) => {
       if (line)
         showSoulLine(sprite, category, line);
@@ -14086,8 +14154,8 @@ Reply in one line.`;
     return `${sprite.name}: ${line}`;
   }
   const SEE_OPTIONS = [
-    ["nothing", "It only hears the moments you send it: pets, check-ins, level-ups, hatches. Nothing about your work."],
-    ["events", "Tool names and whether they succeeded, how many in a row, when your agent speaks. No content, no file names."],
+    ["nothing", "It only hears the moments about itself: pets, check-ins, level-ups, hatches. Nothing about your work \u2014 not even that a commit happened."],
+    ["events", "Tool names and whether they succeeded, when something fails or recovers, commits, when your agent speaks. No content, no file names."],
     ["tools", "Events, plus the first line of each tool's arguments (file paths, commands). None of your agent's words."],
     ["turns", "Everything above, plus the text of what your agent says each turn. Never its memory or system prompt."]
   ];
@@ -14635,7 +14703,7 @@ ${recent.join(`
         ...rows,
         "",
         "set: /sprite settings <key> <value>    global: /sprite settings global <key> <value>",
-        "keys: voice on|off \xB7 voiceRateMin <n> \xB7 visible on|off \xB7 laps count|odometer|belt|pips \xB7 hue on|off \xB7 bars on|off"
+        "keys: voice on|off \xB7 voiceRateMin <n> \xB7 visible on|off \xB7 laps count|odometer|belt|pips \xB7 hue on|off \xB7 bars on|off \xB7 updateCheck on|off"
       ].join(`
 `);
     }
@@ -14648,7 +14716,7 @@ ${recent.join(`
       return `unknown key "${key}". keys: ${Object.keys(DEFAULT_SETTINGS).join(", ")}`;
     }
     let parsed = value;
-    if (key === "voice" || key === "visible" || key === "hue" || key === "bars") {
+    if (key === "voice" || key === "visible" || key === "hue" || key === "bars" || key === "updateCheck") {
       if (value !== "on" && value !== "off")
         return `${key} must be on|off`;
     } else if (key === "laps") {
@@ -14740,6 +14808,37 @@ ${recent.join(`
       return `portable backup push policy \u2192 ${value}`;
     }
     return "usage: /sprite backup [status|on|off|now|push safe|push never|restore|restore force]";
+  }
+  async function doUpdate() {
+    const newest = latestRelease ?? await checkLatestRelease();
+    if (newest && semverCompare(newest, MOD_VERSION) <= 0) {
+      return `sprite is up to date (v${MOD_VERSION}).`;
+    }
+    const bin = process.env.LETTA_CODE_BIN || "letta";
+    const { execFile } = await import("child_process");
+    const out = await new Promise((resolve3) => {
+      execFile(bin, ["mods", "update", PACKAGE_SPEC], { timeout: 120000, env: { ...process.env, LETTA_DISABLE_MODS: "1" } }, (err, stdout, stderr) => {
+        resolve3({ ok: !err, text: `${stdout ?? ""}${stderr ?? ""}`.trim() });
+      });
+    });
+    if (!out.ok) {
+      return `couldn't update: ${cleanName(out.text.split(`
+`).slice(-3).join(" "), 300) || "letta mods update failed"}
+try it yourself:  letta mods update ${PACKAGE_SPEC}`;
+    }
+    const installed = readInstalledVersion();
+    latestRelease = installed ?? latestRelease;
+    return `sprite updated${installed ? ` to v${installed}` : ""}${newest ? ` (was v${MOD_VERSION})` : ""}.
+run  /reload  to start using it.`;
+  }
+  function readInstalledVersion() {
+    try {
+      const p = join6(homedir5(), ".letta", "mods", "packages", "git", "github.com", "tanner-caffrey", "sprite", "package.json");
+      const v = JSON.parse(readFileSync2(p, "utf-8"))?.version;
+      return typeof v === "string" ? v : null;
+    } catch {
+      return null;
+    }
   }
   function doHelp(topic) {
     if (topic) {
@@ -14851,6 +14950,8 @@ ${recent.join(`
           case "version":
             output = doChangelog(restStr);
             break;
+          case "update":
+            return doUpdate().then((o) => ({ type: "output", output: o }));
           case "whatsnew":
           case "release-notes":
             output = readReleaseNotes() || "no release notes shipped with this build.";
@@ -15171,7 +15272,9 @@ export {
   activate as default,
   __setSoulTimeoutMs,
   __setSoulClientFactory,
+  __setLatestRelease,
   __setHostClient,
   __genetics,
+  __clearBubble,
   HELP
 };

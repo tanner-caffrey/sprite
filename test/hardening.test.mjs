@@ -48,18 +48,19 @@ function remoteFiles(remoteDir) {
   return git(remoteDir, ["ls-tree", "-r", "--name-only", "main"]).split("\n").filter(Boolean);
 }
 
-function makeLetta(agent, memoryDir) {
+function makeLetta(agent, memoryDir, opts = {}) {
   const commands = new Map();
   const tools = new Map();
   const toolDefs = new Map();
   const handlers = new Map();
+  const panels = new Map();
   const context = { agent, memfs: { enabled: Boolean(memoryDir), memoryDir: memoryDir ?? null } };
   const letta = {
     capabilities: {
       tools: true,
       commands: true,
       events: { lifecycle: true, tools: true, turns: true, compact: true, llm: true },
-      ui: { panels: false },
+      ui: { panels: Boolean(opts.panels) },
     },
     getContext: () => context,
     commands: { register: (c) => (commands.set(c.id, c), () => commands.delete(c.id)) },
@@ -72,7 +73,14 @@ function makeLetta(agent, memoryDir) {
         return () => handlers.set(name, list.filter((h) => h !== handler));
       },
     },
-    ui: { openPanel() { throw new Error("headless"); } },
+    ui: {
+      openPanel(p) {
+        if (!opts.panels) throw new Error("headless");
+        panels.set(p.id, p);
+        return { update() {}, close() { panels.delete(p.id); } };
+      },
+      notify() {},
+    },
   };
   const history = [];
   const ctx = { agent, getContext: () => context, context, cwd: root, conversation: { getHistory: async () => history } };
@@ -80,6 +88,7 @@ function makeLetta(agent, memoryDir) {
     letta,
     tools,
     toolDefs,
+    panels,
     history,
     raw: (args) => Promise.resolve(commands.get("sprite").run({ ...ctx, args })),
     handlerCount: (name) => (handlers.get(name) ?? []).length,
@@ -1106,7 +1115,7 @@ await check("soul: failed model turns report the SDK error instead of silently t
   dispose();
 });
 
-await check("soul: ambient lines (commit, errors) are live once ensouled; `see` gates the detail", async () => {
+await check("soul: ambient work-moments reach the mind only from `see events` up; `see` gates the detail", async () => {
   const mock = mockSoulClient();
   __setSoulClientFactory(async () => mock.client);
   const agent = { id: "agent-soulamb", name: "Owner" };
@@ -1117,9 +1126,16 @@ await check("soul: ambient lines (commit, errors) are live once ensouled; `see` 
   host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "t1", args: { command: "git commit -m 'secret msg'" } });
   host.fire("tool_end", { agentId: agent.id, toolName: "Bash", toolCallId: "t1", status: "success" });
   await tick();
+  // see nothing: the commit is a work-moment → the mind is NOT told (panel gets a corpus line)
+  assert.equal(mock.calls.filter((c) => c[0] === "prompt").slice(n0).filter((c) => /commit/i.test(c[2])).length, 0, "see=nothing must not tell the mind about commits");
+  assert.ok((activeSprite(agent.id).log ?? []).some((e) => e.category === "commit"), "panel should still mark the commit");
+  await host.command("soul see events");
+  host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "t1b", args: { command: "git commit -m 'secret msg'" } });
+  host.fire("tool_end", { agentId: agent.id, toolName: "Bash", toolCallId: "t1b", status: "success" });
+  await tick();
   const commit = mock.calls.filter((c) => c[0] === "prompt").slice(n0).find((c) => /commit/i.test(c[2]));
-  assert.ok(commit, "commit should reach the mind");
-  assert.doesNotMatch(commit[2], /secret msg/, "see=nothing must not leak the commit message");
+  assert.ok(commit, "under events the commit should reach the mind");
+  assert.doesNotMatch(commit[2], /secret msg/, "events must not leak the commit message");
   await host.command("soul see tools");
   host.fire("tool_start", { agentId: agent.id, toolName: "Bash", toolCallId: "t2", args: { command: "git commit -m 'visible msg'" } });
   host.fire("tool_end", { agentId: agent.id, toolName: "Bash", toolCallId: "t2", status: "success" });
@@ -1460,6 +1476,25 @@ await check("review #2: a queued commit/talk payload is dropped after `see nothi
   dispose();
 });
 
+await check("turn_end: the host's `assistantMessage` field is what the mind hears under `see turns`", async () => {
+  const mock = mockSoulClient();
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-turnfield", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "turns" });
+  await tick();
+  host.fire("turn_end", { agentId: agent.id, conversationId: "c", stopReason: "end_turn", assistantMessage: "REAL_HOST_FIELD words" });
+  await tick();
+  const last = mock.calls.filter((c) => c[0] === "prompt").pop();
+  assert.match(last[2], /they just said: «REAL_HOST_FIELD words»/, last[2]);
+  // and under events, the same event sends no content
+  await host.command("soul see events");
+  host.fire("turn_end", { agentId: agent.id, assistantMessage: "SHOULD_NOT_LEAK" });
+  await tick();
+  assert.doesNotMatch(mock.calls.filter((c) => c[0] === "prompt").pop()[2], /SHOULD_NOT_LEAK/);
+  dispose();
+});
+
 await check("review #3: another window's `see nothing` is honored before this window sends", async () => {
   const mock = mockSoulClient({ hang: (m) => m.includes("first line") });
   __setSoulClientFactory(async () => mock.client);
@@ -1661,6 +1696,85 @@ await check("review #11: releasing a sprite drops its queued mind calls; dispose
   const sent = mock.calls.filter((c) => c[0] === "prompt").slice(before).map((c) => c[2]).join("\n");
   assert.doesNotMatch(sent, /QUEUED_AFTER_RELEASE/, "queued call ran after release");
   d2();
+});
+
+// ---------------------------------------------------------------------------
+await check("see matrix: exactly what the mind receives at each level, on the host's real event shapes", async () => {
+  const mock = mockSoulClient({ reply: () => "ok" });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-matrix", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "nothing" });
+  await tick();
+  const strip = (t) => t.split("\n\n(Anything quoted")[0].replace(/\n\nSay one line[\s\S]*$/, "");
+  const drive = async () => {
+    const n0 = mock.calls.length;
+    await host.command("soul comment tools 1");
+    host.fire("tool_start", { agentId: agent.id, toolCallId: "t1", toolName: "Read", args: { file_path: "/home/u/secret/notes.md" } });
+    host.fire("tool_end", { agentId: agent.id, toolCallId: "t1", toolName: "Read", args: { file_path: "/home/u/secret/notes.md" }, status: "success" });
+    await tick();
+    host.fire("tool_start", { agentId: agent.id, toolCallId: "t2", toolName: "Bash", args: { command: "git commit -m 'private message'\necho second line" } });
+    host.fire("tool_end", { agentId: agent.id, toolCallId: "t2", toolName: "Bash", args: { command: "git commit -m 'private message'\necho second line" }, status: "success" });
+    await tick();
+    host.fire("tool_end", { agentId: agent.id, toolCallId: "t3", toolName: "Edit", args: { file_path: "/x/y.ts" }, status: "error" });
+    await tick();
+    await host.command("soul comment turn");
+    host.fire("turn_end", { agentId: agent.id, conversationId: "c", stopReason: "end_turn", assistantMessage: "here is what I said" });
+    await tick(); await tick();
+    return mock.calls.slice(n0).filter((c) => c[0] === "prompt").map((c) => strip(c[2]));
+  };
+  // nothing: the mind hears NOTHING about work (commit/error still show as corpus lines on the panel)
+  assert.deepEqual(await drive(), []);
+  await host.command("soul see events");
+  assert.deepEqual(await drive(), [
+    "they used Read (success)",
+    "they used Bash (success)",
+    "They just made a git commit.",
+    "Something they tried just failed.",
+    "they just finished a turn",
+  ]);
+  await host.command("soul see tools");
+  assert.deepEqual(await drive(), [
+    "they used Read (success): «/home/u/secret/notes.md»",
+    "they used Bash (success): «git commit -m 'private message'»",
+    "They just made a git commit: «git commit -m 'private message'»",
+    "Their Edit call just failed.",
+    "they just finished a turn",
+  ]);
+  await host.command("soul see turns");
+  assert.deepEqual(await drive(), [
+    "they used Read (success): «/home/u/secret/notes.md»",
+    "they used Bash (success): «git commit -m 'private message'»",
+    "They just made a git commit: «git commit -m 'private message'»",
+    "Their Edit call just failed.",
+    "they just said: «here is what I said»",
+  ]);
+  // and the second line of a multi-line command never goes out at any level
+  const all = mock.calls.filter((c) => c[0] === "prompt").map((c) => c[2]).join("\n");
+  assert.doesNotMatch(all, /second line/);
+  dispose();
+});
+
+// ---------------------------------------------------------------------------
+await check("update: a newer release shows on the panel row when idle; update check can be turned off", async () => {
+  const { __setLatestRelease } = await import("../mods/sprite.tsx");
+  const agent = { id: "agent-update", name: "Owner" };
+  seedAlive(agent.id);
+  const host = makeLetta(agent, null, { panels: true }); const d = activate(host.letta);
+  host.fire("conversation_open", { agentId: agent.id });
+  const { __clearBubble } = await import("../mods/sprite.tsx");
+  __clearBubble(); // the nudge yields to speech; make the row idle for the assertion
+  __setLatestRelease("99.0.0");
+  const rowWith = () => host.panels.get("sprite")?.render({ chalk: new Proxy({}, { get: () => (s) => s }), columns: 120, row: (l, r) => `${l} | ${r}` }) ?? "";
+  assert.match(rowWith(), /⬆ v99\.0\.0 available · \/sprite update/);
+  assert.match(host.command("help update"), /letta mods update/);
+  host.command("settings global updateCheck off");
+  assert.doesNotMatch(rowWith(), /available/);
+  __setLatestRelease("0.0.1"); // older than us → never a nudge
+  host.command("settings global updateCheck on");
+  assert.doesNotMatch(rowWith(), /available/);
+  __setLatestRelease(null);
+  d();
 });
 
 console.log(`\nSprite hardening test passed (${passed} checks).`);

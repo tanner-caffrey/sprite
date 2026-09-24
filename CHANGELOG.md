@@ -3,6 +3,21 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.9.11 — it hears you now; updates from inside
+- `see turns` works: the mod now reads the reply from the field Letta Code
+  actually sends (`assistantMessage`). Until now an ensouled companion under
+  `turns` only ever heard "they just finished a turn" — Poof's first real
+  words from his agent arrived 84 days after he hatched.
+- `see nothing` is literally nothing: commits, errors, recoveries, and
+  compaction no longer reach the mind at that level (the panel still marks
+  them with a built-in line). Failures and recoveries now do reach it from
+  `events` up — they were being swallowed by the built-in voice's rate limit.
+  What each level sends is pinned, string for string, by a test.
+- `/sprite update` updates to the newest release and tells you to `/reload`.
+  On launch the mod quietly checks GitHub for a newer release and, when
+  there is one, the panel row shows `⬆ vX.Y.Z available · /sprite update`
+  while idle. `/sprite settings global updateCheck off` turns that off.
+
 ## v0.9.10 — a full review pass
 Every finding from an end-to-end adversarial review of the whole mod:
 
