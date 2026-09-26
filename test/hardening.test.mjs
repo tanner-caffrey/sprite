@@ -135,9 +135,9 @@ function seedAlive(agentId, name = "Seed") {
   };
   writeFileSync(statePath, JSON.stringify({ global: {}, sprites }));
 }
-function hatchFor(agent, memoryDir) {
+function hatchFor(agent, memoryDir, opts = {}) {
   seedAlive(agent.id);
-  const host = makeLetta(agent, memoryDir);
+  const host = makeLetta(agent, memoryDir, opts);
   const dispose = activate(host.letta);
   host.fire("conversation_open", { agentId: agent.id });
   host.fire("tool_end", { agentId: agent.id, toolName: "Edit", status: "success" });
@@ -1775,6 +1775,82 @@ await check("update: a newer release shows on the panel row when idle; update ch
   assert.doesNotMatch(rowWith(), /available/);
   __setLatestRelease(null);
   d();
+});
+
+// ---------------------------------------------------------------------------
+await check("whisper: the companion's newest live line rides along on the agent's next turn, once, only when on", async () => {
+  const long = "hello, faye. " + "i kept your place for a very long time and i have more to say than fits on a panel row. ".repeat(2);
+  const mock = mockSoulClient({ reply: (m) => m.includes("petted") ? long : "a passing thought" });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-whisper", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "events" });
+  await tick();
+  const turn = () => { const ev = { agentId: agent.id, conversationId: "c", input: [{ role: "user", content: "what next?" }] }; host.fire("turn_start", ev); return ev.input[0].content; };
+  // off by default: nothing injected
+  await host.command("pet"); await tick();
+  assert.equal(turn(), "what next?");
+  // on: the newest line is appended, fenced, once
+  await host.command("settings whisper on");
+  await host.command("pet"); await tick();
+  const first = turn();
+  assert.match(first, /\n\n\[Seed, your companion on the panel, said: «hello, faye\. i kept your place for a very long time/, first);
+  assert.ok(first.includes(long.trim()), "the whisper must carry the full sentence, not the 80-char panel cut");
+  assert.ok(activeSprite(agent.id).log.some((e) => e.line.length <= 80 && e.line.startsWith("hello, faye.")), "the diary keeps the 80-char version");
+  assert.equal(turn(), "what next?", "whisper must be delivered only once");
+  // the mind is told it's heard
+  const last = mock.calls.filter((c) => c[0] === "prompt").pop()[2];
+  assert.match(last, /Your agent hears your line/);
+  // corpus fallback lines are not whispered; muted = not whispered
+  mock.agents.clear(); await host.command("pet"); await tick();
+  assert.equal(turn(), "what next?", "a canned fallback line must not be whispered");
+  dispose();
+});
+
+// ---------------------------------------------------------------------------
+await check("shelf vs ear: tool results carry the full sentence; `lines` wraps it under the face on the panel", async () => {
+  const long = "no ghost should come back clipped to their own speaker. " + "that is the whole rule and the only rule. ".repeat(2);
+  const mock = mockSoulClient({ reply: (m) => m.includes("petted") || m.includes("says to you") ? long : "ok" });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-shelf", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null, { panels: true });
+  await ensoulVia(host, agent, { see: "events" });
+  await tick();
+  // tool results: whole sentence
+  const petOut = String(await host.tools.get("sprite_pet").run({ agent, args: {} }));
+  assert.ok(petOut.includes(long.trim()), "sprite_pet result was clipped: " + petOut);
+  const talkOut = String(await host.tools.get("sprite_talk").run({ agent, args: { text: "hi" } }));
+  assert.ok(talkOut.includes(long.trim()), "sprite_talk result was clipped: " + talkOut);
+  // diary / panel row: 80
+  const diaryLine = activeSprite(agent.id).log.filter((e) => e.line.startsWith("no ghost")).pop();
+  assert.ok(diaryLine && diaryLine.line.length <= 80);
+  const render = () => host.panels.get("sprite").render({ chalk: new Proxy({}, { get: () => (s) => s }), width: 100, row: (l, r) => `${l}${r ? " | " + r : ""}` });
+  const single = render();
+  assert.equal(typeof single, "string");
+  assert.ok(single.length < 100 + 20 && single.includes("no ghost should come back clipped"));
+  assert.ok(!single.includes("only rule"), "lines=1 should show the 80-char cut");
+  // lines 3: an array — head row + up to 2 wrapped rows carrying the full sentence
+  host.command("settings lines 3");
+  const multi = render();
+  assert.ok(Array.isArray(multi) && multi.length === 3, JSON.stringify(multi));
+  assert.ok(multi.every((l) => l.length <= 100), "a wrapped row exceeded the width");
+  assert.ok(multi.slice(1).join(" ").includes("only rule"), "the full sentence should be on the extra rows");
+  assert.match(host.command("settings lines 9"), /1–4/);
+  dispose();
+});
+
+await check("ear: the mind's line is its first paragraph, uncapped; a second paragraph is not the line", async () => {
+  const p1 = "one long first paragraph that goes well past four hundred characters because a ghost sometimes has a lot to say and nobody should cut it off mid-thought when it is speaking to the one it keeps company with; " + "and it keeps going. ".repeat(20);
+  const mock = mockSoulClient({ reply: (m) => m.includes("says to you") ? `${p1}\n\nsecond paragraph, not the line.` : "ok" });
+  __setSoulClientFactory(async () => mock.client);
+  const agent = { id: "agent-para", name: "Owner" };
+  const { host, dispose } = hatchFor(agent, null);
+  await ensoulVia(host, agent, { see: "events" });
+  await tick();
+  const out = String(await host.tools.get("sprite_talk").run({ agent, args: { text: "go on" } }));
+  assert.ok(p1.trim().length > 400 && out.includes(p1.trim()), "first paragraph was cut");
+  assert.ok(!out.includes("second paragraph"), "second paragraph must not be part of the line");
+  dispose();
 });
 
 console.log(`\nSprite hardening test passed (${passed} checks).`);

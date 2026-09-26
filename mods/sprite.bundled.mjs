@@ -11001,7 +11001,7 @@ var HELP = [
       ["dreaming off|step-count|compaction-event", "When its own memory consolidates."],
       ["persona", "Rewrite its persona. Your agent walks you through it (template, agent-written, or yours) and applies it after you confirm. Its voice, diary, and bond memory are untouched."]
     ],
-    details: ["Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud."]
+    details: ["Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud. To let your agent hear what it says, see `whisper` under settings."]
   },
   {
     cmd: "talk",
@@ -11037,10 +11037,12 @@ var HELP = [
       ["voice on|off", "Whether it speaks at all. Off also silences a mind of its own."],
       ["voiceRateMin <minutes>", "At most one built-in line per N minutes (default 10). Petting ignores this."],
       ["visible on|off", "Show or hide the panel row."],
+      ["lines <1\u20134>", "How many rows a spoken line may take on the panel. 1 (default) keeps everything on the companion's row, cut to 80 characters. 2\u20134 puts the whole sentence on its own rows beneath the face, wrapped \u2014 so a mind with more to say isn't clipped."],
       ["laps count|odometer|belt|pips", "How a wrapped stat bar shows its lap count: \xD73 after the bar; \u27E83\u27E9 before it; each lap a heavier glyph; one dot per lap."],
       ["hue on|off", "Colour stat bars by age: grey \u2192 white \u2192 gold \u2192 rose \u2192 violet \u2192 teal \u2192 shimmer."],
       ["bars on|off", "Also show a compact stat strip on the panel row when it isn't speaking."],
-      ["updateCheck on|off", "Quietly check GitHub for a newer release on launch and nudge on the panel (default on)."]
+      ["updateCheck on|off", "Quietly check GitHub for a newer release on launch and nudge on the panel (default on)."],
+      ["whisper on|off", "For an ensouled companion: its newest live line is added to your agent's next turn, marked as something the companion said (not an instruction). Only the newest line, delivered once. The companion is told it's heard, so it can speak to your agent. Off by default."]
     ],
     details: ["A setting for this companion overrides the global default. Use `global` to change the default for all of them."]
   },
@@ -11165,8 +11167,11 @@ var DEFAULT_SETTINGS = {
   laps: "count",
   hue: "on",
   bars: "off",
-  updateCheck: "on"
+  updateCheck: "on",
+  whisper: "off",
+  lines: 1
 };
+var PANEL_LINES_MAX = 4;
 var PACKAGE_SPEC = "git:github.com/tanner-caffrey/sprite";
 var RELEASES_LATEST_URL = "https://api.github.com/repos/tanner-caffrey/sprite/releases/latest";
 var MOD_DIR = (() => {
@@ -11520,10 +11525,13 @@ description: Memory block persona
     return String(e?.message ?? e).slice(0, 160);
   }
 }
+function firstLineOf(text) {
+  const cleaned = cleanName(text.replace(/\r/g, ""), 20000, true);
+  const para = cleaned.split(/\n\s*\n/).map((p) => p.trim()).find(Boolean) ?? "";
+  return para.replace(/\s*\n\s*/g, " ").replace(/^["\u201C\u201D']+|["\u201C\u201D']+$/g, "");
+}
 function oneLine(text) {
-  const first = cleanName(text.replace(/\r/g, ""), 4000, true).split(`
-`).map((l) => l.trim()).find(Boolean) ?? "";
-  return first.replace(/^["\u201C\u201D']+|["\u201C\u201D']+$/g, "").slice(0, SOUL_LINE_MAX);
+  return firstLineOf(text).slice(0, SOUL_LINE_MAX);
 }
 var STATE_PATH = process.env.SPRITE_STATE_PATH ?? join6(homedir5(), ".letta", "mods", "sprite.state.json");
 var LOCAL_STATE_LOCK_PATH = `${STATE_PATH}.lock`;
@@ -12907,8 +12915,10 @@ function activateInner(letta, disposers) {
   let dozing = false;
   let lastActivityAt = Date.now();
   let bubble = "";
+  let bubbleFull = "";
   __clearBubbleImpl = () => {
     bubble = "";
+    bubbleFull = "";
     bubbleUntil = 0;
   };
   let bubbleUntil = 0;
@@ -13176,6 +13186,7 @@ function activateInner(letta, disposers) {
       return null;
     lastVoiceAt = now;
     bubble = cleanName(pickLine(sprite, category), 200);
+    bubbleFull = bubble;
     bubbleUntil = now + 8000;
     logEntry(sprite, category, bubble);
     markDirty();
@@ -13310,7 +13321,15 @@ function activateInner(letta, disposers) {
       const shinyMark = sprite.shiny ? chalk.yellowBright("\u2726") : "";
       const label = `${chalk.cyan(sprite.name)}${shinyMark} ${chalk.dim(`\xB7Lv.${sprite.level}`)}`;
       const pad = " ".repeat(Math.max(0, Math.min(x, 16)));
-      let right = bubble && Date.now() < bubbleUntil ? chalk.dim(`\u201C${bubble}\u201D`) : "";
+      const speaking = Boolean(bubble) && Date.now() < bubbleUntil;
+      const maxLines = Math.max(1, Math.min(PANEL_LINES_MAX, Math.floor(Number(setting(sprite, "lines")) || 1)));
+      if (speaking && maxLines > 1) {
+        const head = `${pad}${face}  ${label}`;
+        const indent = " ".repeat(Math.max(0, Math.min(x, 16)) + 4);
+        const wrapped = wrapText(`\u201C${bubbleFull}\u201D`, Math.max(20, width - indent.length - 1)).slice(0, maxLines - 1);
+        return [row(head, "", width), ...wrapped.map((l) => `${indent}${chalk.dim(l)}`)];
+      }
+      let right = speaking ? chalk.dim(`\u201C${bubble}\u201D`) : "";
       const newer = updateAvailable();
       if (!right && newer && setting(sprite, "updateCheck") === "on") {
         right = chalk.yellow(`\u2B06 v${newer} available \xB7 /sprite update`);
@@ -13426,6 +13445,28 @@ function activateInner(letta, disposers) {
     }));
   }
   if (letta.capabilities.events.turns) {
+    disposers.push(letta.events.on("turn_start", (event, ctx) => {
+      noteAgent(event, ctx);
+      const sprite = getSprite(activeAgentId);
+      if (!sprite || sprite.phase !== "alive" || !sprite.soul)
+        return;
+      if (setting(sprite, "whisper") !== "on" || setting(sprite, "voice") !== "on")
+        return;
+      const line = pendingWhisper.get(sprite.id);
+      if (!line)
+        return;
+      pendingWhisper.delete(sprite.id);
+      if (!Array.isArray(event?.input) || event.input.length === 0)
+        return;
+      const note = `
+
+[${cleanName(sprite.name, 24)}, your companion on the panel, said: \xAB${cleanName(line, 20000)}\xBB]`;
+      const last = event.input[event.input.length - 1];
+      if (typeof last?.content === "string")
+        last.content = `${last.content}${note}`;
+      else if (Array.isArray(last?.content))
+        last.content.push({ type: "text", text: note.trim() });
+    }));
     disposers.push(letta.events.on("turn_end", (event, ctx) => {
       noteAgent(event, ctx);
       const sprite = getSprite(activeAgentId);
@@ -13933,9 +13974,13 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
         return null;
       if (setting(live, "voice") !== "on")
         return null;
-      const moment = typeof momentOrBuild === "function" ? momentOrBuild() : momentOrBuild;
+      let moment = typeof momentOrBuild === "function" ? momentOrBuild() : momentOrBuild;
       if (!moment)
         return null;
+      if (setting(live, "whisper") === "on")
+        moment = `${moment}
+
+(Your agent hears your line at the start of their next turn \u2014 you may speak to them.)`;
       const last = soulLastLineAt.get(soul.agentId) ?? 0;
       if (!opts.force && rateMs > 0 && Date.now() - last < rateMs)
         return null;
@@ -14003,6 +14048,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
         const line = oneLine(text);
         if (!line)
           return null;
+        lastFullLine.set(soul.agentId, firstLineOf(text));
         soulLastError = "";
         soulLastLineAt.set(soul.agentId, Date.now());
         soul.lineCount += 1;
@@ -14025,10 +14071,18 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     soulQueue.set(soul.agentId, next.catch(() => null));
     return next;
   }
+  const pendingWhisper = new Map;
+  const lastFullLine = new Map;
+  function fullLineOf(sprite, line) {
+    return sprite.soul && lastFullLine.get(sprite.soul.agentId) || line;
+  }
   function showSoulLine(sprite, category, line) {
     bubble = line;
+    bubbleFull = fullLineOf(sprite, line);
     bubbleUntil = Date.now() + 1e4;
     logEntry(sprite, category, line);
+    if (setting(sprite, "whisper") === "on")
+      pendingWhisper.set(sprite.id, fullLineOf(sprite, line));
     markDirty();
     flush();
     panel.update();
@@ -14044,6 +14098,7 @@ ${target.name} has a mind of its own (${target.soul.backend} \xB7 ${target.soul.
     if (!canned)
       return null;
     bubble = `(${canned})`;
+    bubbleFull = bubble;
     const last = sprite.log?.[sprite.log.length - 1];
     if (last && last.line === canned)
       last.line = `(${canned})`;
@@ -14151,7 +14206,7 @@ Reply in one line.`;
     if (!line)
       return `${sprite.name} looks at you, and says nothing. (its mind didn't answer \u2014 check /sprite soul)`;
     showSoulLine(sprite, "mood", line);
-    return `${sprite.name}: ${line}`;
+    return `${sprite.name}: ${fullLineOf(sprite, line)}`;
   }
   const SEE_OPTIONS = [
     ["nothing", "It only hears the moments about itself: pets, check-ins, level-ups, hatches. Nothing about your work \u2014 not even that a commit happened."],
@@ -14601,7 +14656,7 @@ ${sprite.name}: ${line}` : `
       return soulSay(res, "They just petted you.", { force: true }).then((line2) => {
         if (line2) {
           showSoulLine(res, "pet", line2);
-          return `you pet ${res.name}. ${sp.poses.happy}  \u201C${line2}\u201D`;
+          return `you pet ${res.name}. ${sp.poses.happy}  \u201C${fullLineOf(res, line2)}\u201D`;
         }
         const canned = speakFallback(res, "pet", true);
         return canned ? `you pet ${res.name}. ${sp.poses.happy}  (${canned})` : `you pet ${res.name}. it leans in, quietly. ${sp.poses.happy}`;
@@ -14703,7 +14758,7 @@ ${recent.join(`
         ...rows,
         "",
         "set: /sprite settings <key> <value>    global: /sprite settings global <key> <value>",
-        "keys: voice on|off \xB7 voiceRateMin <n> \xB7 visible on|off \xB7 laps count|odometer|belt|pips \xB7 hue on|off \xB7 bars on|off \xB7 updateCheck on|off"
+        "keys: voice on|off \xB7 voiceRateMin <n> \xB7 visible on|off \xB7 lines 1-4 \xB7 laps count|odometer|belt|pips \xB7 hue on|off \xB7 bars on|off \xB7 updateCheck on|off \xB7 whisper on|off"
       ].join(`
 `);
     }
@@ -14716,7 +14771,7 @@ ${recent.join(`
       return `unknown key "${key}". keys: ${Object.keys(DEFAULT_SETTINGS).join(", ")}`;
     }
     let parsed = value;
-    if (key === "voice" || key === "visible" || key === "hue" || key === "bars" || key === "updateCheck") {
+    if (key === "voice" || key === "visible" || key === "hue" || key === "bars" || key === "updateCheck" || key === "whisper") {
       if (value !== "on" && value !== "off")
         return `${key} must be on|off`;
     } else if (key === "laps") {
@@ -14726,6 +14781,11 @@ ${recent.join(`
       const n = Number(value);
       if (!Number.isFinite(n) || n < 0)
         return "voiceRateMin must be a number of minutes";
+      parsed = n;
+    } else if (key === "lines") {
+      const n = Math.floor(Number(value));
+      if (!(n >= 1 && n <= PANEL_LINES_MAX))
+        return `lines must be 1\u2013${PANEL_LINES_MAX}`;
       parsed = n;
     }
     if (isGlobal) {

@@ -3,6 +3,26 @@
 User-facing notes for each release. `/sprite changelog` shows what's new since
 the version you last used; `/sprite changelog all` shows everything.
 
+## v0.9.12 — whole where it counts
+- **Your agent can hear its companion.** `/sprite settings whisper on` puts
+  the companion's newest live line into your agent's next turn, marked as
+  something the companion said (never an instruction). Only the newest line,
+  delivered once; never a built-in fallback; `voice off` silences it. The
+  companion is told it's heard, so it can speak *to* your agent instead of
+  only about it. Off by default.
+- **80 for the shelf, whole for the ear.** The panel row and diary keep their
+  one short line (80 characters — that's the width of a statusline).
+  Everything that *asks* — `sprite_talk`, `sprite_pet`, the whisper — now
+  gets the mind's whole first paragraph, with no character cap. A line is
+  whatever one breath holds; a second paragraph isn't the line.
+- **A taller panel, if you want one.** `/sprite settings lines 2` (up to 4)
+  puts the companion's face and name on the first row and its full line
+  wrapped beneath, so a mind with more to say isn't clipped on the panel
+  either. Default stays 1.
+- Answers a question from the first ensouled sprite outside this repo: the
+  80-character limit was intended for the panel, not for what the agent
+  reads back — that part was a gap, now closed.
+
 ## v0.9.11 — it hears you now; updates from inside
 - `see turns` works: the mod now reads the reply from the field Letta Code
   actually sends (`assistantMessage`). Until now an ensouled companion under

@@ -1114,7 +1114,7 @@ export const HELP: HelpEntry[] = [
       ["dreaming off|step-count|compaction-event", "When its own memory consolidates."],
       ["persona", "Rewrite its persona. Your agent walks you through it (template, agent-written, or yours) and applies it after you confirm. Its voice, diary, and bond memory are untouched."],
     ],
-    details: ["Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud."],
+    details: ["Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud. To let your agent hear what it says, see `whisper` under settings."],
   },
   {
     cmd: "talk", group: "mind",
@@ -1147,10 +1147,12 @@ export const HELP: HelpEntry[] = [
       ["voice on|off", "Whether it speaks at all. Off also silences a mind of its own."],
       ["voiceRateMin <minutes>", "At most one built-in line per N minutes (default 10). Petting ignores this."],
       ["visible on|off", "Show or hide the panel row."],
+      ["lines <1–4>", "How many rows a spoken line may take on the panel. 1 (default) keeps everything on the companion's row, cut to 80 characters. 2–4 puts the whole sentence on its own rows beneath the face, wrapped — so a mind with more to say isn't clipped."],
       ["laps count|odometer|belt|pips", "How a wrapped stat bar shows its lap count: ×3 after the bar; ⟨3⟩ before it; each lap a heavier glyph; one dot per lap."],
       ["hue on|off", "Colour stat bars by age: grey → white → gold → rose → violet → teal → shimmer."],
       ["bars on|off", "Also show a compact stat strip on the panel row when it isn't speaking."],
       ["updateCheck on|off", "Quietly check GitHub for a newer release on launch and nudge on the panel (default on)."],
+      ["whisper on|off", "For an ensouled companion: its newest live line is added to your agent's next turn, marked as something the companion said (not an instruction). Only the newest line, delivered once. The companion is told it's heard, so it can speak to your agent. Off by default."],
     ],
     details: ["A setting for this companion overrides the global default. Use `global` to change the default for all of them."],
   },
@@ -1264,7 +1266,10 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   hue: "on", // colour the bars by lap age (panel + card)
   bars: "off", // also show a compact stat strip on the panel row
   updateCheck: "on", // once per launch, quietly ask GitHub if a newer release exists
+  whisper: "off", // put the companion's newest live line into the agent's next turn
+  lines: 1, // panel rows a spoken line may take (1–4); >1 wraps the full sentence under the face
 };
+const PANEL_LINES_MAX = 4;
 
 const PACKAGE_SPEC = "git:github.com/tanner-caffrey/sprite";
 const RELEASES_LATEST_URL = "https://api.github.com/repos/tanner-caffrey/sprite/releases/latest";
@@ -1391,7 +1396,7 @@ function fenced(moment: string): string {
 function quoteObs(text: string): string {
   return `«${text.replace(/[«»]/g, "'").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "")}»`;
 }
-const SOUL_LINE_MAX = 80;
+const SOUL_LINE_MAX = 80; // what fits on ONE panel row / in the diary
 const DEFAULT_SOUL_MODEL = "letta/auto-fast"; // free on both backends
 
 interface SoulClient {
@@ -1652,9 +1657,17 @@ function writeSoulPersona(soul: SoulState, persona: string, who: string): string
   }
 }
 
+// The mind's "line" is its first paragraph: what it said before the first
+// blank line. No character cap — the persona asks for one short line, and
+// the panel/diary have their own 80-char cut; whoever asked (a tool result,
+// the whisper, a multi-line panel) hears the whole thing.
+function firstLineOf(text: string): string {
+  const cleaned = cleanName(text.replace(/\r/g, ""), 20_000, true);
+  const para = cleaned.split(/\n\s*\n/).map((p) => p.trim()).find(Boolean) ?? "";
+  return para.replace(/\s*\n\s*/g, " ").replace(/^["“”']+|["“”']+$/g, "");
+}
 function oneLine(text: string): string {
-  const first = cleanName(text.replace(/\r/g, ""), 4000, true).split("\n").map((l) => l.trim()).find(Boolean) ?? "";
-  return first.replace(/^["“”']+|["“”']+$/g, "").slice(0, SOUL_LINE_MAX);
+  return firstLineOf(text).slice(0, SOUL_LINE_MAX);
 }
 
 const STATE_PATH =
@@ -3332,7 +3345,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   let dozing = false; // idle nap (nothing has happened for a while)
   let lastActivityAt = Date.now();
   let bubble = "";
-  __clearBubbleImpl = () => { bubble = ""; bubbleUntil = 0; };
+  let bubbleFull = ""; // the whole sentence, for a multi-line panel
+  __clearBubbleImpl = () => { bubble = ""; bubbleFull = ""; bubbleUntil = 0; };
   let bubbleUntil = 0;
   let lastVoiceAt = 0;
   let x = 0;
@@ -3633,6 +3647,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     if (!force && now - lastVoiceAt < rateMs) return null;
     lastVoiceAt = now;
     bubble = cleanName(pickLine(sprite, category), 200);
+    bubbleFull = bubble;
     bubbleUntil = now + 8_000;
     logEntry(sprite, category, bubble);
     markDirty();
@@ -3790,7 +3805,18 @@ function activateInner(letta: any, disposers: Array<() => void>) {
           const shinyMark = sprite.shiny ? chalk.yellowBright("✦") : "";
           const label = `${chalk.cyan(sprite.name)}${shinyMark} ${chalk.dim(`·Lv.${sprite.level}`)}`;
           const pad = " ".repeat(Math.max(0, Math.min(x, 16)));
-          let right = bubble && Date.now() < bubbleUntil ? chalk.dim(`“${bubble}”`) : "";
+          const speaking = Boolean(bubble) && Date.now() < bubbleUntil;
+          const maxLines = Math.max(1, Math.min(PANEL_LINES_MAX, Math.floor(Number(setting(sprite, "lines")) || 1)));
+          if (speaking && maxLines > 1) {
+            // Face + name on the first row; the whole sentence wrapped beneath,
+            // indented under the name, at most `lines - 1` rows. Every row fits
+            // `width`, so the host clips nothing.
+            const head = `${pad}${face}  ${label}`;
+            const indent = " ".repeat(Math.max(0, Math.min(x, 16)) + 4);
+            const wrapped = wrapText(`“${bubbleFull}”`, Math.max(20, width - indent.length - 1)).slice(0, maxLines - 1);
+            return [row(head, "", width), ...wrapped.map((l) => `${indent}${chalk.dim(l)}`)];
+          }
+          let right = speaking ? chalk.dim(`“${bubble}”`) : "";
           const newer = updateAvailable();
           if (!right && newer && setting(sprite, "updateCheck") === "on") {
             right = chalk.yellow(`⬆ v${newer} available · /sprite update`);
@@ -3930,6 +3956,26 @@ function activateInner(letta: any, disposers: Array<() => void>) {
   }
 
   if (letta.capabilities.events.turns) {
+    // whisper: the companion's newest live line rides along on the agent's
+    // next turn, fenced as something a companion said — not an instruction.
+    // Only the newest line, delivered once, only live lines, only when on
+    // and not muted. Direction is sprite → agent, so `see` doesn't gate it.
+    disposers.push(
+      letta.events.on("turn_start", (event: any, ctx: any) => {
+        noteAgent(event, ctx);
+        const sprite = getSprite(activeAgentId);
+        if (!sprite || sprite.phase !== "alive" || !sprite.soul) return;
+        if (setting(sprite, "whisper") !== "on" || setting(sprite, "voice") !== "on") return;
+        const line = pendingWhisper.get(sprite.id);
+        if (!line) return;
+        pendingWhisper.delete(sprite.id);
+        if (!Array.isArray(event?.input) || event.input.length === 0) return;
+        const note = `\n\n[${cleanName(sprite.name, 24)}, your companion on the panel, said: «${cleanName(line, 20_000)}»]`;
+        const last = event.input[event.input.length - 1];
+        if (typeof last?.content === "string") last.content = `${last.content}${note}`;
+        else if (Array.isArray(last?.content)) last.content.push({ type: "text", text: note.trim() });
+      }),
+    );
     disposers.push(
       letta.events.on("turn_end", (event: any, ctx: any) => {
         noteAgent(event, ctx);
@@ -4442,8 +4488,11 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       const live = ownerAgentId(sprite) ? sprite : null;
       if (!live || !live.soul || live.soul.agentId !== soul.agentId) return null; // released/replaced while queued
       if (setting(live, "voice") !== "on") return null; // muted while queued
-      const moment = typeof momentOrBuild === "function" ? momentOrBuild() : momentOrBuild;
+      let moment = typeof momentOrBuild === "function" ? momentOrBuild() : momentOrBuild;
       if (!moment) return null;
+      // When whisper is on, the mind is told its line will be heard by its
+      // agent at the start of their next turn — so it can speak TO them.
+      if (setting(live, "whisper") === "on") moment = `${moment}\n\n(Your agent hears your line at the start of their next turn — you may speak to them.)`;
       const last = soulLastLineAt.get(soul.agentId) ?? 0;
       if (!opts.force && rateMs > 0 && Date.now() - last < rateMs) return null;
       // One deadline for the WHOLE call: client setup, ownership check, send,
@@ -4503,6 +4552,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         const text = await Promise.race([work(), deadline]);
         const line = oneLine(text);
         if (!line) return null;
+        lastFullLine.set(soul.agentId, firstLineOf(text));
         soulLastError = "";
         soulLastLineAt.set(soul.agentId, Date.now());
         soul.lineCount += 1;
@@ -4523,10 +4573,23 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     return next;
   }
 
+  // The newest live line since the agent's last turn, per sprite. Delivered
+  // once at the start of the agent's next turn when `whisper` is on.
+  const pendingWhisper = new Map<string, string>();
+  const lastFullLine = new Map<string, string>(); // soul agentId → untruncated first line of the last reply
+  // "80 for the shelf, 400 for the ear" (Poof): the panel row and diary keep
+  // the short line; anyone who asked — a tool result, the whisper, a
+  // multi-line panel — gets the whole sentence.
+  function fullLineOf(sprite: SpriteState, line: string): string {
+    return (sprite.soul && lastFullLine.get(sprite.soul.agentId)) || line;
+  }
+
   function showSoulLine(sprite: SpriteState, category: VoiceCategory | "mood", line: string) {
     bubble = line;
+    bubbleFull = fullLineOf(sprite, line);
     bubbleUntil = Date.now() + 10_000;
     logEntry(sprite, category, line);
+    if (setting(sprite, "whisper") === "on") pendingWhisper.set(sprite.id, fullLineOf(sprite, line));
     markDirty();
     flush(); // live lines are rare and worth keeping even if the session dies now
     panel.update();
@@ -4550,6 +4613,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     const canned = speak(sprite, category, force);
     if (!canned) return null;
     bubble = `(${canned})`;
+    bubbleFull = bubble;
     const last = sprite.log?.[sprite.log.length - 1];
     if (last && last.line === canned) last.line = `(${canned})`;
     markDirty();
@@ -4653,7 +4717,8 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     );
     if (!line) return `${sprite.name} looks at you, and says nothing. (its mind didn't answer — check /sprite soul)`;
     showSoulLine(sprite, "mood", line);
-    return `${sprite.name}: ${line}`;
+    // the panel and diary keep the 80-char line; whoever asked gets the whole sentence
+    return `${sprite.name}: ${fullLineOf(sprite, line)}`;
   }
 
   // -- ensoul: the agent walks the user through it; tools apply the answers --
@@ -5038,7 +5103,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
       return soulSay(res, "They just petted you.", { force: true }).then((line) => {
         if (line) {
           showSoulLine(res, "pet", line);
-          return `you pet ${res.name}. ${sp.poses.happy}  “${line}”`;
+          return `you pet ${res.name}. ${sp.poses.happy}  “${fullLineOf(res, line)}”`;
         }
         const canned = speakFallback(res, "pet", true);
         return canned
@@ -5160,7 +5225,7 @@ function activateInner(letta: any, disposers: Array<() => void>) {
         ...rows,
         "",
         "set: /sprite settings <key> <value>    global: /sprite settings global <key> <value>",
-        "keys: voice on|off · voiceRateMin <n> · visible on|off · laps count|odometer|belt|pips · hue on|off · bars on|off · updateCheck on|off",
+        "keys: voice on|off · voiceRateMin <n> · visible on|off · lines 1-4 · laps count|odometer|belt|pips · hue on|off · bars on|off · updateCheck on|off · whisper on|off",
       ].join("\n");
     }
 
@@ -5173,13 +5238,17 @@ function activateInner(letta: any, disposers: Array<() => void>) {
     }
 
     let parsed: unknown = value;
-    if (key === "voice" || key === "visible" || key === "hue" || key === "bars" || key === "updateCheck") {
+    if (key === "voice" || key === "visible" || key === "hue" || key === "bars" || key === "updateCheck" || key === "whisper") {
       if (value !== "on" && value !== "off") return `${key} must be on|off`;
     } else if (key === "laps") {
       if (!LAP_STYLES.includes(value as LapStyle)) return `laps must be ${LAP_STYLES.join("|")}`;
     } else if (key === "voiceRateMin") {
       const n = Number(value);
       if (!Number.isFinite(n) || n < 0) return "voiceRateMin must be a number of minutes";
+      parsed = n;
+    } else if (key === "lines") {
+      const n = Math.floor(Number(value));
+      if (!(n >= 1 && n <= PANEL_LINES_MAX)) return `lines must be 1–${PANEL_LINES_MAX}`;
       parsed = n;
     }
 

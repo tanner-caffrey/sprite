@@ -290,7 +290,7 @@ Inspect or change an ensouled companion's mind.
 | `dreaming off\|step-count\|compaction-event` | When its own memory consolidates. |
 | `persona` | Rewrite its persona. Your agent walks you through it (template, agent-written, or yours) and applies it after you confirm. Its voice, diary, and bond memory are untouched. |
 
-Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud.
+Every change is checked against the agent first (its tags, or the ownership marker in its description): the mod only ever touches an agent that is really this companion's. Dreaming for cloud minds is managed on Letta Cloud. To let your agent hear what it says, see `whisper` under settings.
 
 ### /sprite talk
 
@@ -357,10 +357,12 @@ Show or change how the companion behaves and looks.
 | `voice on\|off` | Whether it speaks at all. Off also silences a mind of its own. |
 | `voiceRateMin <minutes>` | At most one built-in line per N minutes (default 10). Petting ignores this. |
 | `visible on\|off` | Show or hide the panel row. |
+| `lines <1–4>` | How many rows a spoken line may take on the panel. 1 (default) keeps everything on the companion's row, cut to 80 characters. 2–4 puts the whole sentence on its own rows beneath the face, wrapped — so a mind with more to say isn't clipped. |
 | `laps count\|odometer\|belt\|pips` | How a wrapped stat bar shows its lap count: ×3 after the bar; ⟨3⟩ before it; each lap a heavier glyph; one dot per lap. |
 | `hue on\|off` | Colour stat bars by age: grey → white → gold → rose → violet → teal → shimmer. |
 | `bars on\|off` | Also show a compact stat strip on the panel row when it isn't speaking. |
 | `updateCheck on\|off` | Quietly check GitHub for a newer release on launch and nudge on the panel (default on). |
+| `whisper on\|off` | For an ensouled companion: its newest live line is added to your agent's next turn, marked as something the companion said (not an instruction). Only the newest line, delivered once. The companion is told it's heard, so it can speak to your agent. Off by default. |
 
 A setting for this companion overrides the global default. Use `global` to change the default for all of them.
 
